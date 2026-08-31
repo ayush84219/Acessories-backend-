@@ -1,34 +1,74 @@
 import mysql from 'mysql2/promise';
 import dotenv from 'dotenv';
-dotenv.config();
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 // ── MySQL Connection Pool ──────────────────────────────────────────────────────
-const pool = mysql.createPool({
-  host: process.env.MYSQL_HOST || 'localhost',
-  port: Number(process.env.MYSQL_PORT) || 3306,
-  user: process.env.MYSQL_USER || 'root',
-  password: process.env.MYSQL_PASSWORD || '',
-  database: process.env.MYSQL_DATABASE || 'newdata',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-});
+const getPoolConfig = () => {
+  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
+  if (connectionUri) {
+    try {
+      const parsedUrl = new URL(connectionUri);
+      return {
+        host: parsedUrl.hostname,
+        port: Number(parsedUrl.port) || 3306,
+        user: decodeURIComponent(parsedUrl.username),
+        password: decodeURIComponent(parsedUrl.password),
+        database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
+        ssl: { rejectUnauthorized: false },
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        connectTimeout: 30000,
+      };
+    } catch (e) {
+      console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
+    }
+  }
+
+  const host = process.env.MYSQL_HOST || 'localhost';
+  const isAivenOrRemote = host.includes('aivencloud.com') || host.includes('railway.internal') || process.env.MYSQL_SSL === 'true';
+
+  const config = {
+    host: host,
+    port: Number(process.env.MYSQL_PORT) || 3306,
+    user: process.env.MYSQL_USER || 'root',
+    password: process.env.MYSQL_PASSWORD || 'Mohitca011',
+    database: process.env.MYSQL_DATABASE || 'newdata',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    connectTimeout: 30000,
+  };
+
+  if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
+    config.ssl = { rejectUnauthorized: false };
+  }
+
+  return config;
+};
+
+const pool = mysql.createPool(getPoolConfig());
 
 // ── Seed Data ─────────────────────────────────────────────────────────────────
 
 const initialMaterials = [
-  { id: 'M1302', name: 'Organic Cotton Fabric Roll', category: 'Fabric', stock: 2400, unit: 'meters', cost: 25.00, threshold: 200, color: 'Pure White' },
-  { id: 'M1303', name: 'Indigo Denim Raw Roll', category: 'Fabric', stock: 850, unit: 'meters', cost: 45.00, threshold: 150, color: 'Raw Deep Indigo' },
-  { id: 'M1304', name: 'YKK Brass Zippers (15cm)', category: 'Trim', stock: 150, unit: 'pieces', cost: 2.50, threshold: 200, color: 'Matte Gold' },
-  { id: 'M1305', name: 'Polyester Thread Spool', category: 'Trim', stock: 45, unit: 'rolls', cost: 8.00, threshold: 50, color: 'Neutral Gray' },
-  { id: 'M1306', name: 'Metal Rivets (Pack of 100)', category: 'Trim', stock: 60, unit: 'pieces', cost: 5.00, threshold: 20, color: 'Silver Metallic' },
-  { id: 'M1307', name: 'Printed Satin Brand Labels', category: 'Accessory', stock: 500, unit: 'pieces', cost: 0.80, threshold: 100, color: 'Glossy White' }
+  { id: 'M1302', name: 'Organic Cotton Fabric Roll', category: 'Fabric', stock: 2400, unit: 'meters', cost: 25.00, threshold: 200, color: 'Pure White', location: 'Main Store' },
+  { id: 'M1303', name: 'Indigo Denim Raw Roll', category: 'Fabric', stock: 850, unit: 'meters', cost: 45.00, threshold: 150, color: 'Raw Deep Indigo', location: 'Main Store' },
+  { id: 'M1304', name: 'YKK Brass Zippers (15cm)', category: 'Trim', stock: 150, unit: 'pieces', cost: 2.50, threshold: 200, color: 'Matte Gold', location: 'Main Store' },
+  { id: 'M1305', name: 'Polyester Thread Spool', category: 'Trim', stock: 45, unit: 'rolls', cost: 8.00, threshold: 50, color: 'Neutral Gray', location: 'Main Store' },
+  { id: 'M1306', name: 'Metal Rivets (Pack of 100)', category: 'Trim', stock: 60, unit: 'pieces', cost: 5.00, threshold: 20, color: 'Silver Metallic', location: 'Main Store' },
+  { id: 'M1307', name: 'Printed Satin Brand Labels', category: 'Accessory', stock: 500, unit: 'pieces', cost: 0.80, threshold: 100, color: 'Glossy White', location: 'Main Store' }
 ];
 
 const initialDesigns = [
   {
     id: '11000', name: 'Summer Denim Jacket', lotNo2: 'MH-4458', brand: 'Zara',
-    category: 'JACKET', designer: 'Sarah Connor', fabricType: 'Raw Denim Cotton 100%',
+    category: 'JACKET', designer: 'Admin', fabricType: 'Raw Denim Cotton 100%',
     targetSizes: 'S, M, L, XL', colorCode: '#1e40af', status: 'In Verification',
     date: '10/08/2023', comments: '', section: 'Men', season: 'Winter', style: 'ST-9921',
     tapeLace: 'No', bottomType: 'N/A', zip: 'Yes', sticker: 'No', collar: 'No', bone: 'No', fullBaju: 'No',
@@ -50,7 +90,7 @@ const initialDesigns = [
   },
   {
     id: '11001', name: 'Organic Cotton Polo Shirt', lotNo2: 'MH-4459', brand: 'Nike',
-    category: 'T-SHIRT COLLAR', designer: 'Michael Scott', fabricType: 'Pima Cotton Pique',
+    category: 'T-SHIRT COLLAR', designer: 'Admin', fabricType: 'Pima Cotton Pique',
     targetSizes: 'M, L, XL', colorCode: '#059669', status: 'Approved',
     date: '08/08/2023', comments: '', section: 'Men', season: 'Summer', style: 'TS-2201',
     tapeLace: 'No', bottomType: 'N/A', zip: 'No', sticker: 'No', collar: 'Yes', bone: 'No', fullBaju: 'No',
@@ -72,7 +112,7 @@ const initialDesigns = [
   },
   {
     id: '11002', name: 'Linen Comfort Trousers', lotNo2: 'MH-4460', brand: 'H&M',
-    category: 'LOWER', designer: 'Sarah Connor', fabricType: 'Pure Linen Weave',
+    category: 'LOWER', designer: 'Admin', fabricType: 'Pure Linen Weave',
     targetSizes: 'S, M, L', colorCode: '#d97706', status: 'Approved',
     date: '02/08/2023', comments: '', section: 'Women', season: 'Summer', style: 'TR-3304',
     tapeLace: 'No', bottomType: 'Elastic mohri', zip: 'No', sticker: 'No', collar: 'No', bone: 'No', fullBaju: 'No',
@@ -120,7 +160,7 @@ const initialAccessories = [
   'Hook, buckle, velcro', 'Interlining / fusing', 'Bone', 'Full Baju'
 ];
 
-const initialDesigners = ['Sarah Connor', 'Michael Scott', 'Admin'];
+const initialDesigners = ['Admin'];
 
 // ── initDb: create tables + seed ──────────────────────────────────────────────
 
@@ -189,6 +229,7 @@ export async function initDb() {
     cost       DOUBLE DEFAULT 0,
     threshold  DOUBLE DEFAULT 0,
     color      VARCHAR(100),
+    location   VARCHAR(255) DEFAULT 'Main Store',
     packets    INT DEFAULT 1,
     poNumber   VARCHAR(100) DEFAULT 'N/A',
     invoiceNo  VARCHAR(100) DEFAULT 'N/A'
@@ -196,6 +237,11 @@ export async function initDb() {
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN packets INT DEFAULT 1`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN poNumber VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN invoiceNo VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
+  try {
+    await pool.execute(`ALTER TABLE materials ADD COLUMN location VARCHAR(255) DEFAULT 'Main Store'`);
+    // Copy existing location values (which were stored in 'color' column) into 'location' column if 'location' is at default
+    await pool.execute(`UPDATE materials SET location = color WHERE location = 'Main Store' OR location IS NULL`);
+  } catch (_) { }
 
   // Approval Requests
   await pool.execute(`CREATE TABLE IF NOT EXISTS approval_requests (
@@ -222,8 +268,6 @@ export async function initDb() {
     id              VARCHAR(100) PRIMARY KEY,
     poNumber        VARCHAR(100),
     vendorName      VARCHAR(255),
-    vendorEmail     VARCHAR(255),
-    vendorAddress   TEXT,
     designName      VARCHAR(255),
     designCategory  VARCHAR(100),
     items           TEXT,
@@ -235,6 +279,9 @@ export async function initDb() {
     deliveryDate    VARCHAR(100),
     status          VARCHAR(100)
   )`);
+  try {
+    await pool.execute(`CREATE UNIQUE INDEX idx_po_number ON purchase_orders (poNumber)`);
+  } catch (_) {}
 
   // Vendors
   await pool.execute(`CREATE TABLE IF NOT EXISTS vendors (
@@ -365,6 +412,55 @@ export async function initDb() {
     dori_payload         LONGTEXT
   )`);
 
+  // Cutting Header Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS cutting_header (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    Lot_Number VARCHAR(255),
+    StartRow INT,
+    NumRows INT,
+    HeaderCols INT,
+    Fabric VARCHAR(255),
+    Garment_Type VARCHAR(255),
+    Style VARCHAR(255),
+    Sizes VARCHAR(255),
+    Shades TEXT,
+    Saved_At VARCHAR(255),
+    Date_of_Issue VARCHAR(255),
+    Supervisor VARCHAR(255),
+    Image_Url TEXT,
+    Party_Name VARCHAR(255),
+    Brand VARCHAR(255),
+    Season VARCHAR(255),
+    Direct_Stitching VARCHAR(255),
+    Challan_History TEXT,
+    Zip_Order_Date VARCHAR(255),
+    Zip_Received_Date VARCHAR(255),
+    WIP_Status TEXT,
+    Completed_Status TEXT,
+    MWK VARCHAR(255),
+    JobOrder_Date VARCHAR(255),
+    Manpower INT,
+    Cutting_Qty INT,
+    Stitching_Issue_Qty INT,
+    Priority VARCHAR(255),
+    Sticker VARCHAR(255),
+    zip_payload LONGTEXT
+  )`);
+
+  // Cuttings Matrix Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS cuttings_matrix (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    header_id INT,
+    Lot_No VARCHAR(100),
+    Color VARCHAR(100),
+    Cutting_Table INT,
+    M INT,
+    L INT,
+    XL INT,
+    XXL INT,
+    Total_Pcs INT
+  )`);
+
   // Returnable Gate Pass (RGP) Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS rgp (
     id                   INT PRIMARY KEY AUTO_INCREMENT,
@@ -379,8 +475,63 @@ export async function initDb() {
     preparedBy           VARCHAR(255) DEFAULT '',
     authorizedBy         VARCHAR(255) DEFAULT '',
     remarks              TEXT,
-    entries              TEXT,
     createdAt            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Weight Capture Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS weight_capture (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    materialCode    VARCHAR(100),
+    materialName    VARCHAR(255),
+    unit            VARCHAR(50) DEFAULT 'Pcs',
+    category        VARCHAR(100),
+    supplier        VARCHAR(255),
+    lotNo           VARCHAR(100),
+    poNumber        VARCHAR(100),
+    invoiceNo       VARCHAR(100),
+    storeLocation   VARCHAR(255),
+    storeIncharge   VARCHAR(100),
+    grossWeightKg   DOUBLE DEFAULT 0,
+    tareWeightKg    DOUBLE DEFAULT 0,
+    netWeightKg     DOUBLE DEFAULT 0,
+    weightPerPieceG DOUBLE DEFAULT 0,
+    sampleQty       INT DEFAULT 10,
+    sampleWeightKg  DOUBLE DEFAULT 0,
+    pieces          INT DEFAULT 0,
+    packets         INT DEFAULT 1,
+    barcodeId       VARCHAR(100),
+    status          VARCHAR(50) DEFAULT 'Captured',
+    approvalStatus  VARCHAR(50) DEFAULT 'Approved',
+    approvedBy      VARCHAR(100) NULL,
+    approvedAt      DATETIME NULL,
+    rejectionReason TEXT NULL,
+    entryMode       VARCHAR(50) DEFAULT 'Weight Machine',
+    remarks         TEXT,
+    capturedAt      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN approvalStatus VARCHAR(50) DEFAULT 'Approved'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN approvedBy VARCHAR(100) NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN approvedAt DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN rejectionReason TEXT NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN entryMode VARCHAR(50) DEFAULT 'Weight Machine'`); } catch (_) { }
+
+  // Dedicated Accepted Orders Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS order_accepted (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    poNumber        VARCHAR(100) NOT NULL,
+    poId            VARCHAR(50),
+    vendorName      VARCHAR(255),
+    materialName    VARCHAR(255),
+    orderedQty      DECIMAL(10,2) DEFAULT 0,
+    acceptedQty     DECIMAL(10,2) DEFAULT 0,
+    extraQty        DECIMAL(10,2) DEFAULT 0,
+    invoiceNo       VARCHAR(100),
+    invoiceDate     VARCHAR(100),
+    storeLocation   VARCHAR(255),
+    approvedBy      VARCHAR(100) DEFAULT 'Admin',
+    status          VARCHAR(50) DEFAULT 'Accepted',
+    remarks         TEXT,
+    acceptedAt      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
 
   // ── Seed data (only if tables are empty) ────────────────────────────────────
@@ -405,8 +556,8 @@ export async function initDb() {
   if (mCount === 0) {
     for (const m of initialMaterials) {
       await pool.execute(
-        'INSERT INTO materials (id,name,category,stock,unit,cost,threshold,color) VALUES (?,?,?,?,?,?,?,?)',
-        [m.id, m.name, m.category, m.stock, m.unit, m.cost, m.threshold, m.color]
+        'INSERT INTO materials (id,name,category,stock,unit,cost,threshold,color,location) VALUES (?,?,?,?,?,?,?,?,?)',
+        [m.id, m.name, m.category, m.stock, m.unit, m.cost, m.threshold, m.color, m.location || 'Main Store']
       );
     }
   }
@@ -416,10 +567,10 @@ export async function initDb() {
     for (const po of initialPOs) {
       await pool.execute(
         `REPLACE INTO purchase_orders
-          (id,poNumber,vendorName,vendorEmail,vendorAddress,designName,designCategory,
+          (id,poNumber,vendorName,designName,designCategory,
            items,subtotal,taxRate,tax,total,date,deliveryDate,status)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [po.id, po.poNumber, po.vendorName, po.vendorEmail, po.vendorAddress,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [po.id, po.poNumber, po.vendorName,
         po.designName, po.designCategory, po.items, po.subtotal, po.taxRate,
         po.tax, po.total, po.date, po.deliveryDate, po.status]
       );
@@ -442,6 +593,19 @@ export async function initDb() {
       ['accessories_list', JSON.stringify(initialAccessories)]);
     await pool.execute('REPLACE INTO settings (setting_key,setting_value) VALUES (?,?)',
       ['designers_list', JSON.stringify(initialDesigners)]);
+  } else {
+    // Sanitize any legacy dummy designer names
+    try {
+      const [dRows] = await pool.execute("SELECT setting_value FROM settings WHERE setting_key = 'designers_list'");
+      if (dRows.length > 0) {
+        const parsed = JSON.parse(dRows[0].setting_value);
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed.filter(d => !['sarah connor', 'michael scott'].includes(String(d).toLowerCase().trim()));
+          const finalDesigners = cleaned.length > 0 ? (cleaned.includes('Admin') ? cleaned : ['Admin', ...cleaned]) : ['Admin'];
+          await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('designers_list', ?)", [JSON.stringify(finalDesigners)]);
+        }
+      }
+    } catch (_) {}
   }
 
   const [[{ count: hCount }]] = await pool.execute('SELECT COUNT(*) as count FROM design_history');
@@ -496,7 +660,69 @@ export async function initDb() {
     transferredAt    DATETIME      DEFAULT CURRENT_TIMESTAMP
   )`);
 
-  console.log('[DB] All tables ready.');
+  // Warehouse Locations Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS warehouse_locations (
+    id          VARCHAR(100) PRIMARY KEY,
+    code        VARCHAR(255) NOT NULL,
+    warehouse   VARCHAR(255) NOT NULL,
+    capacity    INT DEFAULT 20
+  )`);
+
+  // Auto-sync warehouse_locations from configured warehouse_racks settings
+  try {
+    const [rackSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_racks']);
+    if (rackSetting && rackSetting.length > 0 && rackSetting[0].setting_value) {
+      const parsedRacks = JSON.parse(rackSetting[0].setting_value);
+      if (Array.isArray(parsedRacks) && parsedRacks.length > 0) {
+        await bulkSaveWarehouseLocations(parsedRacks);
+        console.log(`[DB] Synced ${parsedRacks.length} locations to warehouse_locations table.`);
+      }
+    }
+  } catch (syncErr) {
+    console.warn('[DB] Could not sync warehouse_locations on startup:', syncErr.message);
+  }
+
+  // ── High-Speed Performance Indexes for Large Datasets ─────────────────────
+  const ensureIndex = async (table, indexName, columns) => {
+    try {
+      const [existing] = await pool.execute(`SHOW INDEX FROM ${table} WHERE Key_name = ?`, [indexName]);
+      if (existing.length === 0) {
+        await pool.execute(`CREATE INDEX ${indexName} ON ${table} (${columns})`);
+      }
+    } catch (_) {}
+  };
+
+  try {
+    await Promise.all([
+      ensureIndex('weight_capture', 'idx_wc_po', 'poNumber'),
+      ensureIndex('weight_capture', 'idx_wc_matcode', 'materialCode'),
+      ensureIndex('weight_capture', 'idx_wc_inv', 'invoiceNo'),
+      ensureIndex('weight_capture', 'idx_wc_barcode', 'barcodeId'),
+      ensureIndex('weight_capture', 'idx_wc_approval', 'approvalStatus'),
+      ensureIndex('weight_capture', 'idx_wc_captured', 'capturedAt'),
+      ensureIndex('purchase_orders', 'idx_po_number', 'poNumber'),
+      ensureIndex('purchase_orders', 'idx_po_vendor', 'vendorName'),
+      ensureIndex('purchase_orders', 'idx_po_status', 'status'),
+      ensureIndex('order_accepted', 'idx_oa_po', 'poNumber'),
+      ensureIndex('order_accepted', 'idx_oa_inv', 'invoiceNo'),
+      ensureIndex('order_accepted', 'idx_oa_mat', 'materialName'),
+      ensureIndex('order_accepted', 'idx_oa_date', 'acceptedAt'),
+      ensureIndex('materials', 'idx_mat_name', 'name'),
+      ensureIndex('materials', 'idx_mat_category', 'category'),
+      ensureIndex('materials', 'idx_mat_loc', 'location'),
+      ensureIndex('cutting_header', 'idx_ch_lot', 'Lot_Number'),
+      ensureIndex('cutting_header', 'idx_ch_style', 'Style'),
+      ensureIndex('cutting_header', 'idx_ch_party', 'Party_Name'),
+      ensureIndex('cuttings_matrix', 'idx_cm_lot', 'Lot_No'),
+      ensureIndex('cuttings_matrix', 'idx_cm_header', 'header_id'),
+      ensureIndex('material_transfers', 'idx_mt_code', 'materialCode'),
+      ensureIndex('material_transfers', 'idx_mt_date', 'transferredAt'),
+      ensureIndex('zip', 'idx_zip_lot', 'Lot_Number'),
+      ensureIndex('zip', 'idx_zip_po', 'po_number')
+    ]);
+  } catch (_) {}
+
+  console.log('[DB] All tables and high-speed indexes ready.');
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -548,16 +774,16 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
     const existing = rows[0];
     const updatedStock = (Number(existing.stock) || 0) + pieces;
     await pool.execute(
-      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), color = COALESCE(NULLIF(?, ""), color), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo) WHERE id = ?',
-      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.color, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, existing.id]
+      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), location = COALESCE(NULLIF(?, ""), location), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo) WHERE id = ?',
+      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.location, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, existing.id]
     );
     console.log(`[DB] Updated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${packets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
   } else {
     // New material -> insert into materials table
     const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
     await pool.execute(
-      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, location, packets, poNumber, invoiceNo]
+      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo]
     );
     console.log(`[DB] Created new material in Stock DB: ${matId} - ${name} (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
   }
@@ -565,12 +791,11 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
 
 export const syncWeightCapturesToMaterials = async () => {
   try {
-    const [captures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id ASC');
+    const [captures] = await pool.execute("SELECT * FROM weight_capture ORDER BY id ASC");
     for (const c of captures) {
-      if (!c.materialCode) continue;
-      const code = c.materialCode;
-      const name = c.materialName || 'Accessory Material';
-      const category = c.category || 'Accessory';
+      const code = (c.materialCode || '').trim();
+      const name = (c.materialName || 'Accessory Material').trim();
+      const category = (c.category || 'Accessory').trim();
       const pieces = Number(c.pieces) || 0;
       const unit = c.unit || 'Pcs';
       const location = c.storeLocation || 'Main Store';
@@ -578,25 +803,30 @@ export const syncWeightCapturesToMaterials = async () => {
       const poNumber = c.poNumber || 'N/A';
       const invoiceNo = c.invoiceNo || 'N/A';
 
-      const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [code]);
+      if (!code && !name) continue;
+      const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
+
+      const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [matId]);
       if (existing.length > 0) {
-        // If material exists, DO NOT overwrite custom user configurations like color/location, packets, PO/Invoice numbers.
-        // We only update name, category, and unit if they are empty or default.
         const ext = existing[0];
         const newName = ext.name === 'Accessory Material' || !ext.name ? name : ext.name;
         const newCategory = ext.category === 'Accessory' || !ext.category ? category : ext.category;
         const newUnit = !ext.unit ? unit : ext.unit;
+        const newPo = (!ext.poNumber || ext.poNumber === 'N/A') ? poNumber : ext.poNumber;
+        const newInv = (!ext.invoiceNo || ext.invoiceNo === 'N/A') ? invoiceNo : ext.invoiceNo;
+        const newLoc = (!ext.location || ext.location === 'Main Store') ? location : ext.location;
+
         await pool.execute(
-          'UPDATE materials SET name = ?, category = ?, unit = ? WHERE id = ?',
-          [newName, newCategory, newUnit, code]
+          'UPDATE materials SET name = ?, category = ?, unit = ?, poNumber = ?, invoiceNo = ?, location = ? WHERE id = ?',
+          [newName, newCategory, newUnit, newPo, newInv, newLoc, matId]
         );
       } else {
-        // Insert missing material (such as MT1009) into materials DB table
+        const isApproved = c.approvalStatus === 'Approved' || !c.approvalStatus;
         await pool.execute(
-          'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [code, name, category, pieces, unit, 0, 50, location, packets, poNumber, invoiceNo]
+          'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [matId, name, category, isApproved ? pieces : 0, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo]
         );
-        console.log(`[DB] Synced missing weight capture material into DB: ${code} - ${name} (PO: ${poNumber}, Invoice: ${invoiceNo})`);
+        console.log(`[DB] Synced weight capture material into DB: ${matId} - ${name} (PO: ${poNumber}, Invoice: ${invoiceNo})`);
       }
     }
   } catch (err) {
@@ -605,7 +835,8 @@ export const syncWeightCapturesToMaterials = async () => {
 };
 
 export const getUserByEmail = async (email) => {
-  const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+  if (!email) return null;
+  const [rows] = await pool.execute('SELECT * FROM users WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))', [email]);
   return rows[0] || null;
 };
 
@@ -617,30 +848,200 @@ export const createMaterialCapture = async (data) => {
     lotNo = '', poNumber = '', invoiceNo = '', storeLocation = '', storeIncharge = '',
     grossWeightKg = 0, tareWeightKg = 0, netWeightKg = 0, weightPerPieceG = 0,
     sampleQty = 0, sampleWeightKg = 0,
-    pieces = 0, packets = 1, barcodeId = '', status = 'Captured', remarks = ''
+    pieces = 0, packets = 1, barcodeId = '',
+    entryMode = (data.status === 'Manually' || data.status === 'Manual' || data.entryMode === 'Manually' || data.entryMode === 'Manual' || data.isManual || data.captureMethod === 'Manual' ? 'Manually' : 'Weight Machine'),
+    status = data.status || entryMode,
+    approvalStatus = 'Approved',
+    remarks = ''
   } = data;
+
   const [result] = await pool.execute(
     `INSERT INTO weight_capture
      (materialCode,materialName,unit,category,supplier,lotNo,poNumber,invoiceNo,
       storeLocation,storeIncharge,grossWeightKg,tareWeightKg,netWeightKg,
-      weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,remarks)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,approvalStatus,entryMode,remarks)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo,
       storeLocation, storeIncharge,
       Number(grossWeightKg), Number(tareWeightKg), Number(netWeightKg),
       Number(weightPerPieceG), Number(sampleQty), Number(sampleWeightKg),
       Number(pieces), Number(packets),
-      barcodeId, status, remarks]
+      barcodeId, status, approvalStatus, entryMode, remarks]
   );
 
-  // Sync material to materials stock database table
-  try {
-    await addOrUpdateMaterialFromCapture(data);
-  } catch (syncErr) {
-    console.error('[DB] Material stock sync error:', syncErr.message);
+  const captureId = result.insertId;
+
+  // ONLY sync to stock and warehouse locations if approved!
+  if (approvalStatus === 'Approved') {
+    try {
+      await addOrUpdateMaterialFromCapture(data);
+    } catch (syncErr) {
+      console.error('[DB] Material stock sync error:', syncErr.message);
+    }
+
+    try {
+      await saveWarehouseLocationsFromCapture(storeLocation, packets);
+    } catch (locErr) {
+      console.error('[DB] Warehouse location sync error:', locErr.message);
+    }
+
+    if (poNumber) {
+      try {
+        await updatePOCompletionStatus(poNumber);
+      } catch (poErr) {
+        console.error('[DB] PO completion status sync error:', poErr.message);
+      }
+    }
   }
 
-  return result.insertId;
+  return captureId;
+};
+
+export const approveInwardCapture = async (id, approvedBy = 'Admin', note = '') => {
+  const [rows] = await pool.execute('SELECT * FROM weight_capture WHERE id = ?', [id]);
+  if (rows.length === 0) throw new Error('Capture record not found.');
+
+  const capture = rows[0];
+
+  await pool.execute(
+    `UPDATE weight_capture 
+     SET approvalStatus = 'Approved', approvedBy = ?, approvedAt = NOW(), remarks = CONCAT(COALESCE(remarks, ''), ' [Approved: ', ?, ']')
+     WHERE id = ?`,
+    [approvedBy, note || 'Approved by Manager', id]
+  );
+
+  // Now finalize and add into inventory/stock and rack location
+  try {
+    await addOrUpdateMaterialFromCapture({
+      ...capture,
+      pieces: Number(capture.pieces) || 0,
+      packets: Number(capture.packets) || 1
+    });
+  } catch (syncErr) {
+    console.error('[DB] Material stock sync error on approve:', syncErr.message);
+  }
+
+  try {
+    await saveWarehouseLocationsFromCapture(capture.storeLocation, capture.packets);
+  } catch (locErr) {
+    console.error('[DB] Warehouse location sync error on approve:', locErr.message);
+  }
+
+  if (capture.poNumber) {
+    try {
+      await updatePOCompletionStatus(capture.poNumber);
+    } catch (poErr) {
+      console.error('[DB] PO completion status sync error on approve:', poErr.message);
+    }
+  }
+
+  return true;
+};
+
+export const rejectInwardCapture = async (id, rejectedBy = 'Admin', reason = '') => {
+  const [rows] = await pool.execute('SELECT * FROM weight_capture WHERE id = ?', [id]);
+  const poNumber = rows[0]?.poNumber;
+  await pool.execute(
+    `UPDATE weight_capture 
+     SET approvalStatus = 'Rejected', approvedBy = ?, approvedAt = NOW(), rejectionReason = ?, status = 'Rejected'
+     WHERE id = ?`,
+    [rejectedBy, reason || 'Rejected due to excess quantity / not matching PO', id]
+  );
+  if (poNumber) {
+    try {
+      await updatePOCompletionStatus(poNumber);
+    } catch (poErr) {
+      console.error('[DB] PO completion status sync error on reject:', poErr.message);
+    }
+  }
+  return true;
+};
+
+export const saveWarehouseLocationsFromCapture = async (locationStr, packets = 1) => {
+  if (!locationStr || typeof locationStr !== 'string') return;
+  const rawSegments = locationStr.split(',');
+  for (const seg of rawSegments) {
+    const cleanName = seg.replace(/\([^)]*\)/g, '').trim();
+    if (!cleanName || cleanName.toLowerCase() === 'main store' || cleanName.toLowerCase() === 'n/a') continue;
+    const slug = cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    if (!slug) continue;
+
+    let warehouseName = 'Warehouse 1';
+    if (cleanName.toLowerCase().includes('hall')) {
+      const match = cleanName.match(/(hall\s*\d+)/i);
+      if (match) warehouseName = match[1].toUpperCase();
+    }
+
+    try {
+      await pool.execute(
+        `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE code = VALUES(code)`,
+        [slug, cleanName, warehouseName, 20]
+      );
+      console.log(`[DB] Auto-saved location to warehouse_locations table: ${cleanName} (ID: ${slug})`);
+    } catch (locErr) {
+      console.warn('[DB] Could not sync warehouse_locations:', locErr.message);
+    }
+  }
+};
+
+export const getAllWarehouseLocations = async () => {
+  const [rows] = await pool.execute('SELECT * FROM warehouse_locations ORDER BY warehouse ASC, code ASC');
+  return rows;
+};
+
+export const bulkSaveWarehouseLocations = async (locationsArray) => {
+  if (!Array.isArray(locationsArray) || locationsArray.length === 0) return 0;
+  
+  const chunkSize = 100;
+  let totalSaved = 0;
+
+  for (let i = 0; i < locationsArray.length; i += chunkSize) {
+    const chunk = locationsArray.slice(i, i + chunkSize);
+    const valuePlaceholders = [];
+    const params = [];
+
+    for (const r of chunk) {
+      const warehouse = r.warehouse || 'Hall 1';
+      const codeStr = (r.code !== undefined && r.code !== null) ? String(r.code).trim() : '';
+      let rackLabel = r.name ? String(r.name).trim() : '';
+      if (!rackLabel) {
+        rackLabel = codeStr ? `Rack ${codeStr}` : 'Rack';
+      } else if (codeStr && !rackLabel.toLowerCase().includes(codeStr.toLowerCase())) {
+        rackLabel = `${rackLabel} ${codeStr}`;
+      }
+      const fullDisplay = `${warehouse} - ${rackLabel}`;
+      const slug = r.id || `${warehouse}-${rackLabel}`.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const capacity = Number(r.capacity) || 10;
+
+      valuePlaceholders.push('(?, ?, ?, ?)');
+      params.push(slug, fullDisplay, warehouse, capacity);
+    }
+
+    if (valuePlaceholders.length > 0) {
+      const sql = `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
+                   VALUES ${valuePlaceholders.join(', ')}
+                   ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`;
+      await pool.execute(sql, params);
+      totalSaved += chunk.length;
+    }
+  }
+
+  return totalSaved;
+};
+
+export const createWarehouseLocation = async ({ id, code, warehouse = 'Hall 1', capacity = 10 }) => {
+  const cleanCode = String(code || 'Rack').trim();
+  const fullDisplay = cleanCode.toLowerCase().includes(warehouse.toLowerCase()) ? cleanCode : `${warehouse} - ${cleanCode}`;
+  const slug = id || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  await pool.execute(
+    `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
+    [slug, fullDisplay, warehouse, Number(capacity) || 10]
+  );
+  return slug;
 };
 
 export const getAllMaterialCaptures = async () => {
@@ -743,6 +1144,7 @@ export const upsertMaterial = async (m) => {
         cost = ?,
         threshold = ?,
         color = ?,
+        location = ?,
         packets = ?,
         poNumber = ?,
         invoiceNo = ?
@@ -755,6 +1157,7 @@ export const upsertMaterial = async (m) => {
         m.cost !== undefined ? m.cost : ext.cost,
         m.threshold !== undefined ? m.threshold : ext.threshold,
         m.color !== undefined ? m.color : ext.color,
+        m.location !== undefined ? m.location : ext.location,
         m.packets !== undefined ? m.packets : ext.packets,
         m.poNumber !== undefined ? m.poNumber : ext.poNumber,
         m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
@@ -763,16 +1166,16 @@ export const upsertMaterial = async (m) => {
     );
 
     // Sync updated location and packets count back to weight_capture table so they match
-    if (m.color !== undefined) {
+    if (m.location !== undefined) {
       await pool.execute(
         'UPDATE weight_capture SET storeLocation = ?, packets = ? WHERE materialCode = ?',
-        [m.color, m.packets !== undefined ? m.packets : ext.packets, m.id]
+        [m.location, m.packets !== undefined ? m.packets : ext.packets, m.id]
       );
     }
   } else {
     await pool.execute(
-      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, packets, poNumber, invoiceNo)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         m.id,
         m.name || 'Accessory Material',
@@ -781,7 +1184,8 @@ export const upsertMaterial = async (m) => {
         m.unit || 'Pcs',
         m.cost || 0,
         m.threshold || 50,
-        m.color || '',
+        m.color || 'Default',
+        m.location || 'Main Store',
         m.packets || 1,
         m.poNumber || 'N/A',
         m.invoiceNo || 'N/A'
@@ -814,25 +1218,240 @@ export const createApprovalRequest = async (req) => {
 };
 
 export const updateApprovalRequestStatus = async (id, status, extra = {}) => {
+  const normStatus = (status || '').toLowerCase();
   await pool.execute(
     'UPDATE approval_requests SET status=?, rejectionReason=?, resolvedDate=? WHERE id=?',
-    [status, extra.rejectionReason || '', extra.resolvedDate || '', id]
+    [normStatus, extra.rejectionReason || '', extra.resolvedDate || '', id]
   );
+
+  // Automatically connect approval_requests to weight_capture, materials inventory, and purchase_orders
+  try {
+    const [reqRows] = await pool.execute('SELECT * FROM approval_requests WHERE id = ?', [id]);
+    if (reqRows.length > 0) {
+      const ar = reqRows[0];
+      const isTypeInward = ar.type === 'inward_approval' || (ar.type && ar.type.toLowerCase().includes('inward'));
+
+      let parsedItems = [];
+      try {
+        parsedItems = typeof ar.items === 'string' ? JSON.parse(ar.items) : (ar.items || []);
+      } catch (_) {}
+
+      const firstItem = Array.isArray(parsedItems) && parsedItems.length > 0 ? parsedItems[0] : {};
+      const targetPo = (firstItem.poNumber || ar.lotId || '').trim();
+      const targetMatCode = (firstItem.materialCode || ar.materialId || '').trim();
+
+      if (isTypeInward || targetPo || targetMatCode) {
+        // Find matching weight_capture records that are Pending Approval
+        let captureQuery = 'SELECT * FROM weight_capture WHERE (approvalStatus = "Pending Approval" OR approvalStatus IS NULL)';
+        const params = [];
+        if (targetPo && targetMatCode) {
+          captureQuery += ' AND (LOWER(poNumber) = LOWER(?) OR LOWER(materialCode) = LOWER(?))';
+          params.push(targetPo, targetMatCode);
+        } else if (targetPo) {
+          captureQuery += ' AND LOWER(poNumber) = LOWER(?)';
+          params.push(targetPo);
+        } else if (targetMatCode) {
+          captureQuery += ' AND LOWER(materialCode) = LOWER(?)';
+          params.push(targetMatCode);
+        }
+
+        const [matchingCaps] = await pool.execute(captureQuery, params);
+
+        for (const cap of matchingCaps) {
+          if (normStatus === 'approved') {
+            await approveInwardCapture(cap.id, extra.resolvedBy || ar.requesterName || 'Admin', extra.rejectionReason || 'Approved via Queue');
+          } else if (normStatus === 'rejected') {
+            await rejectInwardCapture(cap.id, extra.resolvedBy || ar.requesterName || 'Admin', extra.rejectionReason || 'Rejected via Queue');
+          }
+        }
+
+        // Always recalculate PO status for purchase_orders
+        if (targetPo) {
+          await updatePOCompletionStatus(targetPo);
+        }
+      }
+    }
+  } catch (syncErr) {
+    console.error('[DB] Failed to sync approval_request status to weight_capture/purchase_orders:', syncErr.message);
+  }
 };
 
 // ── Purchase Orders ───────────────────────────────────────────────────────────
 
+export const updatePOCompletionStatus = async (poNumber) => {
+  if (!poNumber) return null;
+  const cleanPo = String(poNumber).trim();
+  if (!cleanPo) return null;
+
+  try {
+    const [poRows] = await pool.execute('SELECT * FROM purchase_orders WHERE LOWER(poNumber) = ?', [cleanPo.toLowerCase()]);
+    if (poRows.length === 0) return null;
+    const po = poRows[0];
+
+    let items = [];
+    try {
+      items = typeof po.items === 'string' ? JSON.parse(po.items) : (po.items || []);
+    } catch (_) {
+      items = [];
+    }
+
+    const totalOrdered = items.reduce((sum, itm) => sum + (parseFloat(itm.qty || itm.quantity || 0) || 0), 0);
+
+    const [recvRows] = await pool.execute(
+      `SELECT 
+        SUM(CASE WHEN approvalStatus = 'Approved' OR approvalStatus IS NULL THEN pieces ELSE 0 END) as approvedPieces,
+        SUM(CASE WHEN approvalStatus = 'Pending Approval' THEN pieces ELSE 0 END) as pendingPieces,
+        SUM(CASE WHEN approvalStatus = 'Pending Approval' THEN 1 ELSE 0 END) as pendingCount
+       FROM weight_capture WHERE LOWER(poNumber) = ?`,
+      [cleanPo.toLowerCase()]
+    );
+    const approvedReceived = Number(recvRows[0]?.approvedPieces) || 0;
+    const pendingPieces = Number(recvRows[0]?.pendingPieces) || 0;
+    const pendingCount = Number(recvRows[0]?.pendingCount) || 0;
+
+    let newStatus = po.status || 'Sent to Vendor';
+    if (pendingCount > 0) {
+      newStatus = 'Pending Approval';
+    } else if (totalOrdered > 0) {
+      if (approvedReceived >= totalOrdered) {
+        newStatus = 'Completed';
+      } else if (approvedReceived > 0) {
+        newStatus = 'Partially Received';
+      } else {
+        newStatus = 'Sent to Vendor';
+      }
+    } else if (approvedReceived > 0) {
+      newStatus = 'Completed';
+    } else {
+      newStatus = 'Sent to Vendor';
+    }
+
+    if (newStatus !== po.status) {
+      await pool.execute('UPDATE purchase_orders SET status=? WHERE id=?', [newStatus, po.id]);
+    }
+    return { poNumber: cleanPo, totalOrdered, approvedReceived, pendingPieces, status: newStatus };
+  } catch (err) {
+    console.error('[DB] updatePOCompletionStatus error:', err.message);
+    return null;
+  }
+};
+
 export const getAllPOs = async () => {
   const [rows] = await pool.execute('SELECT * FROM purchase_orders ORDER BY date DESC');
-  return rows.map(r => ({ ...r, items: r.items ? JSON.parse(r.items) : [] }));
+  let captureMap = new Map();
+  let statusMap = new Map();
+  try {
+    const [captures] = await pool.execute(
+      'SELECT poNumber, approvalStatus, SUM(pieces) as totalPieces, COUNT(*) as count FROM weight_capture WHERE poNumber IS NOT NULL AND poNumber != "" GROUP BY poNumber, approvalStatus'
+    );
+    captures.forEach(c => {
+      if (c.poNumber) {
+        const raw = String(c.poNumber).trim().toLowerCase();
+        const clean = raw.replace(/^po-?/i, '');
+        const isApproved = c.approvalStatus === 'Approved' || !c.approvalStatus;
+        const isRejected = c.approvalStatus === 'Rejected';
+        const isPending = c.approvalStatus === 'Pending Approval';
+        const pcs = Number(c.totalPieces) || 0;
+
+        [raw, clean, 'po-' + clean].forEach(k => {
+          if (!captureMap.has(k)) captureMap.set(k, { approved: 0, rejected: 0, pending: 0 });
+          const cur = captureMap.get(k);
+          if (isApproved) cur.approved += pcs;
+          if (isRejected) cur.rejected += pcs;
+          if (isPending) cur.pending += pcs;
+        });
+      }
+    });
+  } catch (_) {}
+
+  return rows.map(r => {
+    let items = [];
+    try {
+      items = r.items ? (typeof r.items === 'string' ? JSON.parse(r.items) : r.items) : [];
+    } catch (_) {
+      items = [];
+    }
+
+    const totalOrdered = items.reduce((sum, itm) => sum + (parseFloat(itm.qty || itm.quantity || 0) || 0), 0);
+    const rawPo = (r.poNumber || '').trim().toLowerCase();
+    const cleanPo = rawPo.replace(/^po-?/i, '');
+    const capInfo = captureMap.get(rawPo) || captureMap.get(cleanPo) || captureMap.get('po-' + cleanPo) || { approved: 0, rejected: 0, pending: 0 };
+    const totalReceived = capInfo.approved;
+
+    let computedStatus = r.status || 'Sent to Vendor';
+    if (capInfo.pending > 0) {
+      computedStatus = 'Pending Approval';
+    } else if (capInfo.rejected > 0 && capInfo.approved === 0) {
+      computedStatus = 'Rejected';
+    } else if (totalOrdered > 0) {
+      if (totalReceived >= totalOrdered) {
+        computedStatus = 'Completed';
+      } else if (totalReceived > 0) {
+        computedStatus = 'Partially Received';
+      }
+    } else if (totalReceived > 0) {
+      computedStatus = 'Completed';
+    }
+
+    return {
+      ...r,
+      items,
+      totalOrdered,
+      totalReceived,
+      status: computedStatus
+    };
+  });
+};
+
+export const getAcceptedOrders = async () => {
+  const all = await getAllPOs();
+  let captures = [];
+  try {
+    const [rows] = await pool.execute(
+      "SELECT * FROM weight_capture WHERE approvalStatus = 'Approved' OR approvalStatus IS NULL ORDER BY id ASC"
+    );
+    captures = rows;
+  } catch (_) {}
+
+  const cleanPo = str => String(str || '').trim().toLowerCase().replace(/^po-?/i, '');
+
+  return all
+    .filter(po => {
+      const isAcc = po.status === 'Completed' || po.status === 'Accepted' || (po.totalOrdered > 0 && po.totalReceived >= po.totalOrdered) || (po.totalReceived > 0 && po.status !== 'Rejected' && po.status !== 'Pending Approval');
+      return isAcc;
+    })
+    .map(po => {
+      const norm = cleanPo(po.poNumber);
+      const poCaptures = captures.filter(c => cleanPo(c.poNumber) === norm);
+      return {
+        ...po,
+        acceptedCaptures: poCaptures,
+        acceptedBills: poCaptures.map(c => ({
+          id: c.id,
+          invoiceNo: c.invoiceNo || c.billNo || 'N/A',
+          materialName: c.materialName || c.category || 'Trim Item',
+          pieces: Number(c.pieces) || 0,
+          packets: Number(c.packets) || 1,
+          location: c.storeLocation || 'Main Store',
+          date: c.capturedAt ? new Date(c.capturedAt).toLocaleDateString('en-GB') : (c.date || 'N/A'),
+          approvedBy: c.approvedBy || 'Admin',
+          approvedAt: c.approvedAt || c.capturedAt || 'N/A'
+        }))
+      };
+    });
 };
 
 export const createPO = async (po) => {
   const itemsJson = po.items ? JSON.stringify(po.items) : '[]';
+  const cleanPo = (po.poNumber || '').trim();
 
-  // Auto-generate sequential numeric ID if it is a new PO (id starts with 'PO' or is empty)
+  // Check if a record with this exact poNumber already exists to prevent duplicate rows
+  const [existing] = await pool.execute('SELECT id FROM purchase_orders WHERE LOWER(poNumber) = LOWER(?)', [cleanPo]);
+
   let finalId = po.id;
-  if (!po.id || String(po.id).startsWith('PO')) {
+  if (existing.length > 0) {
+    finalId = existing[0].id;
+  } else if (!po.id || String(po.id).startsWith('PO')) {
     try {
       const [rows] = await pool.execute('SELECT id FROM purchase_orders');
       const ids = rows.map(r => parseInt(r.id, 10)).filter(n => !isNaN(n));
@@ -845,10 +1464,10 @@ export const createPO = async (po) => {
 
   await pool.execute(
     `REPLACE INTO purchase_orders
-      (id,poNumber,vendorName,vendorEmail,vendorAddress,designName,designCategory,
+      (id,poNumber,vendorName,designName,designCategory,
        items,subtotal,taxRate,tax,total,date,deliveryDate,status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [finalId, po.poNumber, po.vendorName || '', po.vendorEmail || '', po.vendorAddress || '',
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [finalId, cleanPo, po.vendorName || '',
       po.designName || '', po.designCategory || '', itemsJson,
       po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
       po.date || '', po.deliveryDate || '', po.status || 'Draft']
@@ -865,9 +1484,41 @@ export const getPOByNumberOrId = async (poIdentifier) => {
     [poIdentifier, poIdentifier]
   );
   if (rows[0]) {
+    const po = rows[0];
+    let items = [];
+    try {
+      items = po.items ? (typeof po.items === 'string' ? JSON.parse(po.items) : po.items) : [];
+    } catch (_) {
+      items = [];
+    }
+    const totalOrdered = items.reduce((sum, itm) => sum + (parseFloat(itm.qty || itm.quantity || 0) || 0), 0);
+
+    let totalReceived = 0;
+    try {
+      const [recvRows] = await pool.execute(
+        'SELECT SUM(pieces) as totalPieces FROM weight_capture WHERE LOWER(poNumber) = ?',
+        [(po.poNumber || '').toLowerCase()]
+      );
+      totalReceived = Number(recvRows[0]?.totalPieces) || 0;
+    } catch (_) {}
+
+    let computedStatus = po.status || 'Sent to Vendor';
+    if (totalOrdered > 0) {
+      if (totalReceived >= totalOrdered) {
+        computedStatus = 'Completed';
+      } else if (totalReceived > 0) {
+        computedStatus = 'Partially Received';
+      }
+    } else if (totalReceived > 0) {
+      computedStatus = 'Completed';
+    }
+
     return {
-      ...rows[0],
-      items: rows[0].items ? JSON.parse(rows[0].items) : []
+      ...po,
+      items,
+      totalOrdered,
+      totalReceived,
+      status: computedStatus
     };
   }
   return null;
@@ -896,7 +1547,13 @@ export const deleteVendor = async (id) => {
 
 export const getSetting = async (key) => {
   const [rows] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key=?', [key]);
-  return rows[0] ? JSON.parse(rows[0].setting_value) : null;
+  if (!rows[0]) return null;
+  const parsed = JSON.parse(rows[0].setting_value);
+  if (key === 'designers_list' && Array.isArray(parsed)) {
+    const cleaned = parsed.filter(d => !['sarah connor', 'michael scott'].includes(String(d).toLowerCase().trim()));
+    return cleaned.length > 0 ? (cleaned.includes('Admin') ? cleaned : ['Admin', ...cleaned]) : ['Admin'];
+  }
+  return parsed;
 };
 
 export const setSetting = async (key, value) => {
@@ -904,6 +1561,18 @@ export const setSetting = async (key, value) => {
     'REPLACE INTO settings (setting_key,setting_value) VALUES (?,?)',
     [key, JSON.stringify(value)]
   );
+
+  // If warehouse_racks is updated, automatically sync to warehouse_locations table
+  if (key === 'warehouse_racks' && Array.isArray(value)) {
+    try {
+      if (value.length > 0) {
+        await bulkSaveWarehouseLocations(value);
+        console.log(`[DB] Successfully synced and updated ${value.length} racks in warehouse_locations table.`);
+      }
+    } catch (locSyncErr) {
+      console.error('[DB] Failed to sync warehouse_locations on setting update:', locSyncErr.message);
+    }
+  }
 };
 
 // ── Issue Logs ────────────────────────────────────────────────────────────────
@@ -930,13 +1599,13 @@ export const createIssueLog = async (log) => {
 };
 
 export const getCuttingMatrixByLot = async (lotNo) => {
-  const [headers] = await pool.execute('SELECT * FROM cutting_header WHERE Lot_Number = ?', [lotNo]);
+  const [headers] = await pool.execute('SELECT * FROM cutting_header WHERE LOWER(Lot_Number) = LOWER(?)', [lotNo]);
   if (headers.length === 0) return null;
 
   const header = headers[0];
   const [matrixRows] = await pool.execute('SELECT * FROM cuttings_matrix WHERE header_id = ?', [header.id]);
 
-  const parsedRows = matrixRows.map(row => {
+  let parsedRows = matrixRows.map(row => {
     const sizes = {};
     if (row.M !== null) sizes['M'] = row.M;
     if (row.L !== null) sizes['L'] = row.L;
@@ -951,11 +1620,61 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     };
   });
 
+  // If no detailed matrix rows exist in cuttings_matrix table, generate them from Shades & Sizes
+  if (parsedRows.length === 0 && (header.Shades || header.Sizes || header.Cutting_Qty)) {
+    const rawShades = (header.Shades || 'Standard')
+      .split(/[,/;\r\n]+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+
+    const parsedShades = rawShades.map(s => {
+      const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
+      const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
+      const cleanColor = s.replace(/\[\d+\]|\(\d+\)/g, '').trim();
+      return { color: cleanColor || s, count };
+    });
+
+    const uniqueShades = parsedShades.filter(s => s.color.length > 0);
+    if (uniqueShades.length === 0) uniqueShades.push({ color: 'As Per Spec', count: 1 });
+
+    const rawSizes = (header.Sizes || 'M, L, XL, XXL')
+      .split(/[,/;\r\n]+/)
+      .map(s => s.trim().toUpperCase())
+      .filter(s => s.length > 0);
+
+    const standardSizes = ['M', 'L', 'XL', 'XXL'];
+    const activeSizes = rawSizes.length > 0 ? rawSizes : standardSizes;
+
+    const totalQty = parseInt(header.Cutting_Qty, 10) || uniqueShades.length;
+    const qtyPerShade = Math.max(1, Math.floor(totalQty / uniqueShades.length));
+
+    parsedRows = uniqueShades.map(shade => {
+      const sizeMap = {};
+      const shadeTotal = Math.max(shade.count, qtyPerShade);
+      const perSize = Math.max(1, Math.floor(shadeTotal / (activeSizes.length || 1)));
+
+      activeSizes.forEach(sz => {
+        sizeMap[sz] = perSize;
+      });
+
+      standardSizes.forEach(sz => {
+        if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
+      });
+
+      return {
+        color: shade.color,
+        cuttingTable: 1,
+        sizes: sizeMap,
+        totalPcs: shadeTotal
+      };
+    });
+  }
+
   // Query latest doori payload for this lot
   let dooriPayload = null;
   try {
     const [dooriRows] = await pool.execute(
-      'SELECT dori_payload FROM doori WHERE Lot_Number = ? ORDER BY version DESC LIMIT 1',
+      'SELECT dori_payload FROM doori WHERE LOWER(Lot_Number) = LOWER(?) ORDER BY version DESC LIMIT 1',
       [lotNo]
     );
     if (dooriRows.length > 0) {
@@ -1013,6 +1732,31 @@ export const getNextPoNumber = async (type) => {
     throw e;
   } finally {
     conn.release();
+  }
+};
+
+export const getNextGeneralPoNumber = async () => {
+  try {
+    const [rows] = await pool.execute('SELECT poNumber FROM purchase_orders');
+    const [wcRows] = await pool.execute('SELECT poNumber FROM weight_capture WHERE poNumber IS NOT NULL AND poNumber != \'\'');
+    
+    const allPos = [...rows.map(r => r.poNumber), ...wcRows.map(r => r.poNumber)].filter(Boolean);
+    
+    let maxNum = 11000;
+    for (const po of allPos) {
+      const match = String(po).match(/PO-?(\d+)/i) || String(po).match(/(\d+)/);
+      if (match) {
+        const n = parseInt(match[1], 10);
+        if (n >= 11000 && n < 20000 && n > maxNum) {
+          maxNum = n;
+        }
+      }
+    }
+
+    return `PO-${maxNum + 1}`;
+  } catch (err) {
+    console.error('Error generating next PO number:', err);
+    return `PO-${Date.now().toString().slice(-5)}`;
   }
 };
 
@@ -1422,6 +2166,309 @@ export const getAllRgps = async () => {
   return rows.map(r => ({ ...r, entries: r.entries ? JSON.parse(r.entries) : [] }));
 };
 
+export const getUndesignedCuttingLots = async () => {
+  const [rows] = await pool.execute(`
+    SELECT ch.* 
+    FROM cutting_header ch
+    WHERE ch.Lot_Number IS NOT NULL 
+      AND ch.Lot_Number != ''
+      AND ch.Lot_Number REGEXP '^[0-9]+$'
+      AND (
+        (ch.Date_of_Issue LIKE '2026-08-%' AND CAST(SUBSTRING(ch.Date_of_Issue, 9, 2) AS UNSIGNED) >= 10)
+        OR (ch.Date_of_Issue >= '2026-09-01' AND ch.Date_of_Issue LIKE '2026-%')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM designs d 
+        WHERE LOWER(TRIM(d.id)) = LOWER(TRIM(ch.Lot_Number))
+           OR LOWER(TRIM(COALESCE(d.lotNo2, ''))) = LOWER(TRIM(ch.Lot_Number))
+           OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
+           OR LOWER(TRIM(COALESCE(d.repeat_against, ''))) = LOWER(TRIM(ch.Lot_Number))
+      )
+    ORDER BY ch.Date_of_Issue DESC, ch.id DESC
+  `);
+  return rows;
+};
+
+// ── Material Inward Eligibility & Tolerance Checker ─────────────────────────
+
+export const checkInwardEligibility = async ({ poNumber = '', materialName = '', supplier = '', invoiceNo = '', incomingQty = 0 }) => {
+  let orderedQty = 0;
+  let poFound = false;
+  let poDetails = null;
+
+  const cleanPo = (poNumber || '').trim();
+  const cleanMat = (materialName || '').trim().toLowerCase();
+  const cleanSup = (supplier || '').trim().toLowerCase();
+  const cleanInv = (invoiceNo || '').trim().toLowerCase();
+
+  // 1. Look up PO details if poNumber provided
+  if (cleanPo) {
+    const [poRows] = await pool.execute('SELECT * FROM purchase_orders WHERE LOWER(poNumber) = ?', [cleanPo.toLowerCase()]);
+    if (poRows.length > 0) {
+      poFound = true;
+      poDetails = poRows[0];
+      let items = [];
+      if (Array.isArray(poDetails.items)) {
+        items = poDetails.items;
+      } else if (typeof poDetails.items === 'string') {
+        try { items = JSON.parse(poDetails.items); } catch (_) { items = []; }
+      }
+
+      // Find matching item in PO
+      for (const itm of items) {
+        const itmName = (itm.name || itm.description || itm.item || '').toLowerCase().trim();
+        const itmQty = parseFloat(itm.qty || itm.quantity || 0);
+        if (!cleanMat || itmName.includes(cleanMat) || cleanMat.includes(itmName)) {
+          orderedQty += itmQty;
+        }
+      }
+      if (orderedQty === 0 && items.length > 0) {
+        orderedQty = items.reduce((sum, itm) => sum + (parseFloat(itm.qty || itm.quantity || 0) || 0), 0);
+      }
+    }
+  }
+
+  // 2. Check already received quantity for this PO and material
+  let receivedQty = 0;
+  if (cleanPo) {
+    const [recvRows] = await pool.execute(
+      `SELECT SUM(pieces) as totalPieces FROM weight_capture WHERE LOWER(poNumber) = ?`,
+      [cleanPo.toLowerCase()]
+    );
+    receivedQty = Number(recvRows[0]?.totalPieces) || 0;
+  }
+
+  const remainingQty = poFound ? Math.max(0, orderedQty - receivedQty) : null;
+
+  // 3. Check for Duplicate Invoice / Bill No from same Supplier
+  let isDuplicateInvoice = false;
+  let duplicateRecords = [];
+  if (cleanSup && cleanInv) {
+    const [dupRows] = await pool.execute(
+      `SELECT id, materialCode, materialName, poNumber, invoiceNo, supplier, pieces, capturedAt 
+       FROM weight_capture 
+       WHERE LOWER(supplier) = ? AND LOWER(invoiceNo) = ?`,
+      [cleanSup, cleanInv]
+    );
+    if (dupRows.length > 0) {
+      isDuplicateInvoice = true;
+      duplicateRecords = dupRows;
+    }
+  }
+
+  // 4. Check 3% Quantity Tolerance Rule
+  let isExcess = false;
+  let excessPercent = 0;
+  const numIncoming = Number(incomingQty) || 0;
+
+  if (poFound && orderedQty > 0 && remainingQty !== null) {
+    // 3% excess rule: exceeds remaining required quantity by > 3%
+    const toleranceLimit = remainingQty * 1.03;
+    if (numIncoming > toleranceLimit) {
+      isExcess = true;
+      const diff = numIncoming - remainingQty;
+      excessPercent = remainingQty > 0 ? parseFloat(((diff / remainingQty) * 100).toFixed(1)) : 100;
+    }
+  }
+
+  const reasons = [];
+  if (isDuplicateInvoice) {
+    reasons.push(`Duplicate Bill No: Invoice "${invoiceNo}" from supplier "${supplier}" was already entered in database.`);
+  }
+  if (isExcess) {
+    reasons.push(`Excess Quantity: Incoming ${numIncoming.toLocaleString()} pcs exceeds remaining needed ${remainingQty?.toLocaleString() || 0} pcs by ${excessPercent}% (> 3% tolerance).`);
+  }
+
+  const requiresApproval = isDuplicateInvoice || isExcess;
+
+  return {
+    poFound,
+    orderedQty,
+    receivedQty,
+    remainingQty,
+    isDuplicateInvoice,
+    duplicateRecords,
+    isExcess,
+    requiresApproval,
+    reasons
+  };
+};
+
+export const getMaterialTraceability = async (query = '') => {
+  const q = String(query || '').trim().toLowerCase();
+  
+  // 1. Fetch materials
+  const [allMaterials] = await pool.execute('SELECT * FROM materials ORDER BY name ASC');
+  
+  // 2. Fetch weight_captures
+  const [allCaptures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id DESC');
+  
+  // 3. Fetch issue_logs / material_issues
+  let issueLogs = [];
+  try {
+    const [iRows] = await pool.execute('SELECT * FROM material_issues ORDER BY id DESC');
+    issueLogs = iRows;
+  } catch (_) {
+    try {
+      const [iRows] = await pool.execute('SELECT * FROM issue_logs ORDER BY id DESC');
+      issueLogs = iRows;
+    } catch (_) {}
+  }
+
+  // 4. Fetch material_transfers
+  let transfers = [];
+  try {
+    const [tRows] = await pool.execute('SELECT * FROM material_transfers ORDER BY id DESC');
+    transfers = tRows;
+  } catch (_) {}
+
+  // 5. Fetch scanner_logs
+  let scanLogs = [];
+  try {
+    const [sRows] = await pool.execute('SELECT * FROM scanner_logs ORDER BY id DESC');
+    scanLogs = sRows;
+  } catch (_) {}
+
+  // 6. Fetch cutting_header for Lot metadata
+  let cuttingLots = {};
+  try {
+    const [cRows] = await pool.execute('SELECT Lot_Number, Fabric, Garment_Type, Style, Party_Name, Supervisor FROM cutting_header');
+    cRows.forEach(c => {
+      cuttingLots[String(c.Lot_Number).trim()] = c;
+    });
+  } catch (_) {}
+
+  // Filter materials matching query
+  const matchedMaterials = allMaterials.filter(m => {
+    if (!q) return true;
+    const mId = String(m.id || '').toLowerCase();
+    const mName = String(m.name || '').toLowerCase();
+    const mCat = String(m.category || '').toLowerCase();
+    const mCol = String(m.color || '').toLowerCase();
+    const mLoc = String(m.location || '').toLowerCase();
+    return mId.includes(q) || mName.includes(q) || mCat.includes(q) || mCol.includes(q) || mLoc.includes(q);
+  });
+
+  // Build complete trace for each matched material
+  const traceabilityRecords = matchedMaterials.map(m => {
+    const matId = String(m.id || '').trim();
+    const matName = String(m.name || '').trim().toLowerCase();
+
+    // Related captures (Inward entries)
+    const relatedCaptures = allCaptures.filter(c => {
+      const cCode = String(c.materialCode || '').trim().toLowerCase();
+      const cName = String(c.materialName || '').trim().toLowerCase();
+      const cBarcode = String(c.barcodeId || '').trim().toLowerCase();
+      return (cCode && (cCode === matId.toLowerCase() || cCode.includes(matId.toLowerCase()))) ||
+             (cName && (cName === matName || cName.includes(matName) || matName.includes(cName))) ||
+             (cBarcode && cBarcode.includes(matId.toLowerCase()));
+    });
+
+    // Related issue logs (Consumption / Issue against Cutting Lots)
+    const relatedIssues = [];
+    issueLogs.forEach(log => {
+      let matItems = [];
+      try {
+        matItems = typeof log.materials === 'string' ? JSON.parse(log.materials) : (log.materials || []);
+      } catch (_) {
+        matItems = [];
+      }
+
+      const matchingItem = matItems.find(it => {
+        const iId = String(it.materialId || '').trim().toLowerCase();
+        const iName = String(it.name || it.materialName || '').trim().toLowerCase();
+        return (iId && iId === matId.toLowerCase()) ||
+               (iName && (iName === matName || iName.includes(matName) || matName.includes(iName)));
+      });
+
+      if (matchingItem) {
+        const lotInfo = cuttingLots[String(log.lotId).trim()] || {};
+        relatedIssues.push({
+          issueId: log.id,
+          lotId: log.lotId,
+          isReissue: Boolean(log.isReissue),
+          isReturn: Boolean(log.isReturn),
+          qtyIssued: Number(matchingItem.qty || matchingItem.totalRequired || 0) || 0,
+          unit: matchingItem.unit || m.unit || 'pcs',
+          bomItemName: matchingItem.bomItemName || 'Accessory',
+          personName: log.personName || 'Store Incharge',
+          date: log.date || 'N/A',
+          fabric: lotInfo.Fabric || 'Standard',
+          garmentType: lotInfo.Garment_Type || log.category || 'Garment',
+          style: lotInfo.Style || 'Standard',
+          supervisor: lotInfo.Supervisor || log.personName || 'Production Supervisor'
+        });
+      }
+    });
+
+    // Related transfers
+    const relatedTransfers = transfers.filter(t => {
+      const tCode = String(t.materialCode || t.materialId || '').trim().toLowerCase();
+      const tName = String(t.materialName || '').trim().toLowerCase();
+      return tCode === matId.toLowerCase() || tName.includes(matName) || matName.includes(tName);
+    });
+
+    // Related scanner logs
+    const relatedScans = scanLogs.filter(s => {
+      const sBar = String(s.barcode || '').trim().toLowerCase();
+      return sBar.includes(matId.toLowerCase()) || relatedCaptures.some(c => String(c.barcodeId || '').toLowerCase() === sBar);
+    });
+
+    // Totals
+    const totalInwardPieces = relatedCaptures
+      .filter(c => c.approvalStatus === 'Approved' || !c.approvalStatus)
+      .reduce((sum, c) => sum + (Number(c.pieces) || 0), 0);
+    const totalInwardPackets = relatedCaptures
+      .filter(c => c.approvalStatus === 'Approved' || !c.approvalStatus)
+      .reduce((sum, c) => sum + (Number(c.packets) || 1), 0);
+    const totalIssuedPieces = relatedIssues
+      .filter(i => !i.isReturn)
+      .reduce((sum, i) => sum + i.qtyIssued, 0);
+    const totalReturnedPieces = relatedIssues
+      .filter(i => i.isReturn)
+      .reduce((sum, i) => sum + i.qtyIssued, 0);
+
+    // Compute Packet-Level Breakdown with Barcodes
+    const totalPackets = Math.max(1, Number(m.packets) || totalInwardPackets || 1);
+    const primaryBarcodeBase = (relatedCaptures[0]?.barcodeId) || `${matId}-A${String(totalPackets).padStart(2, '0')}`;
+    const packetList = [];
+    const pcsPerPkt = totalPackets > 0 ? Math.round((Number(m.stock) || 0) / totalPackets) : (Number(m.stock) || 0);
+
+    for (let pIdx = 1; pIdx <= totalPackets; pIdx++) {
+      const packetBarcode = `${matId}-PKT${String(pIdx).padStart(3, '0')}`;
+      packetList.push({
+        packetNo: pIdx,
+        totalPackets,
+        barcode: packetBarcode,
+        location: m.location || 'Main Store',
+        pieces: pcsPerPkt,
+        status: (Number(m.stock) || 0) > 0 ? 'In Stock' : 'Consumed'
+      });
+    }
+
+    return {
+      material: m,
+      totalInwardPieces,
+      totalInwardPackets,
+      totalIssuedPieces,
+      totalReturnedPieces,
+      currentStock: Number(m.stock) || 0,
+      packetsCount: totalPackets,
+      primaryBarcode: primaryBarcodeBase,
+      captures: relatedCaptures,
+      issues: relatedIssues,
+      transfers: relatedTransfers,
+      scans: relatedScans,
+      packets: packetList
+    };
+  });
+
+  return traceabilityRecords;
+};
+
 // ── Export pool as default ────────────────────────────────────────────────────
 export default pool;
+
+
+
 

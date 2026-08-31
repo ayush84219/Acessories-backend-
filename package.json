@@ -15,6 +15,7 @@
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.3.0",
-    "nodemailer": "^9.0.1"
+    "nodemailer": "^9.0.1",
+    "xlsx": "^0.18.5"
   }
 }

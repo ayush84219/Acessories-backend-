@@ -55,14 +55,23 @@ import {
   getMaterialTransfers,
   createRgp,
   getRgpByNo,
-  getAllRgps
+  getAllRgps,
+  getUndesignedCuttingLots,
+  getAllWarehouseLocations,
+  createWarehouseLocation,
+  bulkSaveWarehouseLocations,
+  checkInwardEligibility,
+  approveInwardCapture,
+  rejectInwardCapture,
+  getNextGeneralPoNumber,
+  getAcceptedOrders,
+  getMaterialTraceability
 } from './db.js';
 import pool from './db.js';
 
-dotenv.config();
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '.env') });
 const CACHE_DIR = path.join(__dirname, 'cache');
 
 if (!fs.existsSync(CACHE_DIR)) {
@@ -474,19 +483,14 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes TTL
 
 // Read persisted cache time from disk so restarts don't re-trigger fetch
 let lastFetchTime = 0;
-try {
-  if (fs.existsSync(LOTS_CACHE_TIME_PATH)) {
-    lastFetchTime = parseInt(fs.readFileSync(LOTS_CACHE_TIME_PATH, 'utf8') || '0', 10);
-  }
-} catch (_) { }
 
-async function getLotsCSV() {
-  const url = 'https://docs.google.com/spreadsheets/d/13ArpFOD7idmpv7QIRJQkD-tfswtkH6rNnEANtv2M7Ek/export?format=csv&gid=0';
-  const now = Date.now();
+async function getLotsCSV(force = false) {
+  const url = 'https://docs.google.com/spreadsheets/d/1fKSwGBIpzWEFk566WRQ4bzQ0anJlmasoY8TwrTLQHXI/export?format=csv&gid=0';
+  const now = Date.now();   
   const cacheExists = fs.existsSync(LOTS_CSV_CACHE_PATH);
 
-  // If cache is still fresh, serve it directly
-  if (cacheExists && (now - lastFetchTime < CACHE_TTL_MS)) {
+  // If cache is still fresh and force is false, serve it directly
+  if (!force && cacheExists && (now - lastFetchTime < CACHE_TTL_MS)) {
     return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
   }
 
@@ -513,19 +517,177 @@ async function getLotsCSV() {
     // Offline/timeout fallback: serve stale cache if available
     if (cacheExists) {
       console.warn('[Offline Fallback] Serving stale cached CSV.');
-      // Bump lastFetchTime to avoid retry storm
       lastFetchTime = now;
       fs.writeFileSync(LOTS_CACHE_TIME_PATH, String(now), 'utf8');
       return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
     }
-    // No cache at all — return empty CSV so server doesn’t crash
     console.warn('[Fallback] No cache available — returning empty lots.');
     lastFetchTime = now;
     return '';
   }
 }
 
-// 6. Retrieve Lot Data from Google Sheet Route
+// Helper to ensure cuttings_matrix rows exist in database
+async function ensureCuttingsMatrixRows(headerId, lotNo, shadesStr, sizesStr, totalQty) {
+  try {
+    const [existingMatrix] = await pool.execute('SELECT id FROM cuttings_matrix WHERE header_id = ?', [headerId]);
+    if (existingMatrix.length > 0) return;
+
+    const rawShades = (shadesStr || 'Standard')
+      .split(/[,/;\r\n]+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+
+    const parsedShades = rawShades.map(s => {
+      const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
+      const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
+      const cleanColor = s.replace(/\[\d+\]|\(\d+\)/g, '').trim();
+      return { color: cleanColor || s, count };
+    });
+
+    const uniqueShades = parsedShades.filter(s => s.color.length > 0);
+    if (uniqueShades.length === 0) uniqueShades.push({ color: 'Standard', count: 1 });
+
+    const rawSizes = (sizesStr || 'M, L, XL, XXL')
+      .split(/[,/;\r\n]+/)
+      .map(s => s.trim().toUpperCase())
+      .filter(s => s.length > 0);
+
+    const standardSizes = ['M', 'L', 'XL', 'XXL'];
+    const activeSizes = rawSizes.length > 0 ? rawSizes : standardSizes;
+
+    const total = parseInt(totalQty, 10) || uniqueShades.length;
+    const qtyPerShade = Math.max(1, Math.floor(total / uniqueShades.length));
+
+    for (const shade of uniqueShades) {
+      const sizeMap = {};
+      const shadeTotal = Math.max(shade.count, qtyPerShade);
+      const perSize = Math.max(1, Math.floor(shadeTotal / (activeSizes.length || 1)));
+
+      activeSizes.forEach(sz => {
+        sizeMap[sz] = perSize;
+      });
+      standardSizes.forEach(sz => {
+        if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
+      });
+
+      await pool.execute(
+        `INSERT INTO cuttings_matrix (header_id, Lot_No, Color, Cutting_Table, M, L, XL, XXL, Total_Pcs)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          headerId,
+          lotNo || '',
+          shade.color,
+          1,
+          sizeMap['M'] || 0,
+          sizeMap['L'] || 0,
+          sizeMap['XL'] || 0,
+          sizeMap['XXL'] || 0,
+          shadeTotal
+        ]
+      );
+    }
+  } catch (err) {
+    console.warn('[Matrix Sync] Warning ensuring cuttings_matrix:', err.message);
+  }
+}
+
+// Reusable function to synchronize Google Sheets lots into MySQL database
+export async function syncGoogleSheetsToDb(force = false) {
+  try {
+    console.log('[Sync] Starting Google Sheets to MySQL synchronization...');
+    const csvText = await getLotsCSV(force);
+    if (!csvText) {
+      console.warn('[Sync] No CSV text retrieved from Google Sheets.');
+      return { success: false, error: 'Failed to download Google Sheet CSV.' };
+    }
+    const rows = parseCSV(csvText);
+    let inserted = 0;
+    let updated = 0;
+
+    for (const r of rows) {
+      const rawLot = r['Lot Number'] || r['Lot No'] || r['Job Order No'];
+      if (!rawLot || rawLot.trim() === '') continue;
+
+      const trimmedLot = rawLot.trim().substring(0, 100);
+      if (trimmedLot.length > 50 || trimmedLot.toLowerCase().includes('total') || trimmedLot.toLowerCase().includes('summary')) {
+        continue;
+      }
+
+      let headerId = null;
+      const [existing] = await pool.execute('SELECT id FROM cutting_header WHERE Lot_Number = ?', [trimmedLot]);
+      if (existing.length === 0) {
+        const [insertRes] = await pool.execute(
+          `INSERT INTO cutting_header (
+            Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
+            Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, zip_payload
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            trimmedLot,
+            (r['Fabric'] || '').substring(0, 255),
+            (r['Garment Type'] || '').substring(0, 255),
+            (r['Style'] || '').substring(0, 255),
+            (r['Size'] || '').substring(0, 255),
+            r['Shade'] || '',
+            new Date().toISOString(),
+            (r['Date'] || '').substring(0, 100),
+            (r['Submitted By'] || '').substring(0, 255),
+            (r['Party Name'] || '').substring(0, 255),
+            (r['Brand'] || '').substring(0, 255),
+            (r['Season'] || '').substring(0, 100),
+            (r['Direct Stitching'] || '').substring(0, 100),
+            parseInt(r['Quantity']) || 0,
+            (r['Priority'] || 'Normal').substring(0, 50),
+            (r['Sticker'] || '').substring(0, 100),
+            null
+          ]
+        );
+        headerId = insertRes.insertId;
+        inserted++;
+      } else {
+        headerId = existing[0].id;
+        await pool.execute(
+          `UPDATE cutting_header SET
+            Fabric = COALESCE(NULLIF(?, ''), Fabric),
+            Garment_Type = COALESCE(NULLIF(?, ''), Garment_Type),
+            Style = COALESCE(NULLIF(?, ''), Style),
+            Brand = COALESCE(NULLIF(?, ''), Brand),
+            Party_Name = COALESCE(NULLIF(?, ''), Party_Name),
+            Cutting_Qty = COALESCE(NULLIF(?, 0), Cutting_Qty)
+           WHERE Lot_Number = ?`,
+          [
+            (r['Fabric'] || '').substring(0, 255),
+            (r['Garment Type'] || '').substring(0, 255),
+            (r['Style'] || '').substring(0, 255),
+            (r['Brand'] || '').substring(0, 255),
+            (r['Party Name'] || '').substring(0, 255),
+            parseInt(r['Quantity']) || 0,
+            trimmedLot
+          ]
+        );
+        updated++;
+      }
+
+      if (headerId) {
+        await ensureCuttingsMatrixRows(headerId, trimmedLot, r['Shade'], r['Size'], r['Quantity']);
+      }
+    }
+
+    console.log(`[Sync] Complete. Inserted: ${inserted}, Updated: ${updated}, Total Rows: ${rows.length}`);
+    return {
+      success: true,
+      message: 'Google Sheets synchronized successfully with database.',
+      inserted,
+      updated,
+      totalProcessed: rows.length
+    };
+  } catch (err) {
+    console.error('[Sync] Error syncing Google Sheets to DB:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// 6. Retrieve Lot Data from Google Sheet with MySQL Database Fallback & Auto-Save
 app.get('/api/lot/:lotNo', async (req, res) => {
   try {
     const lotNo = req.params.lotNo.trim();
@@ -533,61 +695,206 @@ app.get('/api/lot/:lotNo', async (req, res) => {
       return res.status(400).json({ error: 'Lot number parameter is required.' });
     }
 
-    console.log(`Fetching Google Sheet data for lot: ${lotNo}...`);
-    const csvText = await getLotsCSV();
-    const rows = parseCSV(csvText);
+    console.log(`[Lot Fetch] Searching for lot: ${lotNo}...`);
+    let matchedRow = null;
 
-    const matchedRow = rows.find(row => {
-      const rowLotNo = row['Lot Number'] || row['Lot No'] || row['Job Order No'];
-      return rowLotNo && String(rowLotNo).trim().toLowerCase() === lotNo.toLowerCase();
-    });
-
-    if (!matchedRow) {
-      console.log(`Lot not found in sheet: ${lotNo}`);
-      return res.status(404).json({ error: `Lot number "${lotNo}" not found in Google Sheet.` });
+    // Step 1: Try fetching from Google Sheet CSV
+    try {
+      const csvText = await getLotsCSV();
+      if (csvText) {
+        const rows = parseCSV(csvText);
+        matchedRow = rows.find(row => {
+          const rowLotNo = row['Lot Number'] || row['Lot No'] || row['Job Order No'];
+          return rowLotNo && String(rowLotNo).trim().toLowerCase() === lotNo.toLowerCase();
+        });
+      }
+    } catch (csvErr) {
+      console.warn(`[Lot Fetch] Google Sheet CSV error for ${lotNo}:`, csvErr.message);
     }
 
-    console.log(`Successfully matched lot: ${lotNo}`);
-    res.status(200).json({
-      lotNo: matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo,
-      fabric: matchedRow['Fabric'] || '',
-      brand: matchedRow['Brand'] || '',
-      garmentType: matchedRow['Garment Type'] || '',
-      section: matchedRow['Section'] || '',
-      season: matchedRow['Season'] || '',
-      style: matchedRow['Style'] || '',
-      component: matchedRow['Component'] || matchedRow['Component '] || '',
-      tapeLace: matchedRow['Tape/Lace'] || '',
-      bottomType: matchedRow['Bottom Type'] || '',
-      zip: matchedRow['Zip'] || '',
-      sticker: matchedRow['Sticker'] || '',
-      collar: matchedRow['Collar'] || '',
-      bone: matchedRow['Bone'] || '',
-      fullBaju: matchedRow['FULL BAJU'] || matchedRow['Full Baju'] || '',
-      shade: matchedRow['Shade'] || '',
-      size: matchedRow['Size'] || '',
-      quantity: matchedRow['Quantity'] || '',
-      unit: matchedRow['Unit'] || '',
-      partyName: matchedRow['Party Name'] || '',
-      emb: matchedRow['Emb'] || '',
-      embDetails: matchedRow['Emb Details'] || '',
-      printing: matchedRow['Printing'] || '',
-      printingDetails: matchedRow['Printing Details'] || '',
-      pattern: matchedRow['Pattern'] || '',
-      remarks: matchedRow['Remarks'] || '',
-      directStitching: matchedRow['Direct Stitching'] || '',
-      submittedBy: matchedRow['Submitted By'] || '',
-      imageUrl: matchedRow['Image URL'] || '',
-      priority: matchedRow['Priority'] || '',
-      status: matchedRow['Status'] || ''
-    });
+    if (matchedRow) {
+      console.log(`[Lot Fetch] Successfully matched lot from Google Sheet: ${lotNo}`);
+      
+      // Auto-save/persist this lot into MySQL cutting_header immediately so database stays updated
+      (async () => {
+        try {
+          const rawLot = matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo;
+          const trimmedLot = String(rawLot).trim().substring(0, 100);
+          let headerId = null;
+          const [existing] = await pool.execute('SELECT id FROM cutting_header WHERE Lot_Number = ?', [trimmedLot]);
+          if (existing.length === 0) {
+            const [ins] = await pool.execute(
+              `INSERT INTO cutting_header (
+                Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
+                Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, zip_payload
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                trimmedLot,
+                (matchedRow['Fabric'] || '').substring(0, 255),
+                (matchedRow['Garment Type'] || '').substring(0, 255),
+                (matchedRow['Style'] || '').substring(0, 255),
+                (matchedRow['Size'] || '').substring(0, 255),
+                matchedRow['Shade'] || '',
+                new Date().toISOString(),
+                (matchedRow['Date'] || '').substring(0, 100),
+                (matchedRow['Submitted By'] || '').substring(0, 255),
+                (matchedRow['Party Name'] || '').substring(0, 255),
+                (matchedRow['Brand'] || '').substring(0, 255),
+                (matchedRow['Season'] || '').substring(0, 100),
+                (matchedRow['Direct Stitching'] || '').substring(0, 100),
+                parseInt(matchedRow['Quantity']) || 0,
+                (matchedRow['Priority'] || 'Normal').substring(0, 50),
+                (matchedRow['Sticker'] || '').substring(0, 100),
+                null
+              ]
+            );
+            headerId = ins.insertId;
+            console.log(`[Lot Fetch] Auto-saved new lot "${trimmedLot}" into MySQL cutting_header.`);
+          } else {
+            headerId = existing[0].id;
+          }
+
+          if (headerId) {
+            await ensureCuttingsMatrixRows(headerId, trimmedLot, matchedRow['Shade'], matchedRow['Size'], matchedRow['Quantity']);
+          }
+        } catch (dbSaveErr) {
+          console.warn('[Lot Fetch] Auto-save to DB warning:', dbSaveErr.message);
+        }
+      })();
+
+
+      return res.status(200).json({
+        lotNo: matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo,
+        fabric: matchedRow['Fabric'] || '',
+        brand: matchedRow['Brand'] || '',
+        garmentType: matchedRow['Garment Type'] || '',
+        section: matchedRow['Section'] || '',
+        season: matchedRow['Season'] || '',
+        style: matchedRow['Style'] || '',
+        component: matchedRow['Component'] || matchedRow['Component '] || '',
+        tapeLace: matchedRow['Tape/Lace'] || '',
+        bottomType: matchedRow['Bottom Type'] || '',
+        zip: matchedRow['Zip'] || '',
+        sticker: matchedRow['Sticker'] || '',
+        collar: matchedRow['Collar'] || '',
+        bone: matchedRow['Bone'] || '',
+        fullBaju: matchedRow['FULL BAJU'] || matchedRow['Full Baju'] || '',
+        shade: matchedRow['Shade'] || '',
+        size: matchedRow['Size'] || '',
+        quantity: matchedRow['Quantity'] || '',
+        unit: matchedRow['Unit'] || '',
+        partyName: matchedRow['Party Name'] || '',
+        emb: matchedRow['Emb'] || '',
+        embDetails: matchedRow['Emb Details'] || '',
+        printing: matchedRow['Printing'] || '',
+        printingDetails: matchedRow['Printing Details'] || '',
+        pattern: matchedRow['Pattern'] || '',
+        remarks: matchedRow['Remarks'] || '',
+        directStitching: matchedRow['Direct Stitching'] || '',
+        submittedBy: matchedRow['Submitted By'] || '',
+        imageUrl: matchedRow['Image URL'] || '',
+        priority: matchedRow['Priority'] || '',
+        status: matchedRow['Status'] || ''
+      });
+    }
+
+    // Step 2: Fallback to MySQL cutting_header table
+    console.log(`[Lot Fetch] Lot "${lotNo}" not in Google Sheet CSV. Checking MySQL cutting_header...`);
+    const [dbRows] = await pool.execute(
+      'SELECT * FROM cutting_header WHERE LOWER(Lot_Number) = LOWER(?) LIMIT 1',
+      [lotNo]
+    );
+
+    if (dbRows && dbRows.length > 0) {
+      const cut = dbRows[0];
+      console.log(`[Lot Fetch] Successfully found lot "${lotNo}" in MySQL cutting_header!`);
+      return res.status(200).json({
+        lotNo: cut.Lot_Number || lotNo,
+        fabric: cut.Fabric || '',
+        brand: cut.Brand || cut.Party_Name || '',
+        garmentType: cut.Garment_Type || '',
+        section: cut.MWK || '',
+        season: cut.Season || '',
+        style: cut.Style || '',
+        component: '',
+        tapeLace: '',
+        bottomType: '',
+        zip: '',
+        sticker: cut.Sticker || '',
+        collar: '',
+        bone: '',
+        fullBaju: '',
+        shade: cut.Shades || '',
+        size: cut.Sizes || '',
+        quantity: cut.Cutting_Qty || cut.Stitching_Issue_Qty || '',
+        unit: 'Pcs',
+        partyName: cut.Party_Name || '',
+        emb: '',
+        embDetails: '',
+        printing: '',
+        printingDetails: '',
+        pattern: '',
+        remarks: '',
+        directStitching: cut.Direct_Stitching || '',
+        submittedBy: cut.Supervisor || '',
+        imageUrl: cut.Image_Url || '',
+        priority: cut.Priority || 'Normal',
+        status: cut.Completed_Status || cut.WIP_Status || ''
+      });
+    }
+
+    // Step 3: Fallback to MySQL designs table
+    const [designRows] = await pool.execute(
+      'SELECT * FROM designs WHERE LOWER(id) = LOWER(?) OR LOWER(lotNo2) = LOWER(?) LIMIT 1',
+      [lotNo, lotNo]
+    );
+    if (designRows && designRows.length > 0) {
+      const des = designRows[0];
+      console.log(`[Lot Fetch] Successfully found lot "${lotNo}" in MySQL designs table!`);
+      return res.status(200).json({
+        lotNo: des.id || lotNo,
+        fabric: des.fabricType || '',
+        brand: des.brand || '',
+        garmentType: des.category || '',
+        section: des.section || '',
+        season: des.season || '',
+        style: des.style || '',
+        component: '',
+        tapeLace: des.tapeLace || '',
+        bottomType: des.bottomType || '',
+        zip: des.zip || '',
+        sticker: des.sticker || '',
+        collar: des.collar || '',
+        bone: des.bone || '',
+        fullBaju: des.fullBaju || '',
+        shade: des.colorCode || '',
+        size: des.targetSizes || '',
+        quantity: des.quantity || '',
+        unit: 'Pcs',
+        partyName: des.brand || '',
+        emb: '',
+        embDetails: '',
+        printing: '',
+        printingDetails: '',
+        pattern: '',
+        remarks: des.comments || '',
+        directStitching: '',
+        submittedBy: des.designer || '',
+        imageUrl: des.imageUrl || '',
+        priority: 'Normal',
+        status: des.status || ''
+      });
+    }
+
+    console.log(`[Lot Fetch] Lot "${lotNo}" not found in Google Sheet or Database.`);
+    return res.status(404).json({ error: `Lot number "${lotNo}" not found in Google Sheet or database.` });
   } catch (err) {
-    console.error('Google Sheet Lot Fetch Error:', err.message);
-    res.status(500).json({ error: 'Server failed to retrieve Google Sheet data. Please check internet connection.' });
+    console.error('[Lot Fetch] Error:', err.message);
+    res.status(500).json({ error: 'Server failed to retrieve lot data: ' + err.message });
   }
 });
 
-// 7. Retrieve All Lots from MySQL database (replaces Google Sheet dependency)
+// 7. Retrieve All Lots from MySQL database
 app.get('/api/lots', async (req, res) => {
   try {
     const { getAllCuttingHeaders } = await import('./db.js');
@@ -604,6 +911,57 @@ app.get('/api/lots', async (req, res) => {
     res.status(500).json({ error: 'Failed to retrieve lots from database.' });
   }
 });
+
+// 7.1 Safe Sync Endpoint: Import Google Sheets lots into MySQL without dropping tables
+app.post('/api/sync-google-sheets', async (req, res) => {
+  try {
+    const result = await syncGoogleSheetsToDb(true);
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || 'Failed to sync Google Sheets' });
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('[Sync] Error syncing Google Sheets to DB:', err.message);
+    res.status(500).json({ error: 'Sync failed: ' + err.message });
+  }
+});
+
+// 7.2 Cutting lot reports which are not designed yet
+app.get('/api/reports/undesigned-cutting-lots', async (req, res) => {
+  try {
+    const lots = await getUndesignedCuttingLots();
+    res.status(200).json(lots);
+  } catch (err) {
+    console.error('API GET /api/reports/undesigned-cutting-lots error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve undesigned cutting lots.' });
+  }
+});
+
+// 7.3 Next PO Number Endpoint
+app.get('/api/next-po-number', async (req, res) => {
+  try {
+    const type = req.query.type || 'zip';
+    const nextPo = await getNextPoNumber(type);
+    res.status(200).json({ nextPoNumber: nextPo, poNumber: nextPo });
+  } catch (err) {
+    console.error('API GET /api/next-po-number error:', err.message);
+    res.status(500).json({ error: 'Failed to generate next PO number: ' + err.message });
+  }
+});
+
+
+// 7.4 Approvals List Endpoint Alias
+app.get('/api/approvals', async (req, res) => {
+  try {
+    const [rows] = await pool.execute('SELECT * FROM approval_requests ORDER BY id DESC');
+    res.status(200).json(rows);
+  } catch (err) {
+    console.error('API GET /api/approvals error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch approval requests.' });
+  }
+});
+
+
 
 
 // 8. Image Proxy to cache Google Drive images and avoid 429 Rate Limit errors
@@ -885,14 +1243,119 @@ app.put('/api/approval-requests/:id/status', async (req, res) => {
 
 // ── Purchase Order Routes ───────────────────────────────────────────────────
 
-// GET all purchase orders
+// GET all purchase orders with optional filtering (?material=..., ?status=..., ?search=...)
 app.get('/api/pos', async (req, res) => {
   try {
-    const pos = await getAllPOs();
+    const { material, search, status, vendor } = req.query;
+    let pos = await getAllPOs();
+
+    if (material && material !== 'all') {
+      const matLower = String(material).toLowerCase().trim();
+      pos = pos.filter(po => {
+        if (!po.items || !Array.isArray(po.items)) return false;
+        return po.items.some(item => {
+          const name = String(item.name || item.description || item.item || '').toLowerCase().trim();
+          const dept = String(item.department || item.dept || item.category || '').toLowerCase().trim();
+          return name.includes(matLower) || dept.includes(matLower);
+        });
+      });
+    }
+
+    if (status && status !== 'all') {
+      const sLower = String(status).toLowerCase().trim();
+      pos = pos.filter(po => {
+        const s = String(po.status || '').toLowerCase();
+        return s.includes(sLower);
+      });
+    }
+
+    if (vendor && vendor !== 'all') {
+      const vLower = String(vendor).toLowerCase().trim();
+      pos = pos.filter(po => {
+        const v = String(po.vendorName || '').toLowerCase();
+        return v.includes(vLower);
+      });
+    }
+
+    if (search) {
+      const q = String(search).toLowerCase().trim();
+      const cleanQ = q.replace(/^po-?/i, '').trim();
+      pos = pos.filter(po => {
+        const poNum = String(po.poNumber || '').toLowerCase();
+        const vName = String(po.vendorName || '').toLowerCase();
+        const dName = String(po.designName || '').toLowerCase();
+        const dCat = String(po.designCategory || '').toLowerCase();
+        const itemsStr = Array.isArray(po.items) ? po.items.map(i => (i.name || i.description || i.item || '')).join(' ').toLowerCase() : '';
+
+        return (
+          poNum.includes(q) ||
+          (cleanQ && poNum.replace(/^po-?/i, '').includes(cleanQ)) ||
+          vName.includes(q) ||
+          dName.includes(q) ||
+          dCat.includes(q) ||
+          itemsStr.includes(q)
+        );
+      });
+    }
+
     res.status(200).json(pos);
   } catch (err) {
     console.error('API GET /api/pos error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve purchase orders.' });
+  }
+});
+
+// GET dedicated accepted orders and their approved inward records
+app.get('/api/accepted-orders', async (req, res) => {
+  try {
+    const accepted = await getAcceptedOrders();
+    res.status(200).json({ success: true, count: accepted.length, data: accepted });
+  } catch (err) {
+    console.error('API GET /api/accepted-orders error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to retrieve accepted orders.' });
+  }
+});
+
+// GET unique material list from all POs
+app.get('/api/pos/materials', async (req, res) => {
+  try {
+    const pos = await getAllPOs();
+    const matSet = new Set();
+    pos.forEach(po => {
+      if (Array.isArray(po.items)) {
+        po.items.forEach(itm => {
+          const n = String(itm.name || itm.description || itm.item || '').trim();
+          if (n) matSet.add(n);
+        });
+      }
+    });
+    res.status(200).json({ success: true, materials: Array.from(matSet).sort() });
+  } catch (err) {
+    console.error('API GET /api/pos/materials error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve PO materials.' });
+  }
+});
+
+// GET Material Traceability & Full Lifecycle History
+app.get('/api/materials/traceability', async (req, res) => {
+  try {
+    const { query } = req.query;
+    const records = await getMaterialTraceability(query || '');
+    res.status(200).json({ success: true, count: records.length, data: records });
+  } catch (err) {
+    console.error('API GET /api/materials/traceability error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to retrieve material traceability data.' });
+  }
+});
+
+// GET next unique sequential PO number
+app.get('/api/pos/next-number', async (req, res) => {
+  try {
+    const nextPoNumber = await getNextGeneralPoNumber();
+    res.status(200).json({ success: true, nextPoNumber });
+  } catch (err) {
+    console.error('API GET /api/pos/next-number error:', err.message);
+    res.status(500).json({ error: 'Failed to generate next PO number.' });
   }
 });
 
@@ -1021,12 +1484,19 @@ app.delete('/api/vendors/:id', async (req, res) => {
 
 // ── Settings Routes (accessories & designers lists) ─────────────────────────
 
-// GET all settings (accessories_list + designers_list)
+// GET all settings (accessories_list, designers_list, warehouse_halls, warehouse_racks)
 app.get('/api/settings', async (req, res) => {
   try {
     const accessoriesList = await getSetting('accessories_list');
     const designersList = await getSetting('designers_list');
-    res.status(200).json({ accessoriesList, designersList });
+    const warehouseHalls = await getSetting('warehouse_halls');
+    const warehouseRacks = await getSetting('warehouse_racks');
+    res.status(200).json({
+      accessoriesList: accessoriesList || [],
+      designersList: designersList || [],
+      warehouseHalls: warehouseHalls || [],
+      warehouseRacks: warehouseRacks || []
+    });
   } catch (err) {
     console.error('API GET /api/settings error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve settings.' });
@@ -1298,22 +1768,111 @@ app.get('/api/weight-capture', async (req, res) => {
   }
 });
 
-// Serve static assets in production (if built)
+// ── Inward Material PO Requirement, Duplicate Bill & 3% Tolerance Checker ──
+app.post('/api/inward/check-eligibility', async (req, res) => {
+  try {
+    const result = await checkInwardEligibility(req.body);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[API] inward check-eligibility error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Inward Excess Approval / Rejection Endpoints ────────────────────────────
+app.post('/api/inward/approve', async (req, res) => {
+  try {
+    const { id, approvedBy, note } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'Capture ID is required.' });
+    await approveInwardCapture(id, approvedBy || 'Admin', note);
+    res.json({ success: true, message: `Inward capture #${id} approved and finalized into inventory.` });
+  } catch (err) {
+    console.error('[API] inward approve error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/inward/reject', async (req, res) => {
+  try {
+    const { id, rejectedBy, reason } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'Capture ID is required.' });
+    await rejectInwardCapture(id, rejectedBy || 'Admin', reason);
+    res.json({ success: true, message: `Inward capture #${id} rejected and excluded from inventory.` });
+  } catch (err) {
+    console.error('[API] inward reject error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Warehouse Locations API ──────────────────────────────────────────────────
+app.get('/api/warehouse-locations', async (req, res) => {
+  try {
+    const rows = await getAllWarehouseLocations();
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('[API] warehouse-locations GET error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/warehouse-locations', async (req, res) => {
+  try {
+    const slug = await createWarehouseLocation(req.body);
+    res.json({ success: true, id: slug, message: 'Warehouse location saved.' });
+  } catch (err) {
+    console.error('[API] warehouse-locations POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/warehouse-locations/bulk', async (req, res) => {
+  try {
+    const locations = Array.isArray(req.body) ? req.body : (req.body.locations || []);
+    const count = await bulkSaveWarehouseLocations(locations);
+    res.json({ success: true, count, message: `Successfully saved ${count} warehouse locations.` });
+  } catch (err) {
+    console.error('[API] warehouse-locations bulk POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Serve static assets in production (if built) or redirect to Vite dev server in dev
 const distPath = path.join(__dirname, '../frontend/dist');
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
   app.get('*', (req, res) => {
-    if (req.path.startsWith('/api')) {
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
       return res.status(404).json({ error: 'API route not found' });
     }
     res.sendFile(path.join(distPath, 'index.html'));
+  });
+} else {
+  // In development mode, auto-redirect browser page requests to Vite dev server (port 5173)
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+      return res.status(404).json({ error: 'API route not found' });
+    }
+    const host = req.hostname || 'localhost';
+    return res.redirect(`http://${host}:5173${req.originalUrl}`);
   });
 }
 
 
 // Start Server
 const server = app.listen(PORT, () => {
-  console.log(`G-PDMS Auth Server running on http://localhost:${PORT} (or wait)`);
+  console.log(`G-PDMS Auth Server running on http://localhost:${PORT}`);
+  
+  // Background Auto-Sync Google Sheets to Database on startup
+  setTimeout(() => {
+    console.log('[Auto-Sync] Initiating startup Google Sheets synchronization to MySQL database...');
+    syncGoogleSheetsToDb(false).catch(err => console.warn('[Auto-Sync] Startup sync warning:', err.message));
+  }, 2500);
+
+  // Periodic Auto-Sync every 15 minutes
+  setInterval(() => {
+    console.log('[Auto-Sync] Running periodic Google Sheets synchronization...');
+    syncGoogleSheetsToDb(false).catch(err => console.warn('[Auto-Sync] Periodic sync warning:', err.message));
+  }, 15 * 60 * 1000);
 });
 
 server.on('error', (err) => {
@@ -1321,9 +1880,9 @@ server.on('error', (err) => {
     console.error(`\n[ERROR] Port ${PORT} is already in use.`);
     console.error(`To kill the old process, run in PowerShell:\n`);
     console.error(`    Stop-Process -Id (Get-NetTCPConnection -LocalPort ${PORT}).OwningProcess -Force\n`);
-    // Don't exit — just log so the user can fix it
   } else {
     console.error('[Server Error]', err.message);
   }
 });
+
 
