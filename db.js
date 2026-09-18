@@ -6,26 +6,20 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
-dotenv.config(); // Also check current working directory / root .env
 
 // ── MySQL Connection Pool ──────────────────────────────────────────────────────
 const getPoolConfig = () => {
-  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL || process.env.MYSQL_PUBLIC_URL || process.env.MYSQL_PRIVATE_URL || process.env.JAWSDB_URL || process.env.CLEARDB_DATABASE_URL;
-  
+  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
   if (connectionUri) {
     try {
-      // Normalize uri for URL parser
-      const normalizedUri = connectionUri.startsWith('mysql://') || connectionUri.startsWith('mysql2://') 
-        ? connectionUri 
-        : `mysql://${connectionUri}`;
-      const parsedUrl = new URL(normalizedUri);
-      
-      const config = {
+      const parsedUrl = new URL(connectionUri);
+      return {
         host: parsedUrl.hostname,
         port: Number(parsedUrl.port) || 3306,
-        user: decodeURIComponent(parsedUrl.username || 'root'),
-        password: decodeURIComponent(parsedUrl.password || ''),
-        database: parsedUrl.pathname.replace(/^\//, '').split('?')[0] || 'access',
+        user: decodeURIComponent(parsedUrl.username),
+        password: decodeURIComponent(parsedUrl.password),
+        database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
+        ssl: { rejectUnauthorized: false },
         waitForConnections: true,
         connectionLimit: 25,
         queueLimit: 0,
@@ -33,34 +27,20 @@ const getPoolConfig = () => {
         keepAliveInitialDelay: 10000,
         connectTimeout: 30000,
       };
-
-      const isRemote = config.host !== 'localhost' && config.host !== '127.0.0.1';
-      if (isRemote || process.env.MYSQL_SSL === 'true' || process.env.DB_SSL === 'true') {
-        config.ssl = { rejectUnauthorized: false };
-      }
-
-      console.log(`[DB Config] Loaded from URL -> Host: ${config.host}:${config.port} | User: ${config.user} | DB: ${config.database} | SSL: ${Boolean(config.ssl)}`);
-      return config;
     } catch (e) {
       console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
     }
   }
 
-  const host = (process.env.DB_HOST || process.env.MYSQL_HOST || process.env.MYSQLHOST || 'localhost').trim();
-  const port = Number(process.env.DB_PORT || process.env.MYSQL_PORT || process.env.MYSQLPORT) || 3306;
-  const user = (process.env.DB_USER || process.env.MYSQL_USER || process.env.MYSQLUSER || 'root').trim();
-  const password = process.env.DB_PASSWORD ?? process.env.MYSQL_PASSWORD ?? process.env.MYSQLPASSWORD ?? '';
-  const database = (process.env.DB_NAME || process.env.DB_DATABASE || process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE || 'access').trim();
-
-  const isRemote = host !== 'localhost' && host !== '127.0.0.1';
-  const sslDisabled = process.env.MYSQL_SSL === 'false' || process.env.DB_SSL === 'false';
+  const host = (process.env.MYSQL_HOST || process.env.DB_HOST || 'localhost').trim();
+  const isAivenOrRemote = host.includes('aivencloud.com') || host.includes('railway.internal') || process.env.MYSQL_SSL === 'true';
 
   const config = {
-    host,
-    port,
-    user,
-    password,
-    database,
+    host: host,
+    port: Number(process.env.MYSQL_PORT || process.env.DB_PORT) || 3306,
+    user: (process.env.MYSQL_USER || process.env.DB_USER || 'root').trim(),
+    password: process.env.MYSQL_PASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
+    database: (process.env.MYSQL_DATABASE || process.env.DB_NAME || 'accessories2').trim(),
     waitForConnections: true,
     connectionLimit: 25,
     queueLimit: 0,
@@ -69,12 +49,10 @@ const getPoolConfig = () => {
     connectTimeout: 30000,
   };
 
-  // Automatically enable SSL for any remote host (Aiven, Render, Railway, AWS RDS, etc.)
-  if (isRemote && !sslDisabled) {
+  if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
     config.ssl = { rejectUnauthorized: false };
   }
 
-  console.log(`[DB Config] Loaded -> Host: ${config.host}:${config.port} | User: ${config.user} | DB: ${config.database} | SSL: ${Boolean(config.ssl)}`);
   return config;
 };
 
@@ -189,10 +167,16 @@ const initialAccessories = [
 const initialDesigners = ['Admin'];
 
 // ── initDb: create tables + seed ──────────────────────────────────────────────
-let isDbInitialized = false;
 
-async function setupTables() {
-  if (isDbInitialized) return;
+export async function initDb() {
+  // Test connection on startup
+  try {
+    await pool.execute('SELECT 1');
+    console.log('[DB] MySQL connected successfully.');
+  } catch (err) {
+    console.error('[DB] MySQL connection FAILED:', err.message);
+    process.exit(1);
+  }
 
   // Users
   await pool.execute(`CREATE TABLE IF NOT EXISTS users (
@@ -760,33 +744,6 @@ async function setupTables() {
   } catch (_) { }
 
   console.log('[DB] All tables and high-speed indexes ready.');
-}
-
-export async function initDb() {
-  try {
-    await pool.execute('SELECT 1');
-    console.log('[DB] MySQL connected successfully.');
-    await setupTables();
-    isDbInitialized = true;
-    return true;
-  } catch (err) {
-    console.warn(`[DB] MySQL initial connection warning: ${err.message}. Background reconnection active.`);
-    
-    // Non-fatal background reconnect: keeps the server running and reconnects automatically
-    const retryInterval = setInterval(async () => {
-      try {
-        await pool.execute('SELECT 1');
-        console.log('[DB] MySQL connected successfully (in background).');
-        await setupTables();
-        isDbInitialized = true;
-        clearInterval(retryInterval);
-      } catch (retryErr) {
-        console.warn(`[DB Reconnect] Waiting for database connection (${retryErr.message})...`);
-      }
-    }, 5000);
-
-    return false;
-  }
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────

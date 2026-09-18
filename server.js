@@ -144,12 +144,13 @@ app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Initialize Database (Non-fatal, auto-reconnects in background)
+// Initialize Database
 try {
   await initDb();
   console.log('Database initialized successfully.');
 } catch (err) {
-  console.warn('Database initial connection note:', err.message);
+  console.error('Database initialization failed:', err.message);
+  process.exit(1);
 }
 
 // Mail Transporter Configuration
