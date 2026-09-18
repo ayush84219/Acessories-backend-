@@ -6,49 +6,75 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config(); // Also check current working directory / root .env
 
 // ── MySQL Connection Pool ──────────────────────────────────────────────────────
 const getPoolConfig = () => {
-  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
+  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL || process.env.MYSQL_PUBLIC_URL || process.env.MYSQL_PRIVATE_URL || process.env.JAWSDB_URL || process.env.CLEARDB_DATABASE_URL;
+  
   if (connectionUri) {
     try {
-      const parsedUrl = new URL(connectionUri);
-      return {
+      // Normalize uri for URL parser
+      const normalizedUri = connectionUri.startsWith('mysql://') || connectionUri.startsWith('mysql2://') 
+        ? connectionUri 
+        : `mysql://${connectionUri}`;
+      const parsedUrl = new URL(normalizedUri);
+      
+      const config = {
         host: parsedUrl.hostname,
         port: Number(parsedUrl.port) || 3306,
-        user: decodeURIComponent(parsedUrl.username),
-        password: decodeURIComponent(parsedUrl.password),
-        database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
-        ssl: { rejectUnauthorized: false },
+        user: decodeURIComponent(parsedUrl.username || 'root'),
+        password: decodeURIComponent(parsedUrl.password || ''),
+        database: parsedUrl.pathname.replace(/^\//, '').split('?')[0] || 'access',
         waitForConnections: true,
-        connectionLimit: 10,
+        connectionLimit: 25,
         queueLimit: 0,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 10000,
         connectTimeout: 30000,
       };
+
+      const isRemote = config.host !== 'localhost' && config.host !== '127.0.0.1';
+      if (isRemote || process.env.MYSQL_SSL === 'true' || process.env.DB_SSL === 'true') {
+        config.ssl = { rejectUnauthorized: false };
+      }
+
+      console.log(`[DB Config] Loaded from URL -> Host: ${config.host}:${config.port} | User: ${config.user} | DB: ${config.database} | SSL: ${Boolean(config.ssl)}`);
+      return config;
     } catch (e) {
       console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
     }
   }
 
-  const host = process.env.MYSQL_HOST || 'localhost';
-  const isAivenOrRemote = host.includes('aivencloud.com') || host.includes('railway.internal') || process.env.MYSQL_SSL === 'true';
+  const host = (process.env.DB_HOST || process.env.MYSQL_HOST || process.env.MYSQLHOST || 'localhost').trim();
+  const port = Number(process.env.DB_PORT || process.env.MYSQL_PORT || process.env.MYSQLPORT) || 3306;
+  const user = (process.env.DB_USER || process.env.MYSQL_USER || process.env.MYSQLUSER || 'root').trim();
+  const password = process.env.DB_PASSWORD ?? process.env.MYSQL_PASSWORD ?? process.env.MYSQLPASSWORD ?? '';
+  const database = (process.env.DB_NAME || process.env.DB_DATABASE || process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE || 'access').trim();
+
+  const isRemote = host !== 'localhost' && host !== '127.0.0.1';
+  const sslDisabled = process.env.MYSQL_SSL === 'false' || process.env.DB_SSL === 'false';
 
   const config = {
-    host: host,
-    port: Number(process.env.MYSQL_PORT) || 3306,
-    user: process.env.MYSQL_USER || 'root',
-    password: process.env.MYSQL_PASSWORD || 'Mohitca011',
-    database: process.env.MYSQL_DATABASE || 'newdata',
+    host,
+    port,
+    user,
+    password,
+    database,
     waitForConnections: true,
-    connectionLimit: 10,
+    connectionLimit: 25,
     queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
     connectTimeout: 30000,
   };
 
-  if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
+  // Automatically enable SSL for any remote host (Aiven, Render, Railway, AWS RDS, etc.)
+  if (isRemote && !sslDisabled) {
     config.ssl = { rejectUnauthorized: false };
   }
 
+  console.log(`[DB Config] Loaded -> Host: ${config.host}:${config.port} | User: ${config.user} | DB: ${config.database} | SSL: ${Boolean(config.ssl)}`);
   return config;
 };
 
@@ -136,7 +162,7 @@ const initialDesigns = [
 
 const initialPOs = [
   {
-    id: 'PO1301', poNumber: 'PO-83421', vendorName: 'YKK Trim Solutions',
+    id: 'PO1301', poNumber: 'PO-11000', vendorName: 'YKK Trim Solutions',
     vendorEmail: 'sales@ykk-trims.com', vendorAddress: 'Industrial Block C, Mumbai',
     designName: 'Summer Denim Jacket', designCategory: 'JACKET',
     items: JSON.stringify([
@@ -163,16 +189,10 @@ const initialAccessories = [
 const initialDesigners = ['Admin'];
 
 // ── initDb: create tables + seed ──────────────────────────────────────────────
+let isDbInitialized = false;
 
-export async function initDb() {
-  // Test connection on startup
-  try {
-    await pool.execute('SELECT 1');
-    console.log('[DB] MySQL connected successfully.');
-  } catch (err) {
-    console.error('[DB] MySQL connection FAILED:', err.message);
-    process.exit(1);
-  }
+async function setupTables() {
+  if (isDbInitialized) return;
 
   // Users
   await pool.execute(`CREATE TABLE IF NOT EXISTS users (
@@ -237,6 +257,7 @@ export async function initDb() {
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN packets INT DEFAULT 1`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN poNumber VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN invoiceNo VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN imageUrl LONGTEXT NULL`); } catch (_) { }
   try {
     await pool.execute(`ALTER TABLE materials ADD COLUMN location VARCHAR(255) DEFAULT 'Main Store'`);
     // Copy existing location values (which were stored in 'color' column) into 'location' column if 'location' is at default
@@ -514,6 +535,7 @@ export async function initDb() {
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN approvedAt DATETIME NULL`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN rejectionReason TEXT NULL`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN entryMode VARCHAR(50) DEFAULT 'Weight Machine'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN imageUrl LONGTEXT NULL`); } catch (_) { }
 
   // Dedicated Accepted Orders Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS order_accepted (
@@ -668,18 +690,28 @@ export async function initDb() {
     capacity    INT DEFAULT 20
   )`);
 
-  // Auto-sync warehouse_locations from configured warehouse_racks settings
+  // Auto-sync warehouse_locations from configured warehouse_racks settings if custom racks exist
   try {
+    const [hallSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_halls']);
+    if (!hallSetting || hallSetting.length === 0 || !hallSetting[0].setting_value) {
+      const defaultHalls = ['Main Store'];
+      await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_halls', ?)", [JSON.stringify(defaultHalls)]);
+    }
+
     const [rackSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_racks']);
+    let parsedRacks = [];
     if (rackSetting && rackSetting.length > 0 && rackSetting[0].setting_value) {
-      const parsedRacks = JSON.parse(rackSetting[0].setting_value);
-      if (Array.isArray(parsedRacks) && parsedRacks.length > 0) {
-        await bulkSaveWarehouseLocations(parsedRacks);
-        console.log(`[DB] Synced ${parsedRacks.length} locations to warehouse_locations table.`);
-      }
+      try {
+        parsedRacks = JSON.parse(rackSetting[0].setting_value);
+      } catch (_) {}
+    }
+
+    if (Array.isArray(parsedRacks) && parsedRacks.length > 0) {
+      await bulkSaveWarehouseLocations(parsedRacks);
+      console.log(`[DB] Synced ${parsedRacks.length} custom locations to warehouse_locations table.`);
     }
   } catch (syncErr) {
-    console.warn('[DB] Could not sync warehouse_locations on startup:', syncErr.message);
+    console.warn('[DB] Could not initialize/sync warehouse_locations on startup:', syncErr.message);
   }
 
   // ── High-Speed Performance Indexes for Large Datasets ─────────────────────
@@ -700,6 +732,7 @@ export async function initDb() {
       ensureIndex('weight_capture', 'idx_wc_barcode', 'barcodeId'),
       ensureIndex('weight_capture', 'idx_wc_approval', 'approvalStatus'),
       ensureIndex('weight_capture', 'idx_wc_captured', 'capturedAt'),
+      ensureIndex('weight_capture', 'idx_wc_po_inv', 'poNumber, invoiceNo'),
       ensureIndex('purchase_orders', 'idx_po_number', 'poNumber'),
       ensureIndex('purchase_orders', 'idx_po_vendor', 'vendorName'),
       ensureIndex('purchase_orders', 'idx_po_status', 'status'),
@@ -710,19 +743,50 @@ export async function initDb() {
       ensureIndex('materials', 'idx_mat_name', 'name'),
       ensureIndex('materials', 'idx_mat_category', 'category'),
       ensureIndex('materials', 'idx_mat_loc', 'location'),
+      ensureIndex('materials', 'idx_mat_cat_name', 'category, name'),
       ensureIndex('cutting_header', 'idx_ch_lot', 'Lot_Number'),
       ensureIndex('cutting_header', 'idx_ch_style', 'Style'),
       ensureIndex('cutting_header', 'idx_ch_party', 'Party_Name'),
       ensureIndex('cuttings_matrix', 'idx_cm_lot', 'Lot_No'),
       ensureIndex('cuttings_matrix', 'idx_cm_header', 'header_id'),
+      ensureIndex('cuttings_matrix', 'idx_cm_lot_style', 'Lot_No, style'),
       ensureIndex('material_transfers', 'idx_mt_code', 'materialCode'),
       ensureIndex('material_transfers', 'idx_mt_date', 'transferredAt'),
       ensureIndex('zip', 'idx_zip_lot', 'Lot_Number'),
-      ensureIndex('zip', 'idx_zip_po', 'po_number')
+      ensureIndex('zip', 'idx_zip_po', 'po_number'),
+      ensureIndex('issue_logs', 'idx_issue_lot', 'lotId'),
+      ensureIndex('scans', 'idx_scans_lot_date', 'lot_number, scanned_at')
     ]);
-  } catch (_) {}
+  } catch (_) { }
 
   console.log('[DB] All tables and high-speed indexes ready.');
+}
+
+export async function initDb() {
+  try {
+    await pool.execute('SELECT 1');
+    console.log('[DB] MySQL connected successfully.');
+    await setupTables();
+    isDbInitialized = true;
+    return true;
+  } catch (err) {
+    console.warn(`[DB] MySQL initial connection warning: ${err.message}. Background reconnection active.`);
+    
+    // Non-fatal background reconnect: keeps the server running and reconnects automatically
+    const retryInterval = setInterval(async () => {
+      try {
+        await pool.execute('SELECT 1');
+        console.log('[DB] MySQL connected successfully (in background).');
+        await setupTables();
+        isDbInitialized = true;
+        clearInterval(retryInterval);
+      } catch (retryErr) {
+        console.warn(`[DB Reconnect] Waiting for database connection (${retryErr.message})...`);
+      }
+    }, 5000);
+
+    return false;
+  }
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -754,6 +818,7 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
   const location = data.storeLocation || 'Main Store';
   const poNumber = data.poNumber || 'N/A';
   const invoiceNo = data.invoiceNo || 'N/A';
+  const imageUrl = data.imageUrl || '';
 
   if (!name && !code) return;
 
@@ -774,16 +839,16 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
     const existing = rows[0];
     const updatedStock = (Number(existing.stock) || 0) + pieces;
     await pool.execute(
-      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), location = COALESCE(NULLIF(?, ""), location), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo) WHERE id = ?',
-      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.location, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, existing.id]
+      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), location = COALESCE(NULLIF(?, ""), location), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo), imageUrl = COALESCE(NULLIF(?, ""), imageUrl) WHERE id = ?',
+      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.location, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, imageUrl || existing.imageUrl || '', existing.id]
     );
     console.log(`[DB] Updated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${packets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
   } else {
     // New material -> insert into materials table
     const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
     await pool.execute(
-      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo]
+      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl]
     );
     console.log(`[DB] Created new material in Stock DB: ${matId} - ${name} (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
   }
@@ -852,21 +917,22 @@ export const createMaterialCapture = async (data) => {
     entryMode = (data.status === 'Manually' || data.status === 'Manual' || data.entryMode === 'Manually' || data.entryMode === 'Manual' || data.isManual || data.captureMethod === 'Manual' ? 'Manually' : 'Weight Machine'),
     status = data.status || entryMode,
     approvalStatus = 'Approved',
-    remarks = ''
+    remarks = '',
+    imageUrl = ''
   } = data;
 
   const [result] = await pool.execute(
     `INSERT INTO weight_capture
      (materialCode,materialName,unit,category,supplier,lotNo,poNumber,invoiceNo,
       storeLocation,storeIncharge,grossWeightKg,tareWeightKg,netWeightKg,
-      weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,approvalStatus,entryMode,remarks)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,approvalStatus,entryMode,remarks,imageUrl)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo,
       storeLocation, storeIncharge,
       Number(grossWeightKg), Number(tareWeightKg), Number(netWeightKg),
       Number(weightPerPieceG), Number(sampleQty), Number(sampleWeightKg),
       Number(pieces), Number(packets),
-      barcodeId, status, approvalStatus, entryMode, remarks]
+      barcodeId, status, approvalStatus, entryMode, remarks, imageUrl || '']
   );
 
   const captureId = result.insertId;
@@ -1035,13 +1101,38 @@ export const createWarehouseLocation = async ({ id, code, warehouse = 'Hall 1', 
   const cleanCode = String(code || 'Rack').trim();
   const fullDisplay = cleanCode.toLowerCase().includes(warehouse.toLowerCase()) ? cleanCode : `${warehouse} - ${cleanCode}`;
   const slug = id || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const cap = Number(capacity) > 0 ? Number(capacity) : 10;
   await pool.execute(
     `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
      VALUES (?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
-    [slug, fullDisplay, warehouse, Number(capacity) || 10]
+    [slug, fullDisplay, warehouse, cap]
   );
-  return slug;
+  return { id: slug, code: fullDisplay, warehouse, capacity: cap };
+};
+
+export const deleteWarehouseLocation = async (idOrCode) => {
+  if (!idOrCode) return false;
+  await pool.execute('DELETE FROM warehouse_locations WHERE id = ? OR code = ?', [idOrCode, idOrCode]);
+  
+  // Also clean up from warehouse_racks in settings
+  try {
+    const [rackSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_racks']);
+    if (rackSetting && rackSetting[0] && rackSetting[0].setting_value) {
+      let parsed = JSON.parse(rackSetting[0].setting_value);
+      if (Array.isArray(parsed)) {
+        parsed = parsed.filter(r => r.id !== idOrCode && r.code !== idOrCode && `${r.warehouse} - ${r.name || `Rack ${r.code}`}` !== idOrCode);
+        await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
+      }
+    }
+  } catch (_) {}
+  return true;
+};
+
+export const clearAllWarehouseLocations = async () => {
+  await pool.execute('DELETE FROM warehouse_locations');
+  await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', '[]')");
+  return true;
 };
 
 export const getAllMaterialCaptures = async () => {
@@ -1442,8 +1533,13 @@ export const getAcceptedOrders = async () => {
 };
 
 export const createPO = async (po) => {
-  const itemsJson = po.items ? JSON.stringify(po.items) : '[]';
-  const cleanPo = (po.poNumber || '').trim();
+  const itemsJson = po.items ? (typeof po.items === 'string' ? po.items : JSON.stringify(po.items)) : '[]';
+  let cleanPo = (po.poNumber || '').trim();
+
+  // If no PO number provided, generate next starting from 11000
+  if (!cleanPo) {
+    cleanPo = await getNextGeneralPoNumber();
+  }
 
   // Check if a record with this exact poNumber already exists to prevent duplicate rows
   const [existing] = await pool.execute('SELECT id FROM purchase_orders WHERE LOWER(poNumber) = LOWER(?)', [cleanPo]);
@@ -1455,10 +1551,11 @@ export const createPO = async (po) => {
     try {
       const [rows] = await pool.execute('SELECT id FROM purchase_orders');
       const ids = rows.map(r => parseInt(r.id, 10)).filter(n => !isNaN(n));
-      const maxId = ids.length > 0 ? Math.max(...ids) : 0;
-      finalId = String(maxId + 1);
+      const maxId = ids.length > 0 ? Math.max(...ids) : 11000;
+      finalId = String(Math.max(maxId, 11000) + 1);
     } catch (err) {
       console.warn("Failed to generate sequential PO ID:", err.message);
+      finalId = cleanPo.replace(/^PO-?/i, '') || String(Date.now());
     }
   }
 
@@ -1472,6 +1569,8 @@ export const createPO = async (po) => {
       po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
       po.date || '', po.deliveryDate || '', po.status || 'Draft']
   );
+
+  return { ...po, id: finalId, poNumber: cleanPo };
 };
 
 export const updatePOStatus = async (id, status) => {
@@ -1756,7 +1855,7 @@ export const getNextGeneralPoNumber = async () => {
     return `PO-${maxNum + 1}`;
   } catch (err) {
     console.error('Error generating next PO number:', err);
-    return `PO-${Date.now().toString().slice(-5)}`;
+    return `PO-11001`;
   }
 };
 
@@ -2171,12 +2270,7 @@ export const getUndesignedCuttingLots = async () => {
     SELECT ch.* 
     FROM cutting_header ch
     WHERE ch.Lot_Number IS NOT NULL 
-      AND ch.Lot_Number != ''
-      AND ch.Lot_Number REGEXP '^[0-9]+$'
-      AND (
-        (ch.Date_of_Issue LIKE '2026-08-%' AND CAST(SUBSTRING(ch.Date_of_Issue, 9, 2) AS UNSIGNED) >= 10)
-        OR (ch.Date_of_Issue >= '2026-09-01' AND ch.Date_of_Issue LIKE '2026-%')
-      )
+      AND TRIM(ch.Lot_Number) != ''
       AND NOT EXISTS (
         SELECT 1 FROM designs d 
         WHERE LOWER(TRIM(d.id)) = LOWER(TRIM(ch.Lot_Number))
@@ -2184,7 +2278,7 @@ export const getUndesignedCuttingLots = async () => {
            OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
            OR LOWER(TRIM(COALESCE(d.repeat_against, ''))) = LOWER(TRIM(ch.Lot_Number))
       )
-    ORDER BY ch.Date_of_Issue DESC, ch.id DESC
+    ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
   `);
   return rows;
 };
