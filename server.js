@@ -153,6 +153,41 @@ try {
   process.exit(1);
 }
 
+// ── Health Check & System Status Endpoints ─────────────────────────────────────
+app.get('/api/ping', (req, res) => res.status(200).send('pong'));
+
+app.get('/api/health', async (req, res) => {
+  let dbStatus = 'healthy';
+  let dbLatencyMs = 0;
+  try {
+    const start = Date.now();
+    await pool.query('SELECT 1');
+    dbLatencyMs = Date.now() - start;
+  } catch (e) {
+    dbStatus = 'unreachable: ' + e.message;
+  }
+
+  const isHealthy = dbStatus === 'healthy';
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'UP' : 'DEGRADED',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime()),
+    database: {
+      status: dbStatus,
+      latencyMs: dbLatencyMs
+    },
+    syncWorker: syncWorkerStats,
+    cache: {
+      dir: CACHE_DIR,
+      lotsCached: fs.existsSync(LOTS_CSV_CACHE_PATH)
+    },
+    memory: {
+      rssMb: (process.memoryUsage().rss / 1024 / 1024).toFixed(2),
+      heapUsedMb: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)
+    }
+  });
+});
+
 // Mail Transporter Configuration
 const getTransporter = () => {
   // If SMTP_SERVICE is set to gmail or if user entered credentials without host, default to Gmail service config
@@ -482,6 +517,27 @@ function parseCSV(text) {
   return results;
 }
 
+// Helper: Extract image URL from any supported Google Sheet column variant
+function extractRowImageUrl(r) {
+  if (!r) return '';
+  const val = (
+    r['Image URL'] ||
+    r['Image'] ||
+    r['Image Link'] ||
+    r['Photo'] ||
+    r['Picture'] ||
+    r['Drive Link'] ||
+    r['ImageURL'] ||
+    r['imageUrl'] ||
+    r['Image_Url'] ||
+    r['Image_URL'] ||
+    r['Image link'] ||
+    r['Image url'] ||
+    ''
+  );
+  return String(val).trim();
+}
+
 // Helper: Get Lots CSV with local caching and offline fallback
 const LOTS_CSV_CACHE_PATH = path.join(CACHE_DIR, 'lots.csv');
 const LOTS_CACHE_TIME_PATH = path.join(CACHE_DIR, 'lots_cache_time.txt');
@@ -739,10 +795,11 @@ export async function syncGoogleSheetsToDb(force = false) {
 
       for (let i = 0; i < toInsert.length; i += chunkSize) {
         const chunk = toInsert.slice(i, i + chunkSize);
-        const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+        const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
         const flatParams = [];
 
         chunk.forEach(r => {
+          const rowImg = extractRowImageUrl(r);
           flatParams.push(
             r._cleanLot,
             (r['Fabric'] || '').substring(0, 255),
@@ -760,6 +817,7 @@ export async function syncGoogleSheetsToDb(force = false) {
             parseInt(r['Quantity']) || 0,
             (r['Priority'] || 'Normal').substring(0, 50),
             (r['Sticker'] || '').substring(0, 100),
+            rowImg.substring(0, 1000),
             null
           );
         });
@@ -767,7 +825,7 @@ export async function syncGoogleSheetsToDb(force = false) {
         await pool.execute(
           `INSERT INTO cutting_header (
             Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
-            Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, zip_payload
+            Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, Image_Url, zip_payload
           ) VALUES ${placeholders}`,
           flatParams
         );
@@ -813,6 +871,7 @@ export async function syncGoogleSheetsToDb(force = false) {
         const chunk = toUpdate.slice(i, i + updateConcurrency);
         await Promise.all(
           chunk.map(async ({ id, row: r }) => {
+            const rowImg = extractRowImageUrl(r);
             await pool.execute(
               `UPDATE cutting_header SET
                 Fabric = COALESCE(NULLIF(?, ''), Fabric),
@@ -820,7 +879,8 @@ export async function syncGoogleSheetsToDb(force = false) {
                 Style = COALESCE(NULLIF(?, ''), Style),
                 Brand = COALESCE(NULLIF(?, ''), Brand),
                 Party_Name = COALESCE(NULLIF(?, ''), Party_Name),
-                Cutting_Qty = COALESCE(NULLIF(?, 0), Cutting_Qty)
+                Cutting_Qty = COALESCE(NULLIF(?, 0), Cutting_Qty),
+                Image_Url = COALESCE(NULLIF(?, ''), Image_Url)
                WHERE id = ?`,
               [
                 (r['Fabric'] || '').substring(0, 255),
@@ -829,6 +889,7 @@ export async function syncGoogleSheetsToDb(force = false) {
                 (r['Brand'] || '').substring(0, 255),
                 (r['Party Name'] || '').substring(0, 255),
                 parseInt(r['Quantity']) || 0,
+                rowImg.substring(0, 1000),
                 id
               ]
             );
@@ -897,6 +958,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
 
     if (matchedRow) {
       console.log(`[Lot Fetch] Successfully matched lot from Google Sheet: ${lotNo}`);
+      const rowImg = extractRowImageUrl(matchedRow);
 
       // Auto-save/persist this lot into MySQL cutting_header immediately so database stays updated
       (async () => {
@@ -904,13 +966,13 @@ app.get('/api/lot/:lotNo', async (req, res) => {
           const rawLot = matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo;
           const trimmedLot = String(rawLot).trim().substring(0, 100);
           let headerId = null;
-          const [existing] = await pool.execute('SELECT id FROM cutting_header WHERE Lot_Number = ?', [trimmedLot]);
+          const [existing] = await pool.execute('SELECT id, Image_Url FROM cutting_header WHERE Lot_Number = ?', [trimmedLot]);
           if (existing.length === 0) {
             const [ins] = await pool.execute(
               `INSERT INTO cutting_header (
                 Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
-                Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, zip_payload
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, Image_Url, zip_payload
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 trimmedLot,
                 (matchedRow['Fabric'] || '').substring(0, 255),
@@ -928,13 +990,17 @@ app.get('/api/lot/:lotNo', async (req, res) => {
                 parseInt(matchedRow['Quantity']) || 0,
                 (matchedRow['Priority'] || 'Normal').substring(0, 50),
                 (matchedRow['Sticker'] || '').substring(0, 100),
+                rowImg.substring(0, 1000),
                 null
               ]
             );
             headerId = ins.insertId;
-            console.log(`[Lot Fetch] Auto-saved new lot "${trimmedLot}" into MySQL cutting_header.`);
+            console.log(`[Lot Fetch] Auto-saved new lot "${trimmedLot}" into MySQL cutting_header with image.`);
           } else {
             headerId = existing[0].id;
+            if (rowImg && !existing[0].Image_Url) {
+              await pool.execute('UPDATE cutting_header SET Image_Url = ? WHERE id = ?', [rowImg.substring(0, 1000), headerId]).catch(() => {});
+            }
           }
 
           if (headerId) {
@@ -950,7 +1016,6 @@ app.get('/api/lot/:lotNo', async (req, res) => {
           console.warn('[Lot Fetch] Auto-save to DB warning:', dbSaveErr.message);
         }
       })();
-
 
       return res.status(200).json({
         lotNo: matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo,
@@ -981,7 +1046,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         remarks: matchedRow['Remarks'] || '',
         directStitching: matchedRow['Direct Stitching'] || '',
         submittedBy: matchedRow['Submitted By'] || '',
-        imageUrl: matchedRow['Image URL'] || '',
+        imageUrl: rowImg,
         priority: matchedRow['Priority'] || '',
         status: matchedRow['Status'] || ''
       });
@@ -1083,7 +1148,6 @@ app.get('/api/lot/:lotNo', async (req, res) => {
   }
 });
 
-// 7. Retrieve All Lots from MySQL database
 app.get('/api/lots', async (req, res) => {
   try {
     const { getAllCuttingHeaders } = await import('./db.js');
@@ -1092,6 +1156,16 @@ app.get('/api/lots', async (req, res) => {
       .filter(h => h.Lot_Number)
       .map(h => ({
         lotNo: String(h.Lot_Number).trim(),
+        fabric: h.Fabric || '',
+        brand: h.Brand || h.Party_Name || '',
+        garmentType: h.Garment_Type || '',
+        style: h.Style || '',
+        season: h.Season || '',
+        section: h.MWK || '',
+        imageUrl: h.Image_Url || '',
+        quantity: h.Cutting_Qty || 0,
+        shades: h.Shades || '',
+        sizes: h.Sizes || '',
         itemName: h.Garment_Type || h.Style || 'Unknown Item'
       }));
     res.status(200).json(lots);
@@ -1235,9 +1309,13 @@ app.get('/api/image-proxy', async (req, res) => {
     // Extract Google Drive File ID
     let fileId = '';
     const fileDMatch = imageUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+    const driveDMatch = imageUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
     const idParamMatch = imageUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+
     if (fileDMatch && fileDMatch[1]) {
       fileId = fileDMatch[1];
+    } else if (driveDMatch && driveDMatch[1]) {
+      fileId = driveDMatch[1];
     } else if (idParamMatch && idParamMatch[1]) {
       fileId = idParamMatch[1];
     }
@@ -1258,36 +1336,50 @@ app.get('/api/image-proxy', async (req, res) => {
       return fs.createReadStream(cachePath).pipe(res);
     }
 
-    // Otherwise, fetch it from Google Drive, write to local cache, and serve it
-    const driveUrl = `https://lh3.googleusercontent.com/d/${fileId}`;
-    console.log(`Image proxy fetching and caching Google Drive ID: ${fileId}...`);
+    // Fetch from Google Drive with fallbacks
+    const candidateUrls = [
+      `https://lh3.googleusercontent.com/d/${fileId}`,
+      `https://drive.google.com/thumbnail?id=${fileId}&sz=w1200`,
+      `https://drive.google.com/uc?export=download&id=${fileId}`
+    ];
 
-    const response = await fetch(driveUrl);
-    if (!response.ok) {
-      throw new Error(`Google Drive returned status ${response.status}`);
+    let imageBuffer = null;
+    let contentType = 'image/jpeg';
+
+    for (const dUrl of candidateUrls) {
+      try {
+        const response = await fetch(dUrl);
+        if (response.ok) {
+          const cType = response.headers.get('content-type') || '';
+          if (cType.includes('image') || cType.includes('octet-stream')) {
+            imageBuffer = Buffer.from(await response.arrayBuffer());
+            contentType = cType.includes('image') ? cType : 'image/jpeg';
+            break;
+          }
+        }
+      } catch (fErr) {
+        console.warn(`[Image Proxy] Fetch attempt failed for ${dUrl}:`, fErr.message);
+      }
     }
 
-    const contentType = response.headers.get('content-type') || 'image/jpeg';
-    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!imageBuffer) {
+      return res.redirect(`https://drive.google.com/uc?export=download&id=${fileId}`);
+    }
 
     // Save in cache folder asynchronously
-    fs.writeFile(cachePath, buffer, (err) => {
-      if (err) {
-        console.error(`Failed to write cache file for ${fileId}:`, err.message);
-      } else {
-        console.log(`Successfully cached file ${fileId}`);
-        autoCleanCache(); // Check and clean old files if cache size limit is exceeded
+    fs.writeFile(cachePath, imageBuffer, (err) => {
+      if (!err) {
+        autoCleanCache();
       }
     });
 
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Content-Length', imageBuffer.length);
     res.setHeader('Cache-Control', 'public, max-age=31536000');
-    res.end(buffer);
+    res.end(imageBuffer);
 
   } catch (err) {
     console.error('Image Proxy Error:', err.message);
-    // Redirect to original URL as a final fallback
     res.redirect(req.query.url);
   }
 });
@@ -2115,6 +2207,18 @@ app.post('/api/warehouse-locations/bulk', async (req, res) => {
     console.error('[API] warehouse-locations bulk POST error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Global error handling middleware for express
+app.use((err, req, res, next) => {
+  console.error('[API Global Error Handler]:', err.message || err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  res.status(err.status || 500).json({
+    success: false,
+    error: err.message || 'Internal Server Error'
+  });
 });
 
 // Serve static assets in production (if built) or redirect to Vite dev server in dev

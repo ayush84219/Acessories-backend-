@@ -58,6 +58,17 @@ const getPoolConfig = () => {
 
 const pool = mysql.createPool(getPoolConfig());
 
+// Periodic connection pool keepalive (runs every 30s to keep connection pool warm & healthy)
+setInterval(async () => {
+  try {
+    const conn = await pool.getConnection();
+    await conn.query('SELECT 1');
+    conn.release();
+  } catch (err) {
+    console.warn('[DB Heartbeat] Connection check warning:', err.message);
+  }
+}, 30000).unref();
+
 // ── Seed Data ─────────────────────────────────────────────────────────────────
 
 const initialMaterials = [
