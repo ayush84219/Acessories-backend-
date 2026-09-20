@@ -576,7 +576,7 @@ function getActiveSheetUrl() {
       const data = JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, 'utf8'));
       if (data && data.url) return data.url;
     }
-  } catch (e) {}
+  } catch (e) { }
   return DEFAULT_SHEET_URL;
 }
 
@@ -584,7 +584,7 @@ function setActiveSheetUrl(newUrl) {
   const normalizedUrl = parseGoogleSheetUrl(newUrl);
   try {
     fs.writeFileSync(SHEET_CONFIG_PATH, JSON.stringify({ url: normalizedUrl, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
-  } catch (e) {}
+  } catch (e) { }
   return normalizedUrl;
 }
 
@@ -942,13 +942,32 @@ app.get('/api/lot/:lotNo', async (req, res) => {
     console.log(`[Lot Fetch] Searching for lot: ${lotNo}...`);
     let matchedRow = null;
 
-    // Step 1: Try fetching from Google Sheet CSV
+    // Helper for robust case-insensitive and alias-aware row column retrieval
+    const getCol = (row, ...keys) => {
+      if (!row) return '';
+      for (const k of keys) {
+        if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') {
+          return String(row[k]).trim();
+        }
+      }
+      const rowKeys = Object.keys(row);
+      for (const k of keys) {
+        const cleanK = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const found = rowKeys.find(rk => rk.toLowerCase().replace(/[^a-z0-9]/g, '') === cleanK);
+        if (found && row[found] !== undefined && row[found] !== null && String(row[found]).trim() !== '') {
+          return String(row[found]).trim();
+        }
+      }
+      return '';
+    };
+
+    // Step 1: Try fetching from Google Sheet CSV (live sync)
     try {
-      const csvText = await getLotsCSV();
+      const csvText = await getLotsCSV(true);
       if (csvText) {
         const rows = parseCSV(csvText);
         matchedRow = rows.find(row => {
-          const rowLotNo = row['Lot Number'] || row['Lot No'] || row['Job Order No'];
+          const rowLotNo = getCol(row, 'Lot Number', 'Lot No', 'Job Order No', 'lot');
           return rowLotNo && String(rowLotNo).trim().toLowerCase() === lotNo.toLowerCase();
         });
       }
@@ -963,7 +982,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
       // Auto-save/persist this lot into MySQL cutting_header immediately so database stays updated
       (async () => {
         try {
-          const rawLot = matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo;
+          const rawLot = getCol(matchedRow, 'Lot Number', 'Lot No', 'Job Order No', 'lot') || lotNo;
           const trimmedLot = String(rawLot).trim().substring(0, 100);
           let headerId = null;
           const [existing] = await pool.execute('SELECT id, Image_Url FROM cutting_header WHERE Lot_Number = ?', [trimmedLot]);
@@ -975,21 +994,21 @@ app.get('/api/lot/:lotNo', async (req, res) => {
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 trimmedLot,
-                (matchedRow['Fabric'] || '').substring(0, 255),
-                (matchedRow['Garment Type'] || '').substring(0, 255),
-                (matchedRow['Style'] || '').substring(0, 255),
-                (matchedRow['Size'] || '').substring(0, 255),
-                matchedRow['Shade'] || '',
+                getCol(matchedRow, 'Fabric').substring(0, 255),
+                getCol(matchedRow, 'Garment Type', 'Garment_Type').substring(0, 255),
+                getCol(matchedRow, 'Style').substring(0, 255),
+                getCol(matchedRow, 'Size', 'Sizes').substring(0, 255),
+                getCol(matchedRow, 'Shade', 'Shades'),
                 new Date().toISOString(),
-                (matchedRow['Date'] || '').substring(0, 100),
-                (matchedRow['Submitted By'] || '').substring(0, 255),
-                (matchedRow['Party Name'] || '').substring(0, 255),
-                (matchedRow['Brand'] || '').substring(0, 255),
-                (matchedRow['Season'] || '').substring(0, 100),
-                (matchedRow['Direct Stitching'] || '').substring(0, 100),
-                parseInt(matchedRow['Quantity']) || 0,
-                (matchedRow['Priority'] || 'Normal').substring(0, 50),
-                (matchedRow['Sticker'] || '').substring(0, 100),
+                getCol(matchedRow, 'Date', 'Date of Issue').substring(0, 100),
+                getCol(matchedRow, 'Submitted By', 'Supervisor').substring(0, 255),
+                getCol(matchedRow, 'Party Name', 'Party_Name').substring(0, 255),
+                getCol(matchedRow, 'Brand').substring(0, 255),
+                getCol(matchedRow, 'Season').substring(0, 100),
+                getCol(matchedRow, 'Direct Stitching').substring(0, 100),
+                parseInt(getCol(matchedRow, 'Quantity', 'Cutting_Qty')) || 0,
+                (getCol(matchedRow, 'Priority') || 'Normal').substring(0, 50),
+                getCol(matchedRow, 'Sticker', 'STICKER').substring(0, 100),
                 rowImg.substring(0, 1000),
                 null
               ]
@@ -999,7 +1018,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
           } else {
             headerId = existing[0].id;
             if (rowImg && !existing[0].Image_Url) {
-              await pool.execute('UPDATE cutting_header SET Image_Url = ? WHERE id = ?', [rowImg.substring(0, 1000), headerId]).catch(() => {});
+              await pool.execute('UPDATE cutting_header SET Image_Url = ? WHERE id = ?', [rowImg.substring(0, 1000), headerId]).catch(() => { });
             }
           }
 
@@ -1007,10 +1026,10 @@ app.get('/api/lot/:lotNo', async (req, res) => {
             await batchEnsureCuttingsMatrix([{
               headerId,
               lotNo: trimmedLot,
-              shadesStr: matchedRow['Shade'],
-              sizesStr: matchedRow['Size'],
-              totalQty: matchedRow['Quantity']
-            }]).catch(() => {});
+              shadesStr: getCol(matchedRow, 'Shade', 'Shades'),
+              sizesStr: getCol(matchedRow, 'Size', 'Sizes'),
+              totalQty: getCol(matchedRow, 'Quantity', 'Cutting_Qty')
+            }]).catch(() => { });
           }
         } catch (dbSaveErr) {
           console.warn('[Lot Fetch] Auto-save to DB warning:', dbSaveErr.message);
@@ -1018,37 +1037,47 @@ app.get('/api/lot/:lotNo', async (req, res) => {
       })();
 
       return res.status(200).json({
-        lotNo: matchedRow['Lot Number'] || matchedRow['Lot No'] || matchedRow['Job Order No'] || lotNo,
-        fabric: matchedRow['Fabric'] || '',
-        brand: matchedRow['Brand'] || '',
-        garmentType: matchedRow['Garment Type'] || '',
-        section: matchedRow['Section'] || '',
-        season: matchedRow['Season'] || '',
-        style: matchedRow['Style'] || '',
-        component: matchedRow['Component'] || matchedRow['Component '] || '',
-        tapeLace: matchedRow['Tape/Lace'] || '',
-        bottomType: matchedRow['Bottom Type'] || '',
-        zip: matchedRow['Zip'] || '',
-        sticker: matchedRow['Sticker'] || '',
-        collar: matchedRow['Collar'] || '',
-        bone: matchedRow['Bone'] || '',
-        fullBaju: matchedRow['FULL BAJU'] || matchedRow['Full Baju'] || '',
-        shade: matchedRow['Shade'] || '',
-        size: matchedRow['Size'] || '',
-        quantity: matchedRow['Quantity'] || '',
-        unit: matchedRow['Unit'] || '',
-        partyName: matchedRow['Party Name'] || '',
-        emb: matchedRow['Emb'] || '',
-        embDetails: matchedRow['Emb Details'] || '',
-        printing: matchedRow['Printing'] || '',
-        printingDetails: matchedRow['Printing Details'] || '',
-        pattern: matchedRow['Pattern'] || '',
-        remarks: matchedRow['Remarks'] || '',
-        directStitching: matchedRow['Direct Stitching'] || '',
-        submittedBy: matchedRow['Submitted By'] || '',
+        lotNo: getCol(matchedRow, 'Lot Number', 'Lot No', 'Job Order No', 'lot') || lotNo,
+        fabric: getCol(matchedRow, 'Fabric'),
+        brand: getCol(matchedRow, 'Brand'),
+        garmentType: getCol(matchedRow, 'Garment Type', 'Garment_Type'),
+        section: getCol(matchedRow, 'Section', 'MWK'),
+        season: getCol(matchedRow, 'Season'),
+        style: getCol(matchedRow, 'Style'),
+        component: getCol(matchedRow, 'Component', 'Component '),
+        tapeLace: getCol(matchedRow, 'Tape/Lace', 'Tape / Lace', 'Tape', 'Lace'),
+        bottomType: getCol(matchedRow, 'Bottom Type', 'Bottom', 'Elastic', 'Rib'),
+        zip: getCol(matchedRow, 'Zip', 'ZIP'),
+        sticker: getCol(matchedRow, 'Sticker', 'STICKER', 'Label'),
+        collar: getCol(matchedRow, 'Collar', 'COLLAR'),
+        bone: getCol(matchedRow, 'Bone', 'BONE', 'Piping'),
+        fullBaju: getCol(matchedRow, 'FULL BAJU', 'Full Baju', 'Full Sleeve', 'Baju'),
+        button: getCol(matchedRow, 'Button', 'Buttons', 'BUTTON'),
+        pocket: getCol(matchedRow, 'Pocket', 'Pockets', 'POCKET'),
+        dori: getCol(matchedRow, 'Dori', 'DORI', 'Drawstring', 'Nara', 'DRAWSTRING', 'NARA'),
+        drawstring: getCol(matchedRow, 'Drawstring', 'DRAWSTRING', 'Nara', 'NARA', 'Dori', 'DORI'),
+        tag: getCol(matchedRow, 'Tag', 'TAG', 'Hang Tag', 'HangTag'),
+        label: getCol(matchedRow, 'Label', 'LABEL', 'Sticker', 'STICKER'),
+        thread: getCol(matchedRow, 'Thread', 'THREAD'),
+        hook: getCol(matchedRow, 'Hook', 'Buckle', 'Velcro', 'Hook, buckle, velcro'),
+        fusing: getCol(matchedRow, 'Interlining', 'Fusing', 'Interlining / fusing'),
+        shade: getCol(matchedRow, 'Shade', 'Shades'),
+        size: getCol(matchedRow, 'Size', 'Sizes'),
+        quantity: getCol(matchedRow, 'Quantity', 'Cutting_Qty'),
+        unit: getCol(matchedRow, 'Unit') || 'Pcs',
+        partyName: getCol(matchedRow, 'Party Name', 'Party_Name'),
+        emb: getCol(matchedRow, 'Emb'),
+        embDetails: getCol(matchedRow, 'Emb Details'),
+        printing: getCol(matchedRow, 'Printing'),
+        printingDetails: getCol(matchedRow, 'Printing Details'),
+        pattern: getCol(matchedRow, 'Pattern'),
+        remarks: getCol(matchedRow, 'Remarks'),
+        directStitching: getCol(matchedRow, 'Direct Stitching'),
+        submittedBy: getCol(matchedRow, 'Submitted By'),
         imageUrl: rowImg,
-        priority: matchedRow['Priority'] || '',
-        status: matchedRow['Status'] || ''
+        priority: getCol(matchedRow, 'Priority'),
+        status: getCol(matchedRow, 'Status'),
+        rawRow: matchedRow
       });
     }
 
@@ -1204,7 +1233,7 @@ app.post('/api/sheet-config', async (req, res) => {
     const savedUrl = setActiveSheetUrl(target);
     // Clear cache immediately
     if (fs.existsSync(LOTS_CSV_CACHE_PATH)) {
-      try { fs.unlinkSync(LOTS_CSV_CACHE_PATH); } catch (e) {}
+      try { fs.unlinkSync(LOTS_CSV_CACHE_PATH); } catch (e) { }
     }
     lastFetchTime = 0;
 
