@@ -2126,7 +2126,8 @@ app.post('/api/weight-capture', async (req, res) => {
 
 app.get('/api/weight-capture', async (req, res) => {
   try {
-    const rows = await getAllMaterialCaptures();
+    const isSummary = req.query.summary === 'true' || req.query.summary === '1';
+    const rows = await getAllMaterialCaptures(isSummary);
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('[API] weight-capture GET error:', err.message);

@@ -728,6 +728,8 @@ export async function initDb() {
       ensureIndex('weight_capture', 'idx_wc_approval', 'approvalStatus'),
       ensureIndex('weight_capture', 'idx_wc_captured', 'capturedAt'),
       ensureIndex('weight_capture', 'idx_wc_po_inv', 'poNumber, invoiceNo'),
+      ensureIndex('weight_capture', 'idx_wc_storeloc', 'storeLocation'),
+      ensureIndex('warehouse_locations', 'idx_whloc_code', 'code'),
       ensureIndex('purchase_orders', 'idx_po_number', 'poNumber'),
       ensureIndex('purchase_orders', 'idx_po_vendor', 'vendorName'),
       ensureIndex('purchase_orders', 'idx_po_status', 'status'),
@@ -1103,7 +1105,13 @@ export const clearAllWarehouseLocations = async () => {
   return true;
 };
 
-export const getAllMaterialCaptures = async () => {
+export const getAllMaterialCaptures = async (summaryOnly = false) => {
+  if (summaryOnly) {
+    const [rows] = await pool.execute(
+      'SELECT id, materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo, storeLocation, storeIncharge, grossWeightKg, tareWeightKg, netWeightKg, pieces, packets, barcodeId, status, approvalStatus, capturedAt, remarks FROM weight_capture ORDER BY capturedAt DESC'
+    );
+    return rows;
+  }
   const [rows] = await pool.execute(
     'SELECT * FROM weight_capture ORDER BY capturedAt DESC'
   );
