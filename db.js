@@ -826,7 +826,9 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
 
 export const syncWeightCapturesToMaterials = async () => {
   try {
-    const [captures] = await pool.execute("SELECT * FROM weight_capture ORDER BY id ASC");
+    const [captures] = await pool.execute(
+      "SELECT materialCode, materialName, category, pieces, unit, storeLocation, packets, poNumber, invoiceNo, approvalStatus FROM weight_capture ORDER BY id ASC"
+    );
     for (const c of captures) {
       const code = (c.materialCode || '').trim();
       const name = (c.materialName || 'Accessory Material').trim();
@@ -1193,7 +1195,6 @@ export const updateDesignStatus = async (id, status, comments) => {
 // ── Materials ─────────────────────────────────────────────────────────────────
 
 export const getAllMaterials = async () => {
-  await syncWeightCapturesToMaterials();
   const [rows] = await pool.execute('SELECT * FROM materials ORDER BY id ASC');
   return rows;
 };
