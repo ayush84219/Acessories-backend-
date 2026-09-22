@@ -2244,7 +2244,6 @@ export const getUndesignedCuttingLots = async () => {
         WHERE LOWER(TRIM(d.id)) = LOWER(TRIM(ch.Lot_Number))
            OR LOWER(TRIM(COALESCE(d.lotNo2, ''))) = LOWER(TRIM(ch.Lot_Number))
            OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
-           OR LOWER(TRIM(COALESCE(d.repeat_against, ''))) = LOWER(TRIM(ch.Lot_Number))
       )
     ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
   `);
