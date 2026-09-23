@@ -69,7 +69,10 @@ import {
   approveInwardCapture,
   rejectInwardCapture,
   getAcceptedOrders,
-  getMaterialTraceability
+  getMaterialTraceability,
+  createExtraMaterialIssue,
+  getAllExtraMaterialIssues,
+  deleteExtraMaterialIssue
 } from './db.js';
 import pool from './db.js';
 
@@ -273,6 +276,67 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+// Strict Role-Based Access Control (RBAC) Middleware
+const requireRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    const userRole = (req.user.role || '').toLowerCase();
+    // Admin always has full access
+    const isAllowed = userRole === 'admin' || allowedRoles.some(r => r.toLowerCase() === userRole);
+    if (!isAllowed) {
+      return res.status(403).json({
+        error: `Access denied. Insufficient permissions for role '${req.user.role || 'User'}'. Required: [${allowedRoles.join(', ')}]`
+      });
+    }
+    next();
+  };
+};
+
+const requireAdmin = requireRole('Admin');
+
+// Optional Authentication Middleware (Injects req.user if token is present without blocking guest/scanners)
+const optionalAuth = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return next();
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (!err && user) req.user = user;
+    next();
+  });
+};
+
+// Health Check Endpoint (For monitoring server uptime, memory, and database pool health)
+app.get('/api/health', async (req, res) => {
+  try {
+    const startTime = Date.now();
+    await pool.execute('SELECT 1');
+    const dbLatencyMs = Date.now() - startTime;
+    const mem = process.memoryUsage();
+    res.status(200).json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptimeSeconds: Math.floor(process.uptime()),
+      database: {
+        status: 'connected',
+        latencyMs: dbLatencyMs
+      },
+      system: {
+        heapUsedMB: (mem.heapUsed / 1024 / 1024).toFixed(2),
+        heapTotalMB: (mem.heapTotal / 1024 / 1024).toFixed(2),
+        rssMB: (mem.rss / 1024 / 1024).toFixed(2)
+      }
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'unhealthy',
+      database: 'disconnected',
+      error: err.message
+    });
+  }
+});
 
 // --- AUTHENTICATION API ROUTES ---
 
@@ -1850,18 +1914,20 @@ app.delete('/api/vendors/:id', async (req, res) => {
 
 // ── Settings Routes (accessories & designers lists) ─────────────────────────
 
-// GET all settings (accessories_list, designers_list, warehouse_halls, warehouse_racks)
+// GET all settings (accessories_list, designers_list, warehouse_halls, warehouse_racks, allow_material_photo_edit)
 app.get('/api/settings', async (req, res) => {
   try {
     const accessoriesList = await getSetting('accessories_list');
     const designersList = await getSetting('designers_list');
     const warehouseHalls = await getSetting('warehouse_halls');
     const warehouseRacks = await getSetting('warehouse_racks');
+    const allowMaterialPhotoEdit = await getSetting('allow_material_photo_edit');
     res.status(200).json({
       accessoriesList: accessoriesList || [],
       designersList: designersList || [],
       warehouseHalls: warehouseHalls || [],
-      warehouseRacks: warehouseRacks || []
+      warehouseRacks: warehouseRacks || [],
+      allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true
     });
   } catch (err) {
     console.error('API GET /api/settings error:', err.message);
@@ -1903,6 +1969,42 @@ app.post('/api/issue-logs', async (req, res) => {
   } catch (err) {
     console.error('API POST /api/issue-logs error:', err.message);
     res.status(500).json({ error: 'Failed to save issue log.' });
+  }
+});
+
+// ── Extra Material Issues Dedicated Table Routes ───────────────────────────
+
+// GET all extra material issue records (with optional ?lotId=)
+app.get('/api/extra-material-issues', async (req, res) => {
+  try {
+    const lotId = req.query.lotId || null;
+    const records = await getAllExtraMaterialIssues(lotId);
+    res.status(200).json(records);
+  } catch (err) {
+    console.error('API GET /api/extra-material-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve extra material issue records.' });
+  }
+});
+
+// POST save new extra material issue record(s)
+app.post('/api/extra-material-issues', async (req, res) => {
+  try {
+    const result = await createExtraMaterialIssue(req.body);
+    res.status(201).json({ message: 'Extra material issue record(s) saved to database table.', ...result });
+  } catch (err) {
+    console.error('API POST /api/extra-material-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to save extra material issue record.' });
+  }
+});
+
+// DELETE extra material issue record by ID
+app.delete('/api/extra-material-issues/:id', async (req, res) => {
+  try {
+    await deleteExtraMaterialIssue(req.params.id);
+    res.status(200).json({ message: 'Extra material issue record deleted.' });
+  } catch (err) {
+    console.error('API DELETE /api/extra-material-issues/:id error:', err.message);
+    res.status(500).json({ error: 'Failed to delete extra material issue record.' });
   }
 });
 

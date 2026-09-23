@@ -323,9 +323,13 @@ export async function initDb() {
     category    VARCHAR(100),
     volume      INT DEFAULT 0,
     personName  VARCHAR(255),
+    receiverName VARCHAR(255) DEFAULT '',
+    receiverDept VARCHAR(100) DEFAULT '',
     date        VARCHAR(100),
     materials   TEXT
   )`);
+  try { await pool.execute(`ALTER TABLE issue_logs ADD COLUMN receiverName VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE issue_logs ADD COLUMN receiverDept VARCHAR(100) DEFAULT ''`); } catch (_) { }
 
   // Design History Logs
   await pool.execute(`CREATE TABLE IF NOT EXISTS design_history (
@@ -551,6 +555,42 @@ export async function initDb() {
     acceptedAt      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  // Dedicated Extra Material Issues Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS extra_material_issues (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    voucher_id       VARCHAR(100) NOT NULL,
+    lot_id           VARCHAR(100) NOT NULL,
+    style            VARCHAR(100) DEFAULT '',
+    brand            VARCHAR(100) DEFAULT '',
+    category         VARCHAR(100) DEFAULT '',
+    season           VARCHAR(100) DEFAULT '',
+    pieces           INT DEFAULT 0,
+    issuer_name      VARCHAR(255) DEFAULT '',
+    receiver_name    VARCHAR(255) DEFAULT '',
+    receiver_dept    VARCHAR(255) DEFAULT '',
+    material_id      VARCHAR(100) DEFAULT '',
+    material_name    VARCHAR(255) DEFAULT '',
+    bom_item_name    VARCHAR(255) DEFAULT '',
+    bom_item_detail  TEXT,
+    unit             VARCHAR(50) DEFAULT 'Pcs',
+    base_qty         DECIMAL(12,2) DEFAULT 0,
+    extra_qty        DECIMAL(12,2) DEFAULT 0,
+    extra_percentage DECIMAL(8,2) DEFAULT 0,
+    max_allowed_qty  DECIMAL(12,2) DEFAULT 0,
+    excess_qty       DECIMAL(12,2) DEFAULT 0,
+    reason           TEXT,
+    remarks          TEXT,
+    status           VARCHAR(50) DEFAULT 'Issued',
+    is_reissue       TINYINT DEFAULT 1,
+    exceeds_limit    TINYINT DEFAULT 0,
+    approved_by      VARCHAR(255) DEFAULT '',
+    approved_at      VARCHAR(100) DEFAULT '',
+    rejection_reason TEXT,
+    issue_date       VARCHAR(100) DEFAULT '',
+    items_payload    LONGTEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   // ── Seed data (only if tables are empty) ────────────────────────────────────
 
   const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
@@ -721,6 +761,7 @@ export async function initDb() {
 
   try {
     await Promise.all([
+      // Weight Capture (Fast Lookups & Summaries)
       ensureIndex('weight_capture', 'idx_wc_po', 'poNumber'),
       ensureIndex('weight_capture', 'idx_wc_matcode', 'materialCode'),
       ensureIndex('weight_capture', 'idx_wc_inv', 'invoiceNo'),
@@ -729,30 +770,56 @@ export async function initDb() {
       ensureIndex('weight_capture', 'idx_wc_captured', 'capturedAt'),
       ensureIndex('weight_capture', 'idx_wc_po_inv', 'poNumber, invoiceNo'),
       ensureIndex('weight_capture', 'idx_wc_storeloc', 'storeLocation'),
+      ensureIndex('weight_capture', 'idx_wc_mat_loc_app', 'materialCode, storeLocation, approvalStatus'),
+      ensureIndex('weight_capture', 'idx_wc_app_date', 'approvalStatus, capturedAt'),
+
+      // Warehouse Racks
       ensureIndex('warehouse_locations', 'idx_whloc_code', 'code'),
+      ensureIndex('warehouse_locations', 'idx_whloc_wh_code', 'warehouse, code'),
+
+      // Purchase Orders
       ensureIndex('purchase_orders', 'idx_po_number', 'poNumber'),
       ensureIndex('purchase_orders', 'idx_po_vendor', 'vendorName'),
       ensureIndex('purchase_orders', 'idx_po_status', 'status'),
+      ensureIndex('purchase_orders', 'idx_po_status_date', 'status, issueDate'),
+
+      // Order Accepted
       ensureIndex('order_accepted', 'idx_oa_po', 'poNumber'),
       ensureIndex('order_accepted', 'idx_oa_inv', 'invoiceNo'),
       ensureIndex('order_accepted', 'idx_oa_mat', 'materialName'),
       ensureIndex('order_accepted', 'idx_oa_date', 'acceptedAt'),
+      ensureIndex('order_accepted', 'idx_oa_po_mat', 'poNumber, materialName'),
+
+      // Materials Catalog
       ensureIndex('materials', 'idx_mat_name', 'name'),
       ensureIndex('materials', 'idx_mat_category', 'category'),
       ensureIndex('materials', 'idx_mat_loc', 'location'),
       ensureIndex('materials', 'idx_mat_cat_name', 'category, name'),
+      ensureIndex('materials', 'idx_mat_cat_stock', 'category, stock'),
+      ensureIndex('materials', 'idx_mat_loc_stock', 'location, stock'),
+
+      // Cutting & Operations
       ensureIndex('cutting_header', 'idx_ch_lot', 'Lot_Number'),
       ensureIndex('cutting_header', 'idx_ch_style', 'Style'),
       ensureIndex('cutting_header', 'idx_ch_party', 'Party_Name'),
       ensureIndex('cuttings_matrix', 'idx_cm_lot', 'Lot_No'),
       ensureIndex('cuttings_matrix', 'idx_cm_header', 'header_id'),
       ensureIndex('cuttings_matrix', 'idx_cm_lot_style', 'Lot_No, style'),
+
+      // Material Transfers
       ensureIndex('material_transfers', 'idx_mt_code', 'materialCode'),
       ensureIndex('material_transfers', 'idx_mt_date', 'transferredAt'),
+      ensureIndex('material_transfers', 'idx_mt_code_date', 'materialCode, transferredAt'),
+      ensureIndex('material_transfers', 'idx_mt_from_to', 'fromLocation, toLocation'),
+
+      // Operations & Approvals
       ensureIndex('zip', 'idx_zip_lot', 'Lot_Number'),
       ensureIndex('zip', 'idx_zip_po', 'po_number'),
       ensureIndex('issue_logs', 'idx_issue_lot', 'lotId'),
-      ensureIndex('scans', 'idx_scans_lot_date', 'lot_number, scanned_at')
+      ensureIndex('scans', 'idx_scans_lot_date', 'lot_number, scanned_at'),
+      ensureIndex('approval_requests', 'idx_ar_type_status', 'type, status'),
+      ensureIndex('users', 'idx_users_email', 'email'),
+      ensureIndex('users', 'idx_users_role', 'role')
     ]);
   } catch (_) { }
 
@@ -1215,7 +1282,8 @@ export const upsertMaterial = async (m) => {
         location = ?,
         packets = ?,
         poNumber = ?,
-        invoiceNo = ?
+        invoiceNo = ?,
+        imageUrl = ?
        WHERE id = ?`,
       [
         m.name !== undefined ? m.name : ext.name,
@@ -1229,21 +1297,27 @@ export const upsertMaterial = async (m) => {
         m.packets !== undefined ? m.packets : ext.packets,
         m.poNumber !== undefined ? m.poNumber : ext.poNumber,
         m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
+        m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
         m.id
       ]
     );
 
-    // Sync updated location and packets count back to weight_capture table so they match
-    if (m.location !== undefined) {
+    // Sync updated location, packets count and imageUrl back to weight_capture table so they match
+    if (m.location !== undefined || m.imageUrl !== undefined) {
       await pool.execute(
-        'UPDATE weight_capture SET storeLocation = ?, packets = ? WHERE materialCode = ?',
-        [m.location, m.packets !== undefined ? m.packets : ext.packets, m.id]
+        'UPDATE weight_capture SET storeLocation = ?, packets = ?, imageUrl = COALESCE(NULLIF(?, ""), imageUrl) WHERE materialCode = ?',
+        [
+          m.location !== undefined ? m.location : (ext.location || 'Main Store'),
+          m.packets !== undefined ? m.packets : ext.packets,
+          m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
+          m.id
+        ]
       );
     }
   } else {
     await pool.execute(
-      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         m.id,
         m.name || 'Accessory Material',
@@ -1256,7 +1330,8 @@ export const upsertMaterial = async (m) => {
         m.location || 'Main Store',
         m.packets || 1,
         m.poNumber || 'N/A',
-        m.invoiceNo || 'N/A'
+        m.invoiceNo || 'N/A',
+        m.imageUrl || ''
       ]
     );
   }
@@ -1264,6 +1339,9 @@ export const upsertMaterial = async (m) => {
 
 export const deleteMaterial = async (id) => {
   await pool.execute('DELETE FROM materials WHERE id=?', [id]);
+  try {
+    await pool.execute('DELETE FROM weight_capture WHERE materialCode=?', [id]);
+  } catch (_) {}
 };
 
 // ── Approval Requests ─────────────────────────────────────────────────────────
@@ -1666,11 +1744,11 @@ export const getAllIssueLogs = async () => {
 export const createIssueLog = async (log) => {
   const materialsJson = log.materials ? JSON.stringify(log.materials) : '[]';
   await pool.execute(
-    `INSERT INTO issue_logs (id,lotId,isReissue,isReturn,category,volume,personName,date,materials)
-     VALUES (?,?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE lotId=VALUES(lotId), date=VALUES(date)`,
+    `INSERT INTO issue_logs (id,lotId,isReissue,isReturn,category,volume,personName,receiverName,receiverDept,date,materials)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE lotId=VALUES(lotId), date=VALUES(date), personName=VALUES(personName), receiverName=VALUES(receiverName), receiverDept=VALUES(receiverDept), materials=VALUES(materials)`,
     [log.id, log.lotId || '', log.isReissue ? 1 : 0, log.isReturn ? 1 : 0,
-    log.category || '', log.volume || 0, log.personName || '', log.date || '', materialsJson]
+    log.category || '', log.volume || 0, log.personName || '', log.receiverName || '', log.receiverDept || '', log.date || '', materialsJson]
   );
 };
 
@@ -2534,6 +2612,99 @@ export const getMaterialTraceability = async (query = '') => {
   });
 
   return traceabilityRecords;
+};
+
+// ── Extra Material Issues Operations ──────────────────────────────────────────
+
+export const createExtraMaterialIssue = async (data) => {
+  const voucherId = data.voucherId || data.voucher_id || `EMI-${Date.now().toString().slice(-6)}`;
+  const lotId = String(data.lotId || data.lot_id || '').trim();
+  const style = data.style || '';
+  const brand = data.brand || '';
+  const category = data.category || '';
+  const season = data.season || '';
+  const pieces = Number(data.pieces || data.volume || 0);
+  const issuerName = data.personName || data.issuer_name || data.issuerName || '';
+  const receiverName = data.receiverName || data.receiver_name || '';
+  const receiverDept = data.receiverDept || data.receiver_dept || '';
+  const issueDate = data.issueDate || data.issue_date || data.date || (new Date().toLocaleDateString('en-GB') + ' ' + new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }));
+  const status = data.status || 'Issued';
+  const approvedBy = data.approvedBy || data.approved_by || '';
+  const approvedAt = data.approvedAt || data.approved_at || '';
+  const rejectionReason = data.rejectionReason || data.rejection_reason || '';
+
+  const items = Array.isArray(data.items) ? data.items : [data];
+  const itemsJson = JSON.stringify(items);
+  const insertedIds = [];
+
+  for (const it of items) {
+    const materialId = it.materialId || it.material_id || '';
+    const materialName = it.materialName || it.material_name || it.name || '';
+    const bomItemName = it.bomItemName || it.bom_item_name || '';
+    const bomItemDetail = it.bomItemDetail || it.bom_item_detail || '';
+    const unit = it.unit || 'Pcs';
+    const baseQty = Number(it.baseQty || it.base_qty || it.previouslyIssued || it.previouslyIssuedQty || 0);
+    const extraQty = Number(it.totalRequired || it.extraQty || it.extra_qty || it.quantity || it.qty || 0);
+    const extraPercentage = Number(it.issuePercentage || it.percentage || it.extraPercentage || it.extra_percentage || 0);
+    const maxAllowedQty = Number(it.maxAllowedQty || it.max_allowed_qty || (baseQty * 0.05) || 0);
+    const excessQty = Number(it.excessQty || it.excess_qty || Math.max(0, extraQty - maxAllowedQty) || 0);
+    const reason = it.reason || it.extraReason || it.extra_reason || 'Cutting Wastage / Excess Loss';
+    const remarks = it.remarks || it.extraRemarks || it.extra_remarks || '';
+    const exceedsLimit = (it.exceedsLimit || it.exceeds_limit || extraPercentage > 5.0) ? 1 : 0;
+
+    const [res] = await pool.execute(
+      `INSERT INTO extra_material_issues (
+        voucher_id, lot_id, style, brand, category, season, pieces,
+        issuer_name, receiver_name, receiver_dept,
+        material_id, material_name, bom_item_name, bom_item_detail, unit,
+        base_qty, extra_qty, extra_percentage, max_allowed_qty, excess_qty,
+        reason, remarks, status, is_reissue, exceeds_limit,
+        approved_by, approved_at, rejection_reason, issue_date, items_payload
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        voucherId, lotId, style, brand, category, season, pieces,
+        issuerName, receiverName, receiverDept,
+        materialId, materialName, bomItemName, bomItemDetail, unit,
+        baseQty, extraQty, extraPercentage, maxAllowedQty, excessQty,
+        reason, remarks, status, 1, exceedsLimit,
+        approvedBy, approvedAt, rejectionReason, issueDate, itemsJson
+      ]
+    );
+    insertedIds.push(res.insertId);
+  }
+
+  return { voucherId, insertedCount: insertedIds.length, insertedIds };
+};
+
+export const getAllExtraMaterialIssues = async (lotId = null) => {
+  let query = 'SELECT * FROM extra_material_issues';
+  const params = [];
+
+  if (lotId) {
+    query += ' WHERE LOWER(lot_id) = LOWER(?)';
+    params.push(String(lotId).trim());
+  }
+
+  query += ' ORDER BY id DESC';
+  const [rows] = await pool.execute(query, params);
+
+  return rows.map(r => {
+    let parsedPayload = [];
+    try {
+      parsedPayload = r.items_payload ? JSON.parse(r.items_payload) : [];
+    } catch (_) {
+      parsedPayload = [];
+    }
+    return {
+      ...r,
+      items: parsedPayload
+    };
+  });
+};
+
+export const deleteExtraMaterialIssue = async (id) => {
+  await pool.execute('DELETE FROM extra_material_issues WHERE id = ?', [id]);
+  return true;
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────
