@@ -1922,12 +1922,14 @@ app.get('/api/settings', async (req, res) => {
     const warehouseHalls = await getSetting('warehouse_halls');
     const warehouseRacks = await getSetting('warehouse_racks');
     const allowMaterialPhotoEdit = await getSetting('allow_material_photo_edit');
+    const allowWarehouseAddRack = await getSetting('allow_warehouse_add_rack');
     res.status(200).json({
       accessoriesList: accessoriesList || [],
       designersList: designersList || [],
       warehouseHalls: warehouseHalls || [],
       warehouseRacks: warehouseRacks || [],
-      allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true
+      allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true,
+      allowWarehouseAddRack: (allowWarehouseAddRack !== null && allowWarehouseAddRack !== undefined) ? Boolean(allowWarehouseAddRack) : false
     });
   } catch (err) {
     console.error('API GET /api/settings error:', err.message);
