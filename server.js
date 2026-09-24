@@ -72,7 +72,10 @@ import {
   getMaterialTraceability,
   createExtraMaterialIssue,
   getAllExtraMaterialIssues,
-  deleteExtraMaterialIssue
+  deleteExtraMaterialIssue,
+  createBoneIssue,
+  getAllBoneIssues,
+  deleteBoneIssue
 } from './db.js';
 import pool from './db.js';
 
@@ -1865,9 +1868,9 @@ app.put('/api/doori-orders/:lotNo/payload', async (req, res) => {
 // GET next unique PO number (auto-increment per type)
 app.get('/api/po-number/next/:type', async (req, res) => {
   try {
-    const type = req.params.type; // 'zip' or 'doori'
-    if (!['zip', 'doori'].includes(type)) {
-      return res.status(400).json({ error: 'Type must be zip or doori.' });
+    const type = req.params.type; // 'zip', 'doori', 'bone', or 'bone_issue'
+    if (!['zip', 'doori', 'bone', 'bone_issue'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be zip, doori, bone, or bone_issue.' });
     }
     const poNumber = await getNextPoNumber(type);
     res.status(200).json({ poNumber });
@@ -2007,6 +2010,42 @@ app.delete('/api/extra-material-issues/:id', async (req, res) => {
   } catch (err) {
     console.error('API DELETE /api/extra-material-issues/:id error:', err.message);
     res.status(500).json({ error: 'Failed to delete extra material issue record.' });
+  }
+});
+
+// ── Dedicated Bone Issue Table Routes ──────────────────────────────────────────
+
+// GET all bone issues from dedicated table (optional ?lotNo=)
+app.get('/api/bone-issues', async (req, res) => {
+  try {
+    const lotNo = req.query.lotNo || req.query.lotId || null;
+    const records = await getAllBoneIssues(lotNo);
+    res.status(200).json(records);
+  } catch (err) {
+    console.error('API GET /api/bone-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve bone issue records.' });
+  }
+});
+
+// POST save a new bone issue record into dedicated table
+app.post('/api/bone-issues', async (req, res) => {
+  try {
+    const record = await createBoneIssue(req.body);
+    res.status(201).json({ message: 'Bone issue saved successfully to database table.', data: record });
+  } catch (err) {
+    console.error('API POST /api/bone-issues error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to save bone issue record.' });
+  }
+});
+
+// DELETE bone issue record by ID or slipNo
+app.delete('/api/bone-issues/:id', async (req, res) => {
+  try {
+    await deleteBoneIssue(req.params.id);
+    res.status(200).json({ message: 'Bone issue deleted from database table.' });
+  } catch (err) {
+    console.error('API DELETE /api/bone-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to delete bone issue record.' });
   }
 });
 

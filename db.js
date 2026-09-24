@@ -591,6 +591,31 @@ export async function initDb() {
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  // Dedicated Bone Issue Table (store bone issues separately)
+  await pool.execute(`CREATE TABLE IF NOT EXISTS bone_issue (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    slip_no       VARCHAR(100) NOT NULL UNIQUE,
+    lot_no        VARCHAR(100) NOT NULL,
+    rolls         INT DEFAULT 1,
+    issuer_name   VARCHAR(255) DEFAULT '',
+    receiver_name VARCHAR(255) DEFAULT '',
+    issue_date    VARCHAR(100) DEFAULT '',
+    style         VARCHAR(255) DEFAULT '',
+    brand         VARCHAR(255) DEFAULT '',
+    garment_type  VARCHAR(255) DEFAULT '',
+    fabric        VARCHAR(255) DEFAULT '',
+    quantity      INT DEFAULT 0,
+    shade         VARCHAR(255) DEFAULT '',
+    size          VARCHAR(255) DEFAULT '',
+    remarks       TEXT,
+    payload       LONGTEXT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+  try { await pool.execute(`CREATE INDEX idx_bone_issue_lot ON bone_issue (lot_no)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_bone_issue_date ON bone_issue (issue_date)`); } catch (_) { }
+  try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('bone_issue_counter', '0')`); } catch (_) { }
+
   // ── Seed data (only if tables are empty) ────────────────────────────────────
 
   const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
@@ -1866,9 +1891,9 @@ export const getAllHistory = async () => {
 
 // ── PO Number counter (atomic, stored in settings) ──────────────────────────
 export const getNextPoNumber = async (type) => {
-  // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001'
-  const key = type === 'zip' ? 'zip_po_counter' : 'doori_po_counter';
-  const prefix = type === 'zip' ? 'ZIP-PO' : 'DORI-PO';
+  // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001' | type = 'bone'/'bone_issue' → returns 'BONE-ISSUE-0001'
+  const key = type === 'zip' ? 'zip_po_counter' : (type === 'bone' || type === 'bone_issue') ? 'bone_issue_counter' : 'doori_po_counter';
+  const prefix = type === 'zip' ? 'ZIP-PO' : (type === 'bone' || type === 'bone_issue') ? 'BONE-ISSUE' : 'DORI-PO';
 
   // Use a transaction to safely increment
   const conn = await pool.getConnection();
@@ -2704,6 +2729,124 @@ export const getAllExtraMaterialIssues = async (lotId = null) => {
 
 export const deleteExtraMaterialIssue = async (id) => {
   await pool.execute('DELETE FROM extra_material_issues WHERE id = ?', [id]);
+  return true;
+};
+
+// ── Bone Issue Operations (Dedicated Table) ──────────────────────────────────
+
+export const createBoneIssue = async (data) => {
+  const slipNo = (data.slipNo || data.slip_no || '').trim();
+  const lotNo = String(data.lotNo || data.lot_no || '').trim();
+  const rolls = Math.max(1, parseInt(data.rolls, 10) || 1);
+  const issuerName = (data.issuerName || data.issuer_name || '').trim();
+  const receiverName = (data.receiverName || data.receiver_name || '').trim();
+  const issueDate = data.issueDate || data.issue_date || data.date || new Date().toISOString().split('T')[0];
+  const style = data.style || '';
+  const brand = data.brand || '';
+  const garmentType = data.garmentType || data.garment_type || '';
+  const fabric = data.fabric || '';
+  const quantity = parseInt(data.quantity || 0, 10) || 0;
+  const shade = data.shade || '';
+  const size = data.size || '';
+  const remarks = data.remarks || '';
+  const payload = typeof data.payload === 'string' ? data.payload : JSON.stringify(data);
+
+  if (!slipNo || !lotNo) {
+    throw new Error('slipNo and lotNo are required for Bone Issue.');
+  }
+
+  const [result] = await pool.execute(
+    `INSERT INTO bone_issue (
+      slip_no, lot_no, rolls, issuer_name, receiver_name, issue_date,
+      style, brand, garment_type, fabric, quantity, shade, size, remarks, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      lot_no = VALUES(lot_no),
+      rolls = VALUES(rolls),
+      issuer_name = VALUES(issuer_name),
+      receiver_name = VALUES(receiver_name),
+      issue_date = VALUES(issue_date),
+      style = VALUES(style),
+      brand = VALUES(brand),
+      garment_type = VALUES(garment_type),
+      fabric = VALUES(fabric),
+      quantity = VALUES(quantity),
+      shade = VALUES(shade),
+      size = VALUES(size),
+      remarks = VALUES(remarks),
+      payload = VALUES(payload)`,
+    [
+      slipNo, lotNo, rolls, issuerName, receiverName, issueDate,
+      style, brand, garmentType, fabric, quantity, shade, size, remarks, payload
+    ]
+  );
+
+  return {
+    id: result.insertId,
+    slipNo,
+    lotNo,
+    rolls,
+    issuerName,
+    receiverName,
+    issueDate,
+    style,
+    brand,
+    garmentType,
+    fabric,
+    quantity,
+    shade,
+    size,
+    remarks
+  };
+};
+
+export const getAllBoneIssues = async (lotNo = null) => {
+  let query = 'SELECT * FROM bone_issue';
+  const params = [];
+
+  if (lotNo) {
+    query += ' WHERE LOWER(lot_no) = LOWER(?)';
+    params.push(String(lotNo).trim());
+  }
+
+  query += ' ORDER BY id DESC';
+  const [rows] = await pool.execute(query, params);
+
+  return rows.map(r => ({
+    id: r.id,
+    slipNo: r.slip_no,
+    slip_no: r.slip_no,
+    lotNo: r.lot_no,
+    lot_no: r.lot_no,
+    rolls: r.rolls,
+    issuerName: r.issuer_name,
+    issuer_name: r.issuer_name,
+    receiverName: r.receiver_name,
+    receiver_name: r.receiver_name,
+    issueDate: r.issue_date,
+    issue_date: r.issue_date,
+    date: r.issue_date,
+    style: r.style,
+    brand: r.brand,
+    garmentType: r.garment_type,
+    garment_type: r.garment_type,
+    fabric: r.fabric,
+    quantity: r.quantity,
+    shade: r.shade,
+    size: r.size,
+    remarks: r.remarks,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  }));
+};
+
+export const deleteBoneIssue = async (idOrSlipNo) => {
+  const isNumeric = !isNaN(Number(idOrSlipNo));
+  if (isNumeric) {
+    await pool.execute('DELETE FROM bone_issue WHERE id = ? OR slip_no = ?', [Number(idOrSlipNo), String(idOrSlipNo)]);
+  } else {
+    await pool.execute('DELETE FROM bone_issue WHERE slip_no = ?', [String(idOrSlipNo)]);
+  }
   return true;
 };
 
