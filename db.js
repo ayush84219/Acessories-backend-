@@ -616,6 +616,32 @@ export async function initDb() {
   try { await pool.execute(`CREATE INDEX idx_bone_issue_date ON bone_issue (issue_date)`); } catch (_) { }
   try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('bone_issue_counter', '0')`); } catch (_) { }
 
+  // Dedicated Elastic Issue Table (store elastic issues separately)
+  await pool.execute(`CREATE TABLE IF NOT EXISTS elastic_issue (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    slip_no       VARCHAR(100) NOT NULL UNIQUE,
+    lot_no        VARCHAR(100) NOT NULL,
+    rolls         INT DEFAULT 1,
+    issuer_name   VARCHAR(255) DEFAULT '',
+    receiver_name VARCHAR(255) DEFAULT '',
+    issue_date    VARCHAR(100) DEFAULT '',
+    style         VARCHAR(255) DEFAULT '',
+    brand         VARCHAR(255) DEFAULT '',
+    garment_type  VARCHAR(255) DEFAULT '',
+    fabric        VARCHAR(255) DEFAULT '',
+    quantity      INT DEFAULT 0,
+    shade         VARCHAR(255) DEFAULT '',
+    size          VARCHAR(255) DEFAULT '',
+    elastic_width VARCHAR(100) DEFAULT '',
+    remarks       TEXT,
+    payload       LONGTEXT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+  try { await pool.execute(`CREATE INDEX idx_elastic_issue_lot ON elastic_issue (lot_no)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_elastic_issue_date ON elastic_issue (issue_date)`); } catch (_) { }
+  try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_issue_counter', '0')`); } catch (_) { }
+
   // ── Seed data (only if tables are empty) ────────────────────────────────────
 
   const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
@@ -1891,9 +1917,9 @@ export const getAllHistory = async () => {
 
 // ── PO Number counter (atomic, stored in settings) ──────────────────────────
 export const getNextPoNumber = async (type) => {
-  // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001' | type = 'bone'/'bone_issue' → returns 'BONE-ISSUE-0001'
-  const key = type === 'zip' ? 'zip_po_counter' : (type === 'bone' || type === 'bone_issue') ? 'bone_issue_counter' : 'doori_po_counter';
-  const prefix = type === 'zip' ? 'ZIP-PO' : (type === 'bone' || type === 'bone_issue') ? 'BONE-ISSUE' : 'DORI-PO';
+  // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001' | type = 'bone'/'bone_issue' → returns 'BONE-ISSUE-0001' | type = 'elastic'/'elastic_issue' → returns 'ELASTIC-ISSUE-0001'
+  const key = type === 'zip' ? 'zip_po_counter' : (type === 'bone' || type === 'bone_issue') ? 'bone_issue_counter' : (type === 'elastic' || type === 'elastic_issue') ? 'elastic_issue_counter' : 'doori_po_counter';
+  const prefix = type === 'zip' ? 'ZIP-PO' : (type === 'bone' || type === 'bone_issue') ? 'BONE-ISSUE' : (type === 'elastic' || type === 'elastic_issue') ? 'ELASTIC-ISSUE' : 'DORI-PO';
 
   // Use a transaction to safely increment
   const conn = await pool.getConnection();
@@ -2846,6 +2872,128 @@ export const deleteBoneIssue = async (idOrSlipNo) => {
     await pool.execute('DELETE FROM bone_issue WHERE id = ? OR slip_no = ?', [Number(idOrSlipNo), String(idOrSlipNo)]);
   } else {
     await pool.execute('DELETE FROM bone_issue WHERE slip_no = ?', [String(idOrSlipNo)]);
+  }
+  return true;
+};
+
+// ── Elastic Issue DB Operations ─────────────────────────────────────────────
+export const createElasticIssue = async (data) => {
+  const slipNo = data.slipNo || data.slip_no || '';
+  const lotNo = data.lotNo || data.lot_no || '';
+  const rolls = parseInt(data.rolls || 1, 10);
+  const issuerName = data.issuerName || data.issuer_name || '';
+  const receiverName = data.receiverName || data.receiver_name || '';
+  const issueDate = data.issueDate || data.issue_date || data.date || new Date().toISOString().split('T')[0];
+  const style = data.style || '';
+  const brand = data.brand || '';
+  const garmentType = data.garmentType || data.garment_type || '';
+  const fabric = data.fabric || '';
+  const quantity = parseInt(data.quantity || 0, 10);
+  const shade = data.shade || '';
+  const size = data.size || '';
+  const elasticWidth = data.elasticWidth || data.elastic_width || data.width || '';
+  const remarks = data.remarks || '';
+  const payload = typeof data.payload === 'string' ? data.payload : JSON.stringify(data);
+
+  if (!slipNo || !lotNo) {
+    throw new Error('slipNo and lotNo are required for Elastic Issue.');
+  }
+
+  const [result] = await pool.execute(
+    `INSERT INTO elastic_issue (
+      slip_no, lot_no, rolls, issuer_name, receiver_name, issue_date,
+      style, brand, garment_type, fabric, quantity, shade, size, elastic_width, remarks, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      lot_no = VALUES(lot_no),
+      rolls = VALUES(rolls),
+      issuer_name = VALUES(issuer_name),
+      receiver_name = VALUES(receiver_name),
+      issue_date = VALUES(issue_date),
+      style = VALUES(style),
+      brand = VALUES(brand),
+      garment_type = VALUES(garment_type),
+      fabric = VALUES(fabric),
+      quantity = VALUES(quantity),
+      shade = VALUES(shade),
+      size = VALUES(size),
+      elastic_width = VALUES(elastic_width),
+      remarks = VALUES(remarks),
+      payload = VALUES(payload)`,
+    [
+      slipNo, lotNo, rolls, issuerName, receiverName, issueDate,
+      style, brand, garmentType, fabric, quantity, shade, size, elasticWidth, remarks, payload
+    ]
+  );
+
+  return {
+    id: result.insertId,
+    slipNo,
+    lotNo,
+    rolls,
+    issuerName,
+    receiverName,
+    issueDate,
+    style,
+    brand,
+    garmentType,
+    fabric,
+    quantity,
+    shade,
+    size,
+    elasticWidth,
+    remarks
+  };
+};
+
+export const getAllElasticIssues = async (lotNo = null) => {
+  let query = 'SELECT * FROM elastic_issue';
+  const params = [];
+
+  if (lotNo) {
+    query += ' WHERE LOWER(lot_no) = LOWER(?)';
+    params.push(String(lotNo).trim());
+  }
+
+  query += ' ORDER BY id DESC';
+  const [rows] = await pool.execute(query, params);
+
+  return rows.map(r => ({
+    id: r.id,
+    slipNo: r.slip_no,
+    slip_no: r.slip_no,
+    lotNo: r.lot_no,
+    lot_no: r.lot_no,
+    rolls: r.rolls,
+    issuerName: r.issuer_name,
+    issuer_name: r.issuer_name,
+    receiverName: r.receiver_name,
+    receiver_name: r.receiver_name,
+    issueDate: r.issue_date,
+    issue_date: r.issue_date,
+    date: r.issue_date,
+    style: r.style,
+    brand: r.brand,
+    garmentType: r.garment_type,
+    garment_type: r.garment_type,
+    fabric: r.fabric,
+    quantity: r.quantity,
+    shade: r.shade,
+    size: r.size,
+    width: r.elastic_width,
+    elasticWidth: r.elastic_width,
+    remarks: r.remarks,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  }));
+};
+
+export const deleteElasticIssue = async (idOrSlipNo) => {
+  const isNumeric = !isNaN(Number(idOrSlipNo));
+  if (isNumeric) {
+    await pool.execute('DELETE FROM elastic_issue WHERE id = ? OR slip_no = ?', [Number(idOrSlipNo), String(idOrSlipNo)]);
+  } else {
+    await pool.execute('DELETE FROM elastic_issue WHERE slip_no = ?', [String(idOrSlipNo)]);
   }
   return true;
 };

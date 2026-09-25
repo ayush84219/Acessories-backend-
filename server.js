@@ -75,7 +75,10 @@ import {
   deleteExtraMaterialIssue,
   createBoneIssue,
   getAllBoneIssues,
-  deleteBoneIssue
+  deleteBoneIssue,
+  createElasticIssue,
+  getAllElasticIssues,
+  deleteElasticIssue
 } from './db.js';
 import pool from './db.js';
 
@@ -1868,9 +1871,9 @@ app.put('/api/doori-orders/:lotNo/payload', async (req, res) => {
 // GET next unique PO number (auto-increment per type)
 app.get('/api/po-number/next/:type', async (req, res) => {
   try {
-    const type = req.params.type; // 'zip', 'doori', 'bone', or 'bone_issue'
-    if (!['zip', 'doori', 'bone', 'bone_issue'].includes(type)) {
-      return res.status(400).json({ error: 'Type must be zip, doori, bone, or bone_issue.' });
+    const type = req.params.type; // 'zip', 'doori', 'bone', 'bone_issue', 'elastic', or 'elastic_issue'
+    if (!['zip', 'doori', 'bone', 'bone_issue', 'elastic', 'elastic_issue'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be zip, doori, bone, bone_issue, elastic, or elastic_issue.' });
     }
     const poNumber = await getNextPoNumber(type);
     res.status(200).json({ poNumber });
@@ -2046,6 +2049,42 @@ app.delete('/api/bone-issues/:id', async (req, res) => {
   } catch (err) {
     console.error('API DELETE /api/bone-issues error:', err.message);
     res.status(500).json({ error: 'Failed to delete bone issue record.' });
+  }
+});
+
+// ── Dedicated Elastic Issue Table Routes ───────────────────────────────────────
+
+// GET all elastic issues from dedicated table (optional ?lotNo=)
+app.get('/api/elastic-issues', async (req, res) => {
+  try {
+    const lotNo = req.query.lotNo || req.query.lotId || null;
+    const records = await getAllElasticIssues(lotNo);
+    res.status(200).json(records);
+  } catch (err) {
+    console.error('API GET /api/elastic-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve elastic issue records.' });
+  }
+});
+
+// POST save a new elastic issue record into dedicated table
+app.post('/api/elastic-issues', async (req, res) => {
+  try {
+    const record = await createElasticIssue(req.body);
+    res.status(201).json({ message: 'Elastic issue saved successfully to database table.', data: record });
+  } catch (err) {
+    console.error('API POST /api/elastic-issues error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to save elastic issue record.' });
+  }
+});
+
+// DELETE elastic issue record by ID or slipNo
+app.delete('/api/elastic-issues/:id', async (req, res) => {
+  try {
+    await deleteElasticIssue(req.params.id);
+    res.status(200).json({ message: 'Elastic issue deleted from database table.' });
+  } catch (err) {
+    console.error('API DELETE /api/elastic-issues error:', err.message);
+    res.status(500).json({ error: 'Failed to delete elastic issue record.' });
   }
 });
 
@@ -2404,6 +2443,55 @@ if (fs.existsSync(distPath)) {
 // Start Server
 const server = app.listen(PORT, () => {
   console.log(`G-PDMS Auth Server running on http://localhost:${PORT}`);
+
+  // ── Auto Keep-Alive Heartbeat (Every 1 Minute) ─────────────────────────────
+  // Pings /api/health and refreshes DB pool to prevent cloud server sleep mode
+  const KEEP_ALIVE_INTERVAL_MS = 60 * 1000; // Exactly every 1 minute
+
+  const runKeepAliveHealthCheck = async () => {
+    const timestamp = new Date().toLocaleTimeString('en-GB');
+    let dbLatency = 0;
+    try {
+      const dbStart = Date.now();
+      await pool.query('SELECT 1');
+      dbLatency = Date.now() - dbStart;
+    } catch (dbErr) {
+      console.warn(`[Keep-Alive Heartbeat] ⚠️ DB ping warning: ${dbErr.message}`);
+    }
+
+    // Ping localhost and external URLs if defined
+    const endpointsToPing = [`http://127.0.0.1:${PORT}/api/health`];
+    const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL || process.env.SERVER_URL || process.env.PUBLIC_BACKEND_URL;
+    if (externalUrl) {
+      const cleanUrl = externalUrl.replace(/\/+$/, '');
+      if (!cleanUrl.includes('127.0.0.1') && !cleanUrl.includes('localhost')) {
+        endpointsToPing.push(`${cleanUrl}/api/health`);
+      }
+    }
+
+    for (const url of endpointsToPing) {
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: { 'User-Agent': 'G-PDMS-KeepAlive-Worker/1.0' }
+        });
+        if (res.ok) {
+          console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Health OK (${url}) | DB Latency: ${dbLatency}ms | Uptime: ${Math.floor(process.uptime())}s`);
+        } else {
+          console.warn(`[Keep-Alive Heartbeat] ⚠️ ${timestamp} - Response status ${res.status} from ${url}`);
+        }
+      } catch (fetchErr) {
+        // Log brief notice without crashing
+        console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Local DB Pool Active | Latency: ${dbLatency}ms | Ping note: ${fetchErr.message}`);
+      }
+    }
+  };
+
+  // Initial keep-alive check after 5 seconds
+  setTimeout(runKeepAliveHealthCheck, 5000);
+
+  // Recurring keep-alive every 1 minute (60 seconds)
+  setInterval(runKeepAliveHealthCheck, KEEP_ALIVE_INTERVAL_MS);
 
   // Background Auto-Sync Google Sheets to Database on startup
   setTimeout(() => {
