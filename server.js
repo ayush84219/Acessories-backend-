@@ -265,7 +265,7 @@ const sendOtpEmail = async (email, name, otpCode) => {
   return false;
 };
 
-// JWT Authentication Middleware
+// JWT Authentication Middleware (12-hour session expiration)
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
@@ -276,7 +276,14 @@ const authenticateToken = (req, res, next) => {
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      return res.status(403).json({ error: 'Token is invalid or expired.' });
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({
+          error: 'Your 12-hour session has expired. Please log in again to secure your application.',
+          code: 'TOKEN_EXPIRED',
+          expired: true
+        });
+      }
+      return res.status(403).json({ error: 'Token is invalid or unauthorized.' });
     }
     req.user = user;
     next();
@@ -495,16 +502,21 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email or password.' });
     }
 
-    // Sign JWT
+    // Sign JWT (Enforce 12-hour tokenization for application security)
     const token = jwt.sign(
       { id: user.id, name: user.name, email: user.email, role: user.role },
       JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '12h' }
     );
+
+    const expiresInSeconds = 12 * 60 * 60; // 12 hours (43200 seconds)
+    const expiresAt = Date.now() + expiresInSeconds * 1000;
 
     res.status(200).json({
       message: 'Login successful!',
       token,
+      expiresIn: expiresInSeconds,
+      expiresAt,
       user: {
         id: user.id,
         name: user.name,
