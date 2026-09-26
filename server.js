@@ -47,7 +47,6 @@ import {
   getAllDooriOrders,
   updateCuttingHeaderPayload,
   updateDooriPayload,
-  resetLotOperationalData,
   duplicateCuttingHeader,
   getNextPoNumber,
   getNextGeneralPoNumber,
@@ -62,6 +61,7 @@ import {
   getUndesignedCuttingLots,
   getAllWarehouseLocations,
   createWarehouseLocation,
+  updateWarehouseLocation,
   deleteWarehouseLocation,
   clearAllWarehouseLocations,
   bulkSaveWarehouseLocations,
@@ -162,40 +162,56 @@ try {
   process.exit(1);
 }
 
-// ── Health Check & System Status Endpoints ─────────────────────────────────────
+// ── Lightweight Health Check (300s / 5min interval, minimal server load) ───────
 app.get('/api/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/api/health', async (req, res) => {
-  let dbStatus = 'healthy';
-  let dbLatencyMs = 0;
   try {
-    const start = Date.now();
     await pool.query('SELECT 1');
-    dbLatencyMs = Date.now() - start;
-  } catch (e) {
-    dbStatus = 'unreachable: ' + e.message;
+    res.status(200).json({
+      status: 'UP',
+      uptimeSeconds: Math.floor(process.uptime()),
+      db: 'connected'
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'DOWN',
+      error: err.message
+    });
   }
-
-  const isHealthy = dbStatus === 'healthy';
-  res.status(isHealthy ? 200 : 503).json({
-    status: isHealthy ? 'UP' : 'DEGRADED',
-    timestamp: new Date().toISOString(),
-    uptimeSeconds: Math.floor(process.uptime()),
-    database: {
-      status: dbStatus,
-      latencyMs: dbLatencyMs
-    },
-    syncWorker: syncWorkerStats,
-    cache: {
-      dir: CACHE_DIR,
-      lotsCached: fs.existsSync(LOTS_CSV_CACHE_PATH)
-    },
-    memory: {
-      rssMb: (process.memoryUsage().rss / 1024 / 1024).toFixed(2),
-      heapUsedMb: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)
-    }
-  });
 });
+
+// ── In-Memory Micro-Cache for High-Frequency Read Endpoints ───────────────
+const memoryCache = new Map();
+
+function getCached(key) {
+  const item = memoryCache.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) {
+    memoryCache.delete(key);
+    return null;
+  }
+  return item.data;
+}
+
+function setCached(key, data, ttlMs = 30000) {
+  memoryCache.set(key, {
+    data,
+    expiresAt: Date.now() + ttlMs
+  });
+}
+
+function invalidateCache(prefix) {
+  if (!prefix) {
+    memoryCache.clear();
+    return;
+  }
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith(prefix)) {
+      memoryCache.delete(key);
+    }
+  }
+}
 
 // Mail Transporter Configuration
 const getTransporter = () => {
@@ -321,35 +337,6 @@ const optionalAuth = (req, res, next) => {
   });
 };
 
-// Health Check Endpoint (For monitoring server uptime, memory, and database pool health)
-app.get('/api/health', async (req, res) => {
-  try {
-    const startTime = Date.now();
-    await pool.execute('SELECT 1');
-    const dbLatencyMs = Date.now() - startTime;
-    const mem = process.memoryUsage();
-    res.status(200).json({
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      uptimeSeconds: Math.floor(process.uptime()),
-      database: {
-        status: 'connected',
-        latencyMs: dbLatencyMs
-      },
-      system: {
-        heapUsedMB: (mem.heapUsed / 1024 / 1024).toFixed(2),
-        heapTotalMB: (mem.heapTotal / 1024 / 1024).toFixed(2),
-        rssMB: (mem.rss / 1024 / 1024).toFixed(2)
-      }
-    });
-  } catch (err) {
-    res.status(503).json({
-      status: 'unhealthy',
-      database: 'disconnected',
-      error: err.message
-    });
-  }
-});
 
 // --- AUTHENTICATION API ROUTES ---
 
@@ -1542,6 +1529,7 @@ app.post('/api/designs', async (req, res) => {
         pieces: design.quantity || 100,
         reason: `Design Submission: Style ${design.style || 'N/A'} - Category ${design.category || 'N/A'}`
       });
+      invalidateCache('approval_requests');
     }
 
     res.status(201).json({ message: 'Design saved successfully.', design });
@@ -1581,10 +1569,19 @@ app.get('/api/design-history', async (req, res) => {
 
 // ── Materials Routes ─────────────────────────────────────────────────────────
 
-// GET all materials
+// GET all materials (micro-cached 15s)
 app.get('/api/materials', async (req, res) => {
   try {
-    const materials = await getAllMaterials();
+    const onlyPresent = req.query.present === 'true';
+    const cacheKey = `materials_${onlyPresent}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.status(200).json(cached);
+    }
+    const materials = await getAllMaterials(onlyPresent);
+    setCached(cacheKey, materials, 15000);
+    res.setHeader('X-Cache', 'MISS');
     res.status(200).json(materials);
   } catch (err) {
     console.error('API GET /api/materials error:', err.message);
@@ -1597,6 +1594,7 @@ app.post('/api/materials', async (req, res) => {
   try {
     const m = req.body;
     await upsertMaterial(m);
+    invalidateCache('materials_');
     res.status(201).json({ message: 'Material saved successfully.', material: m });
   } catch (err) {
     console.error('API POST /api/materials error:', err.message);
@@ -1609,6 +1607,7 @@ app.put('/api/materials/:id', async (req, res) => {
   try {
     const m = { ...req.body, id: req.params.id };
     await upsertMaterial(m);
+    invalidateCache('materials_');
     res.status(200).json({ message: 'Material updated successfully.' });
   } catch (err) {
     console.error('API PUT /api/materials/:id error:', err.message);
@@ -1620,6 +1619,7 @@ app.put('/api/materials/:id', async (req, res) => {
 app.delete('/api/materials/:id', async (req, res) => {
   try {
     await deleteMaterial(req.params.id);
+    invalidateCache('materials_');
     res.status(200).json({ message: 'Material deleted successfully.' });
   } catch (err) {
     console.error('API DELETE /api/materials/:id error:', err.message);
@@ -1643,6 +1643,7 @@ app.post('/api/transfers', async (req, res) => {
   try {
     const t = req.body;
     await recordMaterialTransfer(t);
+    invalidateCache('materials_');
     res.status(201).json({ message: 'Transfer logged successfully.' });
   } catch (err) {
     console.error('API POST /api/transfers error:', err.message);
@@ -1652,10 +1653,18 @@ app.post('/api/transfers', async (req, res) => {
 
 // ── Approval Request Routes ───────────────────────────────────────────────────
 
-// GET all approval requests
+// GET all approval requests (micro-cached 10s)
 app.get('/api/approval-requests', async (req, res) => {
   try {
+    const cacheKey = 'approval_requests_all';
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.status(200).json(cached);
+    }
     const requests = await getAllApprovalRequests();
+    setCached(cacheKey, requests, 10000);
+    res.setHeader('X-Cache', 'MISS');
     res.status(200).json(requests);
   } catch (err) {
     console.error('API GET /api/approval-requests error:', err.message);
@@ -1668,6 +1677,7 @@ app.post('/api/approval-requests', async (req, res) => {
   try {
     const req_data = req.body;
     await createApprovalRequest(req_data);
+    invalidateCache('approval_requests');
     res.status(201).json({ message: 'Approval request submitted.', request: req_data });
   } catch (err) {
     console.error('API POST /api/approval-requests error:', err.message);
@@ -1682,6 +1692,7 @@ app.put('/api/approval-requests/:id/status', async (req, res) => {
     const { status, rejectionReason, resolvedDate: bodyResolvedDate } = req.body;
     const resolvedDate = bodyResolvedDate || new Date().toLocaleDateString('en-GB');
     await updateApprovalRequestStatus(id, status, { rejectionReason: rejectionReason || '', resolvedDate });
+    invalidateCache('approval_requests');
     res.status(200).json({ message: 'Approval request status updated.' });
   } catch (err) {
     console.error('API PUT /api/approval-requests/:id/status error:', err.message);
@@ -1897,10 +1908,18 @@ app.get('/api/po-number/next/:type', async (req, res) => {
 
 // ── Vendor Routes ───────────────────────────────────────────────────────────
 
-// GET all vendors
+// GET all vendors (micro-cached 30s)
 app.get('/api/vendors', async (req, res) => {
   try {
+    const cacheKey = 'vendors_all';
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.status(200).json(cached);
+    }
     const vendors = await getAllVendors();
+    setCached(cacheKey, vendors, 30000);
+    res.setHeader('X-Cache', 'MISS');
     res.status(200).json(vendors);
   } catch (err) {
     console.error('API GET /api/vendors error:', err.message);
@@ -1912,6 +1931,7 @@ app.get('/api/vendors', async (req, res) => {
 app.post('/api/vendors', async (req, res) => {
   try {
     await createVendor(req.body);
+    invalidateCache('vendors');
     res.status(201).json({ message: 'Vendor saved.', vendor: req.body });
   } catch (err) {
     console.error('API POST /api/vendors error:', err.message);
@@ -1923,6 +1943,7 @@ app.post('/api/vendors', async (req, res) => {
 app.delete('/api/vendors/:id', async (req, res) => {
   try {
     await deleteVendor(req.params.id);
+    invalidateCache('vendors');
     res.status(200).json({ message: 'Vendor deleted.' });
   } catch (err) {
     console.error('API DELETE /api/vendors/:id error:', err.message);
@@ -1932,23 +1953,32 @@ app.delete('/api/vendors/:id', async (req, res) => {
 
 // ── Settings Routes (accessories & designers lists) ─────────────────────────
 
-// GET all settings (accessories_list, designers_list, warehouse_halls, warehouse_racks, allow_material_photo_edit)
+// GET all settings (micro-cached 60s)
 app.get('/api/settings', async (req, res) => {
   try {
+    const cacheKey = 'settings_all';
+    const cached = getCached(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.status(200).json(cached);
+    }
     const accessoriesList = await getSetting('accessories_list');
     const designersList = await getSetting('designers_list');
     const warehouseHalls = await getSetting('warehouse_halls');
     const warehouseRacks = await getSetting('warehouse_racks');
     const allowMaterialPhotoEdit = await getSetting('allow_material_photo_edit');
     const allowWarehouseAddRack = await getSetting('allow_warehouse_add_rack');
-    res.status(200).json({
+    const payload = {
       accessoriesList: accessoriesList || [],
       designersList: designersList || [],
       warehouseHalls: warehouseHalls || [],
       warehouseRacks: warehouseRacks || [],
       allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true,
       allowWarehouseAddRack: (allowWarehouseAddRack !== null && allowWarehouseAddRack !== undefined) ? Boolean(allowWarehouseAddRack) : false
-    });
+    };
+    setCached(cacheKey, payload, 60000);
+    res.setHeader('X-Cache', 'MISS');
+    res.status(200).json(payload);
   } catch (err) {
     console.error('API GET /api/settings error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve settings.' });
@@ -1961,6 +1991,7 @@ app.put('/api/settings/:key', async (req, res) => {
     const { key } = req.params;
     const { value } = req.body;
     await setSetting(key, value);
+    invalidateCache('settings');
     res.status(200).json({ message: `Setting "${key}" updated.` });
   } catch (err) {
     console.error('API PUT /api/settings/:key error:', err.message);
@@ -2346,6 +2377,7 @@ app.post('/api/inward/approve', async (req, res) => {
     const { id, approvedBy, note } = req.body;
     if (!id) return res.status(400).json({ success: false, error: 'Capture ID is required.' });
     await approveInwardCapture(id, approvedBy || 'Admin', note);
+    invalidateCache('materials_');
     res.json({ success: true, message: `Inward capture #${id} approved and finalized into inventory.` });
   } catch (err) {
     console.error('[API] inward approve error:', err.message);
@@ -2382,6 +2414,17 @@ app.post('/api/warehouse-locations', async (req, res) => {
     res.json({ success: true, data: loc, message: 'Warehouse location saved successfully.' });
   } catch (err) {
     console.error('[API] warehouse-locations POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/warehouse-locations/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updated = await updateWarehouseLocation(id, req.body);
+    res.json({ success: true, data: updated, message: 'Warehouse location updated successfully.' });
+  } catch (err) {
+    console.error('[API] warehouse-locations PUT error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2456,22 +2499,14 @@ if (fs.existsSync(distPath)) {
 const server = app.listen(PORT, () => {
   console.log(`G-PDMS Auth Server running on http://localhost:${PORT}`);
 
-  // ── Auto Keep-Alive Heartbeat (Every 1 Minute) ─────────────────────────────
-  // Pings /api/health and refreshes DB pool to prevent cloud server sleep mode
-  const KEEP_ALIVE_INTERVAL_MS = 60 * 1000; // Exactly every 1 minute
+  // ── Auto Keep-Alive Heartbeat (Every 5 Minutes / 300 Seconds) ─────────────
+  // Pings /api/health with lightweight payload to keep connection alive with minimal server load
+  const KEEP_ALIVE_INTERVAL_MS = 300 * 1000; // 300 seconds = 5 minutes
 
   const runKeepAliveHealthCheck = async () => {
     const timestamp = new Date().toLocaleTimeString('en-GB');
-    let dbLatency = 0;
-    try {
-      const dbStart = Date.now();
-      await pool.query('SELECT 1');
-      dbLatency = Date.now() - dbStart;
-    } catch (dbErr) {
-      console.warn(`[Keep-Alive Heartbeat] ⚠️ DB ping warning: ${dbErr.message}`);
-    }
 
-    // Ping localhost and external URLs if defined
+    // Ping localhost and external URL if defined
     const endpointsToPing = [`http://127.0.0.1:${PORT}/api/health`];
     const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL || process.env.SERVER_URL || process.env.PUBLIC_BACKEND_URL;
     if (externalUrl) {
@@ -2488,21 +2523,20 @@ const server = app.listen(PORT, () => {
           headers: { 'User-Agent': 'G-PDMS-KeepAlive-Worker/1.0' }
         });
         if (res.ok) {
-          console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Health OK (${url}) | DB Latency: ${dbLatency}ms | Uptime: ${Math.floor(process.uptime())}s`);
+          console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Health OK (${url}) | Uptime: ${Math.floor(process.uptime())}s`);
         } else {
-          console.warn(`[Keep-Alive Heartbeat] ⚠️ ${timestamp} - Response status ${res.status} from ${url}`);
+          console.warn(`[Keep-Alive Heartbeat] ⚠️ ${timestamp} - Status ${res.status} from ${url}`);
         }
       } catch (fetchErr) {
-        // Log brief notice without crashing
-        console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Local DB Pool Active | Latency: ${dbLatency}ms | Ping note: ${fetchErr.message}`);
+        console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Ping notice: ${fetchErr.message}`);
       }
     }
   };
 
-  // Initial keep-alive check after 5 seconds
-  setTimeout(runKeepAliveHealthCheck, 5000);
+  // Initial keep-alive check after 15 seconds
+  setTimeout(runKeepAliveHealthCheck, 15000);
 
-  // Recurring keep-alive every 1 minute (60 seconds)
+  // Recurring keep-alive every 5 minutes (300 seconds)
   setInterval(runKeepAliveHealthCheck, KEEP_ALIVE_INTERVAL_MS);
 
   // Background Auto-Sync Google Sheets to Database on startup
@@ -2511,10 +2545,10 @@ const server = app.listen(PORT, () => {
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Startup sync warning:', err.message));
   }, 2000);
 
-  // Dedicated Incremental Sync Background Worker every 30 seconds
+  // Dedicated Incremental Sync Background Worker every 5 minutes (300 seconds)
   setInterval(() => {
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Sync warning:', err.message));
-  }, 30 * 1000);
+  }, 300 * 1000);
 });
 
 server.on('error', (err) => {

@@ -58,7 +58,7 @@ const getPoolConfig = () => {
 
 const pool = mysql.createPool(getPoolConfig());
 
-// Periodic connection pool keepalive (runs every 30s to keep connection pool warm & healthy)
+// Periodic connection pool keepalive (runs every 300s / 5 minutes to keep connection pool warm & healthy with minimal load)
 setInterval(async () => {
   try {
     const conn = await pool.getConnection();
@@ -67,101 +67,9 @@ setInterval(async () => {
   } catch (err) {
     console.warn('[DB Heartbeat] Connection check warning:', err.message);
   }
-}, 30000).unref();
+}, 300000).unref();
 
-// ── Seed Data ─────────────────────────────────────────────────────────────────
-
-const initialMaterials = [
-  { id: 'M1302', name: 'Organic Cotton Fabric Roll', category: 'Fabric', stock: 2400, unit: 'meters', cost: 25.00, threshold: 200, color: 'Pure White', location: 'Main Store' },
-  { id: 'M1303', name: 'Indigo Denim Raw Roll', category: 'Fabric', stock: 850, unit: 'meters', cost: 45.00, threshold: 150, color: 'Raw Deep Indigo', location: 'Main Store' },
-  { id: 'M1304', name: 'YKK Brass Zippers (15cm)', category: 'Trim', stock: 150, unit: 'pieces', cost: 2.50, threshold: 200, color: 'Matte Gold', location: 'Main Store' },
-  { id: 'M1305', name: 'Polyester Thread Spool', category: 'Trim', stock: 45, unit: 'rolls', cost: 8.00, threshold: 50, color: 'Neutral Gray', location: 'Main Store' },
-  { id: 'M1306', name: 'Metal Rivets (Pack of 100)', category: 'Trim', stock: 60, unit: 'pieces', cost: 5.00, threshold: 20, color: 'Silver Metallic', location: 'Main Store' },
-  { id: 'M1307', name: 'Printed Satin Brand Labels', category: 'Accessory', stock: 500, unit: 'pieces', cost: 0.80, threshold: 100, color: 'Glossy White', location: 'Main Store' }
-];
-
-const initialDesigns = [
-  {
-    id: '11000', name: 'Summer Denim Jacket', lotNo2: 'MH-4458', brand: 'Zara',
-    category: 'JACKET', designer: 'Admin', fabricType: 'Raw Denim Cotton 100%',
-    targetSizes: 'S, M, L, XL', colorCode: '#1e40af', status: 'In Verification',
-    date: '10/08/2023', comments: '', section: 'Men', season: 'Winter', style: 'ST-9921',
-    tapeLace: 'No', bottomType: 'N/A', zip: 'Yes', sticker: 'No', collar: 'No', bone: 'No', fullBaju: 'No',
-    bom: JSON.stringify([
-      { name: 'Zip', status: 'Yes', detail: '1', description: 'YKK Brass Zippers (15cm)', materialId: 'M1304' },
-      { name: 'Button', status: 'Yes', detail: '6', description: 'Metal Rivets (Pack of 100)', materialId: 'M1306' },
-      { name: 'Elastic', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Tape / Lace', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Rib', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Collar', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Sticker / Label', status: 'Yes', detail: '1', description: 'Printed Satin Brand Labels', materialId: 'M1307' },
-      { name: 'Thread', status: 'Yes', detail: '1', description: 'Polyester Thread Spool', materialId: 'M1305' },
-      { name: 'Pocket', status: 'Yes', detail: '2', description: 'Chest pockets', materialId: '' },
-      { name: 'Drawstring / Nara', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Hook, buckle, velcro', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Interlining / fusing', status: 'Yes', detail: '1', description: 'Placket fusing', materialId: '' }
-    ]),
-    totalCost: 0, imageUrl: ''
-  },
-  {
-    id: '11001', name: 'Organic Cotton Polo Shirt', lotNo2: 'MH-4459', brand: 'Nike',
-    category: 'T-SHIRT COLLAR', designer: 'Admin', fabricType: 'Pima Cotton Pique',
-    targetSizes: 'M, L, XL', colorCode: '#059669', status: 'Approved',
-    date: '08/08/2023', comments: '', section: 'Men', season: 'Summer', style: 'TS-2201',
-    tapeLace: 'No', bottomType: 'N/A', zip: 'No', sticker: 'No', collar: 'Yes', bone: 'No', fullBaju: 'No',
-    bom: JSON.stringify([
-      { name: 'Zip', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Button', status: 'Yes', detail: '3', description: 'Polo neck buttons', materialId: '' },
-      { name: 'Elastic', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Tape / Lace', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Rib', status: 'Yes', detail: '2', description: 'Collar & cuff rib', materialId: '' },
-      { name: 'Collar', status: 'Yes', detail: '1', description: 'Flat knit collar', materialId: '' },
-      { name: 'Sticker / Label', status: 'Yes', detail: '1', description: 'Printed Satin Brand Labels', materialId: 'M1307' },
-      { name: 'Thread', status: 'Yes', detail: '1', description: 'Polyester Thread Spool', materialId: 'M1305' },
-      { name: 'Pocket', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Drawstring / Nara', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Hook, buckle, velcro', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Interlining / fusing', status: 'Yes', detail: '1', description: 'Collar stand fusing', materialId: '' }
-    ]),
-    totalCost: 0, imageUrl: ''
-  },
-  {
-    id: '11002', name: 'Linen Comfort Trousers', lotNo2: 'MH-4460', brand: 'H&M',
-    category: 'LOWER', designer: 'Admin', fabricType: 'Pure Linen Weave',
-    targetSizes: 'S, M, L', colorCode: '#d97706', status: 'Approved',
-    date: '02/08/2023', comments: '', section: 'Women', season: 'Summer', style: 'TR-3304',
-    tapeLace: 'No', bottomType: 'Elastic mohri', zip: 'No', sticker: 'No', collar: 'No', bone: 'No', fullBaju: 'No',
-    bom: JSON.stringify([
-      { name: 'Zip', status: 'Yes', detail: '1', description: 'YKK Fly Zipper', materialId: '' },
-      { name: 'Button', status: 'Yes', detail: '1', description: 'Waistband button', materialId: '' },
-      { name: 'Elastic', status: 'Yes', detail: '1', description: 'Waistband elastic', materialId: '' },
-      { name: 'Tape / Lace', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Rib', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Collar', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Sticker / Label', status: 'Yes', detail: '1', description: 'Brand Label', materialId: '' },
-      { name: 'Thread', status: 'Yes', detail: '1', description: 'Polyester Thread Spool', materialId: 'M1305' },
-      { name: 'Pocket', status: 'Yes', detail: '2', description: 'Side pockets', materialId: '' },
-      { name: 'Drawstring / Nara', status: 'Yes', detail: '1', description: 'Waist drawstring', materialId: '' },
-      { name: 'Hook, buckle, velcro', status: 'No', detail: '', description: '', materialId: '' },
-      { name: 'Interlining / fusing', status: 'Yes', detail: '1', description: 'Waistband fusing', materialId: '' }
-    ]),
-    totalCost: 0, imageUrl: ''
-  }
-];
-
-const initialPOs = [
-  {
-    id: 'PO1301', poNumber: 'PO-11000', vendorName: 'YKK Trim Solutions',
-    vendorEmail: 'sales@ykk-trims.com', vendorAddress: 'Industrial Block C, Mumbai',
-    designName: 'Summer Denim Jacket', designCategory: 'JACKET',
-    items: JSON.stringify([
-      { name: 'YKK Brass Zippers (15cm)', qty: 500, unit: 'pieces', price: 2.50 },
-      { name: 'Metal Rivets (Pack of 100)', qty: 627, unit: 'pieces', price: 5.00 }
-    ]),
-    subtotal: 4385, taxRate: 18, tax: 789.3, total: 38500,
-    date: '23/02/2023', deliveryDate: '15/03/2023', status: 'Sent to Vendor'
-  }
-];
+// ── Initial Configuration ─────────────────────────────────────────────────────
 
 const initialVendors = [
   { id: 'V101', name: 'YKK Trim Solutions', email: 'sales@ykk-trims.com', address: 'Industrial Block C, Mumbai', materialsJoined: 'Metal Buttons & Rivets' },
@@ -642,48 +550,14 @@ export async function initDb() {
   try { await pool.execute(`CREATE INDEX idx_elastic_issue_date ON elastic_issue (issue_date)`); } catch (_) { }
   try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_issue_counter', '0')`); } catch (_) { }
 
-  // ── Seed data (only if tables are empty) ────────────────────────────────────
+  // High-performance database query indexes
+  try { await pool.execute(`CREATE INDEX idx_materials_stock ON materials (stock)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_materials_category ON materials (category)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_designs_status ON designs (status)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_designs_lotNo2 ON designs (lotNo2)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_approval_status ON approval_requests (status)`); } catch (_) { }
 
-  const [[{ count: dCount }]] = await pool.execute('SELECT COUNT(*) as count FROM designs');
-  if (dCount === 0) {
-    for (const d of initialDesigns) {
-      await pool.execute(
-        `REPLACE INTO designs
-          (id,name,lotNo2,brand,category,designer,fabricType,targetSizes,colorCode,status,date,
-           comments,section,season,style,tapeLace,bottomType,zip,sticker,collar,bone,fullBaju,
-           bom,totalCost,imageUrl,quantity)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [d.id, d.name, d.lotNo2, d.brand, d.category, d.designer, d.fabricType, d.targetSizes,
-        d.colorCode, d.status, d.date, d.comments || '', d.section, d.season, d.style, d.tapeLace,
-        d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', 100]
-      );
-    }
-  }
-
-  const [[{ count: mCount }]] = await pool.execute('SELECT COUNT(*) as count FROM materials');
-  if (mCount === 0) {
-    for (const m of initialMaterials) {
-      await pool.execute(
-        'INSERT INTO materials (id,name,category,stock,unit,cost,threshold,color,location) VALUES (?,?,?,?,?,?,?,?,?)',
-        [m.id, m.name, m.category, m.stock, m.unit, m.cost, m.threshold, m.color, m.location || 'Main Store']
-      );
-    }
-  }
-
-  const [[{ count: poCount }]] = await pool.execute('SELECT COUNT(*) as count FROM purchase_orders');
-  if (poCount === 0) {
-    for (const po of initialPOs) {
-      await pool.execute(
-        `REPLACE INTO purchase_orders
-          (id,poNumber,vendorName,designName,designCategory,
-           items,subtotal,taxRate,tax,total,date,deliveryDate,status)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [po.id, po.poNumber, po.vendorName,
-        po.designName, po.designCategory, po.items, po.subtotal, po.taxRate,
-        po.tax, po.total, po.date, po.deliveryDate, po.status]
-      );
-    }
-  }
+  // ── Initial Configuration Seed (Only settings/vendors if empty) ───────────
 
   const [[{ count: vCount }]] = await pool.execute('SELECT COUNT(*) as count FROM vendors');
   if (vCount === 0) {
@@ -715,45 +589,6 @@ export async function initDb() {
       }
     } catch (_) {}
   }
-
-  const [[{ count: hCount }]] = await pool.execute('SELECT COUNT(*) as count FROM design_history');
-  if (hCount === 0) {
-    await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11000', 'created', 'Sarah Connor', '10/08/2023 10:24', 'Lot created with category JACKET, style ST-9921')");
-    await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11001', 'created', 'Michael Scott', '08/08/2023 11:15', 'Lot created with category T-SHIRT COLLAR, style TS-2201')");
-    await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11001', 'approved', 'Admin', '08/08/2023 16:40', 'BOM verified and approved.')");
-    await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11002', 'created', 'Sarah Connor', '02/08/2023 09:30', 'Lot created with category LOWER, style TR-3304')");
-    await pool.execute("INSERT INTO design_history (lotId, action, actorName, timestamp, details) VALUES ('11002', 'approved', 'Admin', '02/08/2023 14:12', 'BOM verified and approved.')");
-  }
-
-  // Weight Capture (Weighbridge Audit Log)
-  await pool.execute(`CREATE TABLE IF NOT EXISTS weight_capture (
-    id               INT PRIMARY KEY AUTO_INCREMENT,
-    materialCode     VARCHAR(50)   NOT NULL,
-    materialName     VARCHAR(255)  NOT NULL,
-    unit             VARCHAR(30)   DEFAULT 'Pcs',
-    category         VARCHAR(100)  DEFAULT '',
-    supplier         VARCHAR(255)  DEFAULT '',
-    lotNo            VARCHAR(100)  DEFAULT '',
-    poNumber         VARCHAR(100)  DEFAULT '',
-    invoiceNo        VARCHAR(100)  DEFAULT '',
-    storeLocation    VARCHAR(255)  DEFAULT '',
-    storeIncharge    VARCHAR(255)  DEFAULT '',
-    grossWeightKg    DOUBLE        DEFAULT 0,
-    tareWeightKg     DOUBLE        DEFAULT 0,
-    netWeightKg      DOUBLE        DEFAULT 0,
-    weightPerPieceG  DOUBLE        DEFAULT 0,
-    sampleQty        INT           DEFAULT 0,
-    sampleWeightKg   DOUBLE        DEFAULT 0,
-    pieces           INT           DEFAULT 0,
-    packets          INT           DEFAULT 1,
-    barcodeId        VARCHAR(100)  DEFAULT '',
-    status           VARCHAR(50)   DEFAULT 'Captured',
-    remarks          TEXT,
-    capturedAt       DATETIME      DEFAULT CURRENT_TIMESTAMP
-  )`);
-  // Add sampleQty/sampleWeightKg columns if upgrading from older schema
-  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN sampleQty INT DEFAULT 0`); } catch (_) { }
-  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN sampleWeightKg DOUBLE DEFAULT 0`); } catch (_) { }
 
   // Material Transfers Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS material_transfers (
@@ -848,6 +683,8 @@ export async function initDb() {
       ensureIndex('materials', 'idx_mat_cat_name', 'category, name'),
       ensureIndex('materials', 'idx_mat_cat_stock', 'category, stock'),
       ensureIndex('materials', 'idx_mat_loc_stock', 'location, stock'),
+      ensureIndex('materials', 'idx_mat_stock', 'stock'),
+      ensureIndex('designs', 'idx_designs_status', 'status'),
 
       // Cutting & Operations
       ensureIndex('cutting_header', 'idx_ch_lot', 'Lot_Number'),
@@ -1201,6 +1038,60 @@ export const createWarehouseLocation = async ({ id, code, warehouse = 'Hall 1', 
   return { id: slug, code: fullDisplay, warehouse, capacity: cap };
 };
 
+export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Main Store', capacity = 20 }) => {
+  if (!idOrCode) throw new Error('Location identifier is required');
+  const cleanCode = String(code || 'Rack').trim();
+  const fullDisplay = cleanCode.toLowerCase().includes(warehouse.toLowerCase()) ? cleanCode : `${warehouse} - ${cleanCode}`;
+  const cap = Number(capacity) > 0 ? Number(capacity) : 20;
+
+  // Try updating by id or code
+  const [result] = await pool.execute(
+    `UPDATE warehouse_locations SET code = ?, warehouse = ?, capacity = ? WHERE id = ? OR code = ?`,
+    [fullDisplay, warehouse, cap, idOrCode, idOrCode]
+  );
+
+  // If no existing record matched, insert it
+  if (result.affectedRows === 0) {
+    const slug = idOrCode || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    await pool.execute(
+      `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
+      [slug, fullDisplay, warehouse, cap]
+    );
+  }
+
+  // Also sync in settings.warehouse_racks if present
+  try {
+    const [rackSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_racks']);
+    if (rackSetting && rackSetting[0] && rackSetting[0].setting_value) {
+      let parsed = JSON.parse(rackSetting[0].setting_value);
+      if (Array.isArray(parsed)) {
+        let found = false;
+        parsed = parsed.map(r => {
+          if (r.id === idOrCode || r.code === idOrCode || `${r.warehouse} - ${r.code}` === idOrCode || `${r.warehouse} - ${r.name}` === idOrCode) {
+            found = true;
+            return {
+              ...r,
+              warehouse,
+              code: fullDisplay,
+              name: fullDisplay,
+              capacity: cap
+            };
+          }
+          return r;
+        });
+        if (!found) {
+          parsed.push({ id: idOrCode, warehouse, code: fullDisplay, name: fullDisplay, capacity: cap });
+        }
+        await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
+      }
+    }
+  } catch (_) {}
+
+  return { id: idOrCode, code: fullDisplay, warehouse, capacity: cap };
+};
+
 export const deleteWarehouseLocation = async (idOrCode) => {
   if (!idOrCode) return false;
   await pool.execute('DELETE FROM warehouse_locations WHERE id = ? OR code = ?', [idOrCode, idOrCode]);
@@ -1312,7 +1203,11 @@ export const updateDesignStatus = async (id, status, comments) => {
 
 // ── Materials ─────────────────────────────────────────────────────────────────
 
-export const getAllMaterials = async () => {
+export const getAllMaterials = async (onlyPresent = false) => {
+  if (onlyPresent) {
+    const [rows] = await pool.execute('SELECT * FROM materials WHERE stock > 0 ORDER BY id ASC');
+    return rows;
+  }
   const [rows] = await pool.execute('SELECT * FROM materials ORDER BY id ASC');
   return rows;
 };
