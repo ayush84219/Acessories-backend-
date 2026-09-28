@@ -541,6 +541,13 @@ export async function initDb() {
     shade         VARCHAR(255) DEFAULT '',
     size          VARCHAR(255) DEFAULT '',
     elastic_width VARCHAR(100) DEFAULT '',
+    unit_type     VARCHAR(50) DEFAULT 'inch',
+    elastic_size_input DECIMAL(10, 4) DEFAULT 0,
+    elastic_per_pc_mtr DECIMAL(10, 4) DEFAULT 0,
+    total_elastic_mtr  DECIMAL(12, 4) DEFAULT 0,
+    tape_per_pc_mtr    DECIMAL(10, 4) DEFAULT 0,
+    total_tape_mtr     DECIMAL(12, 4) DEFAULT 0,
+    supervisor_name    VARCHAR(255) DEFAULT '',
     remarks       TEXT,
     payload       LONGTEXT,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -548,6 +555,13 @@ export async function initDb() {
   )`);
   try { await pool.execute(`CREATE INDEX idx_elastic_issue_lot ON elastic_issue (lot_no)`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_elastic_issue_date ON elastic_issue (issue_date)`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS unit_type VARCHAR(50) DEFAULT 'inch'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS elastic_size_input DECIMAL(10,4) DEFAULT 0`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS elastic_per_pc_mtr DECIMAL(10,4) DEFAULT 0`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS total_elastic_mtr DECIMAL(12,4) DEFAULT 0`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS tape_per_pc_mtr DECIMAL(10,4) DEFAULT 0`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS total_tape_mtr DECIMAL(12,4) DEFAULT 0`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS supervisor_name VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_issue_counter', '0')`); } catch (_) { }
 
   // High-performance database query indexes
@@ -1720,52 +1734,102 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     };
   });
 
-  // If no detailed matrix rows exist in cuttings_matrix table, generate them from Shades & Sizes
-  if (parsedRows.length === 0 && (header.Shades || header.Sizes || header.Cutting_Qty)) {
-    const rawShades = (header.Shades || 'Standard')
-      .split(/[,/;\r\n]+/)
-      .map(s => s.trim())
-      .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+  // If no detailed matrix rows exist in cuttings_matrix table, generate them from Challan History or Shades & Sizes
+  if (parsedRows.length === 0 && (header.Challan_History || header.Shades || header.Sizes || header.Cutting_Qty)) {
+    const tableNo = parseInt(header.HeaderCols, 10) || 6;
+    const standardSizes = ['M', 'L', 'XL', 'XXL'];
 
-    const parsedShades = rawShades.map(s => {
-      const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
-      const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
-      const cleanColor = s.replace(/\[\d+\]|\(\d+\)/g, '').trim();
-      return { color: cleanColor || s, count };
-    });
+    // 1. Try to extract item breakdowns from challanHistory JSON
+    let breakdownItems = [];
+    if (header.Challan_History) {
+      try {
+        const parsedHistory = typeof header.Challan_History === 'string' ? JSON.parse(header.Challan_History) : header.Challan_History;
+        if (Array.isArray(parsedHistory)) {
+          for (const entry of parsedHistory) {
+            if (entry && Array.isArray(entry.items) && entry.items.length > 0) {
+              breakdownItems = entry.items.map(it => ({
+                color: it.shade || it.color || '',
+                qty: parseInt(it.qty || it.quantity || 0, 10)
+              })).filter(it => it.color && it.qty > 0);
+              if (breakdownItems.length > 0) break;
+            }
+          }
+        }
+      } catch (e) { }
+    }
 
-    const uniqueShades = parsedShades.filter(s => s.color.length > 0);
-    if (uniqueShades.length === 0) uniqueShades.push({ color: 'As Per Spec', count: 1 });
+    // 2. If no items from challanHistory, parse from shadesStr
+    if (breakdownItems.length === 0) {
+      const rawShades = (header.Shades || 'Standard')
+        .split(/[,/;\r\n]+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+
+      const parsedShades = rawShades.map(s => {
+        const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
+        const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
+        return { color: s, count };
+      });
+
+      const uniqueShades = parsedShades.filter(s => s.color.length > 0);
+      if (uniqueShades.length === 0) uniqueShades.push({ color: 'As Per Spec', count: 1 });
+
+      const total = parseInt(header.Cutting_Qty, 10) || uniqueShades.length;
+      const totalRatio = uniqueShades.reduce((sum, s) => sum + s.count, 0) || uniqueShades.length;
+
+      breakdownItems = uniqueShades.map(s => ({
+        color: s.color,
+        qty: Math.max(1, Math.round(total * (s.count / totalRatio)))
+      }));
+    }
 
     const rawSizes = (header.Sizes || 'M, L, XL, XXL')
       .split(/[,/;\r\n]+/)
       .map(s => s.trim().toUpperCase())
       .filter(s => s.length > 0);
 
-    const standardSizes = ['M', 'L', 'XL', 'XXL'];
     const activeSizes = rawSizes.length > 0 ? rawSizes : standardSizes;
 
-    const totalQty = parseInt(header.Cutting_Qty, 10) || uniqueShades.length;
-    const qtyPerShade = Math.max(1, Math.floor(totalQty / uniqueShades.length));
+    let sizeWeights = {};
+    const sizeKeys = activeSizes.join(',');
+    if (sizeKeys === 'M,L,XL') {
+      sizeWeights = { 'M': 2, 'L': 2, 'XL': 1 };
+    } else if (sizeKeys === 'S,M,L,XL') {
+      sizeWeights = { 'S': 1, 'M': 2, 'L': 2, 'XL': 1 };
+    } else {
+      activeSizes.forEach(sz => { sizeWeights[sz] = 1; });
+    }
+    const totalWeight = activeSizes.reduce((sum, sz) => sum + (sizeWeights[sz] || 1), 0);
 
-    parsedRows = uniqueShades.map(shade => {
+    parsedRows = breakdownItems.map(bItem => {
       const sizeMap = {};
-      const shadeTotal = Math.max(shade.count, qtyPerShade);
-      const perSize = Math.max(1, Math.floor(shadeTotal / (activeSizes.length || 1)));
+      const itemQty = bItem.qty;
 
-      activeSizes.forEach(sz => {
-        sizeMap[sz] = perSize;
-      });
+      if (activeSizes.length === 1) {
+        sizeMap[activeSizes[0]] = itemQty;
+      } else {
+        let distributedSum = 0;
+        activeSizes.forEach((sz, sIdx) => {
+          if (sIdx === activeSizes.length - 1) {
+            sizeMap[sz] = Math.max(0, itemQty - distributedSum);
+          } else {
+            const w = sizeWeights[sz] || 1;
+            const szQty = Math.round(itemQty * (w / totalWeight));
+            sizeMap[sz] = szQty;
+            distributedSum += szQty;
+          }
+        });
+      }
 
       standardSizes.forEach(sz => {
         if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
       });
 
       return {
-        color: shade.color,
-        cuttingTable: 1,
+        color: bItem.color,
+        cuttingTable: tableNo,
         sizes: sizeMap,
-        totalPcs: shadeTotal
+        totalPcs: itemQty
       };
     });
   }
@@ -2266,21 +2330,81 @@ export const getAllRgps = async () => {
   return rows.map(r => ({ ...r, entries: r.entries ? JSON.parse(r.entries) : [] }));
 };
 
+export const ensureCuttingSchema = async () => {
+  try {
+    await pool.execute(`CREATE TABLE IF NOT EXISTS cutting_header (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      Lot_Number VARCHAR(255),
+      StartRow INT,
+      NumRows INT,
+      HeaderCols INT,
+      Fabric VARCHAR(255),
+      Garment_Type VARCHAR(255),
+      Style VARCHAR(255),
+      Sizes VARCHAR(255),
+      Shades TEXT,
+      Saved_At VARCHAR(255),
+      Date_of_Issue VARCHAR(255),
+      Supervisor VARCHAR(255),
+      Image_Url TEXT,
+      Party_Name VARCHAR(255),
+      Brand VARCHAR(255),
+      Season VARCHAR(255),
+      Direct_Stitching VARCHAR(255),
+      Challan_History TEXT,
+      Zip_Order_Date VARCHAR(255),
+      Zip_Received_Date VARCHAR(255),
+      WIP_Status TEXT,
+      Completed_Status TEXT,
+      MWK VARCHAR(255),
+      JobOrder_Date VARCHAR(255),
+      Manpower INT,
+      Cutting_Qty INT,
+      Stitching_Issue_Qty INT,
+      Priority VARCHAR(255),
+      Sticker VARCHAR(255),
+      zip_payload LONGTEXT
+    )`);
+
+    await pool.execute(`CREATE TABLE IF NOT EXISTS cuttings_matrix (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      header_id INT,
+      Lot_No VARCHAR(100),
+      Color VARCHAR(100),
+      Cutting_Table INT,
+      M INT,
+      L INT,
+      XL INT,
+      XXL INT,
+      Total_Pcs INT
+    )`);
+  } catch (_) {}
+};
+
 export const getUndesignedCuttingLots = async () => {
-  const [rows] = await pool.execute(`
-    SELECT ch.* 
-    FROM cutting_header ch
-    WHERE ch.Lot_Number IS NOT NULL 
-      AND TRIM(ch.Lot_Number) != ''
-      AND NOT EXISTS (
-        SELECT 1 FROM designs d 
-        WHERE LOWER(TRIM(d.id)) = LOWER(TRIM(ch.Lot_Number))
-           OR LOWER(TRIM(COALESCE(d.lotNo2, ''))) = LOWER(TRIM(ch.Lot_Number))
-           OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
-      )
-    ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
-  `);
-  return rows;
+  await ensureCuttingSchema();
+  try {
+    const [rows] = await pool.execute(`
+      SELECT ch.* 
+      FROM cutting_header ch
+      WHERE ch.Lot_Number IS NOT NULL 
+        AND TRIM(ch.Lot_Number) != ''
+        AND NOT EXISTS (
+          SELECT 1 FROM designs d 
+          WHERE LOWER(TRIM(d.id)) = LOWER(TRIM(ch.Lot_Number))
+             OR LOWER(TRIM(COALESCE(d.lotNo2, ''))) = LOWER(TRIM(ch.Lot_Number))
+             OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
+        )
+      ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
+    `);
+    return rows;
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE') {
+      await ensureCuttingSchema();
+      return [];
+    }
+    throw err;
+  }
 };
 
 // ── Material Inward Eligibility & Tolerance Checker ─────────────────────────
@@ -2778,6 +2902,7 @@ export const createElasticIssue = async (data) => {
   const rolls = parseInt(data.rolls || 1, 10);
   const issuerName = data.issuerName || data.issuer_name || '';
   const receiverName = data.receiverName || data.receiver_name || '';
+  const supervisorName = data.supervisorName || data.supervisor_name || data.supervisor || '';
   const issueDate = data.issueDate || data.issue_date || data.date || new Date().toISOString().split('T')[0];
   const style = data.style || '';
   const brand = data.brand || '';
@@ -2787,8 +2912,37 @@ export const createElasticIssue = async (data) => {
   const shade = data.shade || '';
   const size = data.size || '';
   const elasticWidth = data.elasticWidth || data.elastic_width || data.width || '';
+  const unitType = String(data.unitType || data.unit_type || data.unit || 'inch').toLowerCase().includes('cm') ? 'cm' : 'inch';
+  const elasticSizeInput = parseFloat(data.elasticSizeInput ?? data.elastic_size_input ?? data.sizeInput ?? 0) || 0;
+  const tapeSizeInput = parseFloat(data.tapeSizeInput ?? data.tape_size_input ?? data.tapeSize ?? 0) || 0;
+
+  // Backend Formula:
+  // Inches: E1 * 0.0254
+  // CMs: E2 / 100
+  let elasticPerPcMtr = parseFloat(data.elasticPerPcMtr ?? data.elastic_per_pc_mtr ?? 0) || 0;
+  if (!elasticPerPcMtr && elasticSizeInput > 0) {
+    elasticPerPcMtr = unitType === 'cm' ? parseFloat((elasticSizeInput / 100).toFixed(4)) : parseFloat((elasticSizeInput * 0.0254).toFixed(4));
+  }
+
+  let tapePerPcMtr = parseFloat(data.tapePerPcMtr ?? data.tape_per_pc_mtr ?? 0) || 0;
+  if (!tapePerPcMtr && tapeSizeInput > 0) {
+    tapePerPcMtr = unitType === 'cm' ? parseFloat((tapeSizeInput / 100).toFixed(4)) : parseFloat((tapeSizeInput * 0.0254).toFixed(4));
+  }
+
+  const totalElasticMtr = parseFloat((quantity * elasticPerPcMtr).toFixed(4));
+  const totalTapeMtr = parseFloat((quantity * tapePerPcMtr).toFixed(4));
+
   const remarks = data.remarks || '';
-  const payload = typeof data.payload === 'string' ? data.payload : JSON.stringify(data);
+  const payload = typeof data.payload === 'string' ? data.payload : JSON.stringify({
+    ...data,
+    unitType,
+    elasticSizeInput,
+    elasticPerPcMtr,
+    totalElasticMtr,
+    tapePerPcMtr,
+    totalTapeMtr,
+    supervisorName
+  });
 
   if (!slipNo || !lotNo) {
     throw new Error('slipNo and lotNo are required for Elastic Issue.');
@@ -2796,14 +2950,17 @@ export const createElasticIssue = async (data) => {
 
   const [result] = await pool.execute(
     `INSERT INTO elastic_issue (
-      slip_no, lot_no, rolls, issuer_name, receiver_name, issue_date,
-      style, brand, garment_type, fabric, quantity, shade, size, elastic_width, remarks, payload
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      slip_no, lot_no, rolls, issuer_name, receiver_name, supervisor_name, issue_date,
+      style, brand, garment_type, fabric, quantity, shade, size, elastic_width,
+      unit_type, elastic_size_input, elastic_per_pc_mtr, total_elastic_mtr, tape_per_pc_mtr, total_tape_mtr,
+      remarks, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
       lot_no = VALUES(lot_no),
       rolls = VALUES(rolls),
       issuer_name = VALUES(issuer_name),
       receiver_name = VALUES(receiver_name),
+      supervisor_name = VALUES(supervisor_name),
       issue_date = VALUES(issue_date),
       style = VALUES(style),
       brand = VALUES(brand),
@@ -2813,11 +2970,19 @@ export const createElasticIssue = async (data) => {
       shade = VALUES(shade),
       size = VALUES(size),
       elastic_width = VALUES(elastic_width),
+      unit_type = VALUES(unit_type),
+      elastic_size_input = VALUES(elastic_size_input),
+      elastic_per_pc_mtr = VALUES(elastic_per_pc_mtr),
+      total_elastic_mtr = VALUES(total_elastic_mtr),
+      tape_per_pc_mtr = VALUES(tape_per_pc_mtr),
+      total_tape_mtr = VALUES(total_tape_mtr),
       remarks = VALUES(remarks),
       payload = VALUES(payload)`,
     [
-      slipNo, lotNo, rolls, issuerName, receiverName, issueDate,
-      style, brand, garmentType, fabric, quantity, shade, size, elasticWidth, remarks, payload
+      slipNo, lotNo, rolls, issuerName, receiverName, supervisorName, issueDate,
+      style, brand, garmentType, fabric, quantity, shade, size, elasticWidth,
+      unitType, elasticSizeInput, elasticPerPcMtr, totalElasticMtr, tapePerPcMtr, totalTapeMtr,
+      remarks, payload
     ]
   );
 
@@ -2828,6 +2993,7 @@ export const createElasticIssue = async (data) => {
     rolls,
     issuerName,
     receiverName,
+    supervisorName,
     issueDate,
     style,
     brand,
@@ -2837,6 +3003,12 @@ export const createElasticIssue = async (data) => {
     shade,
     size,
     elasticWidth,
+    unitType,
+    elasticSizeInput,
+    elasticPerPcMtr,
+    totalElasticMtr,
+    tapePerPcMtr,
+    totalTapeMtr,
     remarks
   };
 };
@@ -2864,6 +3036,8 @@ export const getAllElasticIssues = async (lotNo = null) => {
     issuer_name: r.issuer_name,
     receiverName: r.receiver_name,
     receiver_name: r.receiver_name,
+    supervisorName: r.supervisor_name || '',
+    supervisor_name: r.supervisor_name || '',
     issueDate: r.issue_date,
     issue_date: r.issue_date,
     date: r.issue_date,
@@ -2877,6 +3051,18 @@ export const getAllElasticIssues = async (lotNo = null) => {
     size: r.size,
     width: r.elastic_width,
     elasticWidth: r.elastic_width,
+    unitType: r.unit_type || 'inch',
+    unit_type: r.unit_type || 'inch',
+    elasticSizeInput: parseFloat(r.elastic_size_input || 0),
+    elastic_size_input: parseFloat(r.elastic_size_input || 0),
+    elasticPerPcMtr: parseFloat(r.elastic_per_pc_mtr || 0),
+    elastic_per_pc_mtr: parseFloat(r.elastic_per_pc_mtr || 0),
+    totalElasticMtr: parseFloat(r.total_elastic_mtr || 0),
+    total_elastic_mtr: parseFloat(r.total_elastic_mtr || 0),
+    tapePerPcMtr: parseFloat(r.tape_per_pc_mtr || 0),
+    tape_per_pc_mtr: parseFloat(r.tape_per_pc_mtr || 0),
+    totalTapeMtr: parseFloat(r.total_tape_mtr || 0),
+    total_tape_mtr: parseFloat(r.total_tape_mtr || 0),
     remarks: r.remarks,
     createdAt: r.created_at,
     updatedAt: r.updated_at

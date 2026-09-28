@@ -633,19 +633,45 @@ function parseGoogleSheetUrl(rawInput) {
   return `https://docs.google.com/spreadsheets/d/${str}/export?format=csv&gid=0`;
 }
 
+function getCuttingSheetId() {
+  const raw = process.env.CUTTING_GOOGLE_SHEET_ID || process.env.CUTTING_GOOGLE_SHEET_URL || process.env.ONLY_CUTTING_GOOGLE_SHEET_ID || process.env.ONLY_CUTTING_GOOGLE_SHEET_URL || process.env.GOOGLE_SHEET_ID || process.env.GOOGLE_SHEET_URL || '';
+  const dMatch = String(raw).match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (dMatch && dMatch[1]) return dMatch[1];
+  const clean = String(raw).trim();
+  if (clean && !clean.includes('/')) return clean;
+  return '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
+}
+
 function getActiveSheetUrl() {
-  if (process.env.GOOGLE_SHEET_ID && String(process.env.GOOGLE_SHEET_ID).trim()) {
-    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_ID);
+  // 1. Dedicated ONLY CUTTING Google Sheet environment variables (Index sheet gid=1964871106)
+  if (process.env.CUTTING_GOOGLE_SHEET_URL && String(process.env.CUTTING_GOOGLE_SHEET_URL).trim()) {
+    return parseGoogleSheetUrl(process.env.CUTTING_GOOGLE_SHEET_URL);
   }
-  if (process.env.GOOGLE_SHEET_URL && String(process.env.GOOGLE_SHEET_URL).trim()) {
-    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_URL);
+  if (process.env.ONLY_CUTTING_GOOGLE_SHEET_URL && String(process.env.ONLY_CUTTING_GOOGLE_SHEET_URL).trim()) {
+    return parseGoogleSheetUrl(process.env.ONLY_CUTTING_GOOGLE_SHEET_URL);
   }
+  if (process.env.CUTTING_GOOGLE_SHEET_ID && String(process.env.CUTTING_GOOGLE_SHEET_ID).trim()) {
+    return `https://docs.google.com/spreadsheets/d/${process.env.CUTTING_GOOGLE_SHEET_ID.trim()}/export?format=csv&gid=1964871106`;
+  }
+  if (process.env.ONLY_CUTTING_GOOGLE_SHEET_ID && String(process.env.ONLY_CUTTING_GOOGLE_SHEET_ID).trim()) {
+    return `https://docs.google.com/spreadsheets/d/${process.env.ONLY_CUTTING_GOOGLE_SHEET_ID.trim()}/export?format=csv&gid=1964871106`;
+  }
+
+  // 2. Persisted cutting sheet config (if customized)
   try {
     if (fs.existsSync(SHEET_CONFIG_PATH)) {
       const data = JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, 'utf8'));
       if (data && data.url) return data.url;
     }
   } catch (e) { }
+
+  // 3. Fallback to default GOOGLE_SHEET_ID / URL
+  if (process.env.GOOGLE_SHEET_ID && String(process.env.GOOGLE_SHEET_ID).trim()) {
+    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_ID);
+  }
+  if (process.env.GOOGLE_SHEET_URL && String(process.env.GOOGLE_SHEET_URL).trim()) {
+    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_URL);
+  }
   return DEFAULT_SHEET_URL;
 }
 
@@ -653,9 +679,18 @@ function setActiveSheetUrl(newUrl) {
   const normalizedUrl = parseGoogleSheetUrl(newUrl);
   try {
     fs.writeFileSync(SHEET_CONFIG_PATH, JSON.stringify({ url: normalizedUrl, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+    lastFetchTime = 0;
+    if (fs.existsSync(LOTS_CSV_CACHE_PATH)) {
+      try { fs.unlinkSync(LOTS_CSV_CACHE_PATH); } catch (_) {}
+    }
+    if (fs.existsSync(LOTS_CACHE_TIME_PATH)) {
+      try { fs.unlinkSync(LOTS_CACHE_TIME_PATH); } catch (_) {}
+    }
   } catch (e) { }
   return normalizedUrl;
 }
+
+const CUTTING_MATRIX_CSV_CACHE_PATH = path.join(CACHE_DIR, 'cutting_matrix_gid0.csv');
 
 async function getLotsCSV(force = false) {
   const url = getActiveSheetUrl();
@@ -700,6 +735,124 @@ async function getLotsCSV(force = false) {
   }
 }
 
+// Helper to fetch the actual Cutting matrix sheet (gid=0)
+async function getCuttingMatrixBlocksCSV(force = false) {
+  const sheetId = getCuttingSheetId();
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=0`;
+  const now = Date.now();
+  const cacheExists = fs.existsSync(CUTTING_MATRIX_CSV_CACHE_PATH);
+
+  if (!force && cacheExists && (now - lastFetchTime < CACHE_TTL_MS)) {
+    return fs.readFileSync(CUTTING_MATRIX_CSV_CACHE_PATH, 'utf8');
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const csvText = await response.text();
+      fs.writeFileSync(CUTTING_MATRIX_CSV_CACHE_PATH, csvText, 'utf8');
+      return csvText;
+    }
+  } catch (err) {
+    console.warn('[Matrix Loader] Warning fetching gid=0 matrix sheet:', err.message);
+  }
+
+  if (cacheExists) {
+    return fs.readFileSync(CUTTING_MATRIX_CSV_CACHE_PATH, 'utf8');
+  }
+  return '';
+}
+
+// Direct parser for all Cutting Matrix blocks from gid=0
+function parseCuttingMatrixBlocks(csvText) {
+  if (!csvText) return new Map();
+  const lines = csvText.split('\n');
+  const lotMatrixMap = new Map();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('Cutting Matrix')) {
+      const lotMatch = line.match(/Cutting Matrix\s*[-—]\s*Lot\s*([A-Za-z0-9_-]+)/i);
+      if (!lotMatch) continue;
+      const lotNo = lotMatch[1].trim();
+      let idx = i + 1;
+
+      let style = '';
+      let fabric = '';
+      let garmentType = '';
+
+      if (idx < lines.length && lines[idx].includes('Lot Number:')) {
+        const parts = lines[idx].split(',');
+        style = parts[3] ? parts[3].trim() : '';
+        idx++;
+      }
+      if (idx < lines.length && lines[idx].includes('Fabric:')) {
+        const parts = lines[idx].split(',');
+        fabric = parts[1] ? parts[1].trim() : '';
+        garmentType = parts[3] ? parts[3].trim() : '';
+        idx++;
+      }
+
+      while (idx < lines.length && !lines[idx].toLowerCase().startsWith('color')) {
+        idx++;
+      }
+      if (idx >= lines.length) continue;
+
+      const colHeader = lines[idx].split(',').map(c => c.trim().toUpperCase());
+      const colIdx = {
+        color: colHeader.indexOf('COLOR'),
+        table: colHeader.indexOf('CUTTING TABLE'),
+        m: colHeader.indexOf('M'),
+        l: colHeader.indexOf('L'),
+        xl: colHeader.indexOf('XL'),
+        xxl: colHeader.indexOf('XXL'),
+        total: colHeader.indexOf('TOTAL PCS')
+      };
+      idx++;
+
+      const matrixRows = [];
+      while (idx < lines.length) {
+        const rowLine = lines[idx].trim();
+        if (!rowLine || rowLine.startsWith('Cutting Matrix')) break;
+        const cols = lines[idx].split(',').map(c => c.trim());
+        const colorVal = cols[colIdx.color >= 0 ? colIdx.color : 0] || '';
+        if (colorVal.toLowerCase() === 'total' || !colorVal) {
+          break;
+        }
+        const tableVal = parseInt(cols[colIdx.table >= 0 ? colIdx.table : 1], 10) || 1;
+        const mVal = colIdx.m >= 0 ? parseInt(cols[colIdx.m], 10) || 0 : 0;
+        const lVal = colIdx.l >= 0 ? parseInt(cols[colIdx.l], 10) || 0 : 0;
+        const xlVal = colIdx.xl >= 0 ? parseInt(cols[colIdx.xl], 10) || 0 : 0;
+        const xxlVal = colIdx.xxl >= 0 ? parseInt(cols[colIdx.xxl], 10) || 0 : 0;
+        const totalVal = colIdx.total >= 0 ? parseInt(cols[colIdx.total], 10) || (mVal + lVal + xlVal + xxlVal) : (mVal + lVal + xlVal + xxlVal);
+
+        matrixRows.push({
+          color: colorVal,
+          cuttingTable: tableVal,
+          sizes: { M: mVal, L: lVal, XL: xlVal, XXL: xxlVal },
+          totalPcs: totalVal
+        });
+        idx++;
+      }
+
+      if (matrixRows.length > 0) {
+        lotMatrixMap.set(lotNo.toLowerCase(), {
+          lotNo,
+          style,
+          fabric,
+          garmentType,
+          matrix: matrixRows
+        });
+      }
+    }
+  }
+  return lotMatrixMap;
+}
+
 // In-memory hash of the last successfully synced CSV to eliminate duplicate processing
 let lastSyncedCsvHash = '';
 
@@ -715,46 +868,122 @@ let syncWorkerStats = {
 };
 
 // Helper to batch ensure cuttings_matrix rows in MySQL database
-async function batchEnsureCuttingsMatrix(items) {
+async function batchEnsureCuttingsMatrix(items, lotMatrixMap = null) {
   if (!items || items.length === 0) return;
 
   const standardSizes = ['M', 'L', 'XL', 'XXL'];
   const matrixValues = [];
+  const headerIdsToClear = [];
 
   for (const item of items) {
-    const { headerId, lotNo, shadesStr, sizesStr, totalQty } = item;
-    const rawShades = (shadesStr || 'Standard')
-      .split(/[,/;\r\n]+/)
-      .map(s => s.trim())
-      .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+    const { headerId, lotNo, shadesStr, sizesStr, totalQty, challanHistory, cuttingTable } = item;
+    if (!headerId) continue;
+    headerIdsToClear.push(headerId);
 
-    const parsedShades = rawShades.map(s => {
-      const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
-      const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
-      const cleanColor = s.replace(/\[\d+\]|\(\d+\)/g, '').trim();
-      return { color: cleanColor || s, count };
-    });
+    const lotKey = (lotNo || '').toLowerCase().trim();
+    if (lotMatrixMap && lotMatrixMap.has(lotKey)) {
+      const directBlock = lotMatrixMap.get(lotKey);
+      for (const mRow of directBlock.matrix) {
+        matrixValues.push([
+          headerId,
+          lotNo || '',
+          mRow.color,
+          mRow.cuttingTable || 6,
+          mRow.sizes?.M || 0,
+          mRow.sizes?.L || 0,
+          mRow.sizes?.XL || 0,
+          mRow.sizes?.XXL || 0,
+          mRow.totalPcs || 0
+        ]);
+      }
+      continue;
+    }
 
-    const uniqueShades = parsedShades.filter(s => s.color.length > 0);
-    if (uniqueShades.length === 0) uniqueShades.push({ color: 'Standard', count: 1 });
+    const tableNo = parseInt(cuttingTable, 10) || 6;
 
+    // 1. Try to extract item breakdowns from challanHistory JSON
+    let breakdownItems = [];
+    if (challanHistory) {
+      try {
+        const parsedHistory = typeof challanHistory === 'string' ? JSON.parse(challanHistory) : challanHistory;
+        if (Array.isArray(parsedHistory)) {
+          for (const entry of parsedHistory) {
+            if (entry && Array.isArray(entry.items) && entry.items.length > 0) {
+              breakdownItems = entry.items.map(it => ({
+                color: it.shade || it.color || '',
+                qty: parseInt(it.qty || it.quantity || 0, 10)
+              })).filter(it => it.color && it.qty > 0);
+              if (breakdownItems.length > 0) break;
+            }
+          }
+        }
+      } catch (e) { }
+    }
+
+    // 2. If no items from challanHistory, parse from shadesStr
+    if (breakdownItems.length === 0) {
+      const rawShades = (shadesStr || 'Standard')
+        .split(/[,/;\r\n]+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 0 && !s.toLowerCase().includes('total'));
+
+      const parsedShades = rawShades.map(s => {
+        const qtyMatch = s.match(/\[(\d+)\]|\((\d+)\)/);
+        const count = qtyMatch ? parseInt(qtyMatch[1] || qtyMatch[2], 10) : 1;
+        return { color: s, count };
+      });
+
+      const uniqueShades = parsedShades.filter(s => s.color.length > 0);
+      if (uniqueShades.length === 0) uniqueShades.push({ color: 'Standard', count: 1 });
+
+      const total = parseInt(totalQty, 10) || uniqueShades.length;
+      const totalRatio = uniqueShades.reduce((sum, s) => sum + s.count, 0) || uniqueShades.length;
+
+      breakdownItems = uniqueShades.map(s => ({
+        color: s.color,
+        qty: Math.max(1, Math.round(total * (s.count / totalRatio)))
+      }));
+    }
+
+    // 3. Parse active sizes
     const rawSizes = (sizesStr || 'M, L, XL, XXL')
       .split(/[,/;\r\n]+/)
       .map(s => s.trim().toUpperCase())
       .filter(s => s.length > 0);
 
     const activeSizes = rawSizes.length > 0 ? rawSizes : standardSizes;
-    const total = parseInt(totalQty, 10) || uniqueShades.length;
-    const qtyPerShade = Math.max(1, Math.floor(total / uniqueShades.length));
 
-    for (const shade of uniqueShades) {
+    let sizeWeights = {};
+    const sizeKeys = activeSizes.join(',');
+    if (sizeKeys === 'M,L,XL') {
+      sizeWeights = { 'M': 2, 'L': 2, 'XL': 1 };
+    } else if (sizeKeys === 'S,M,L,XL') {
+      sizeWeights = { 'S': 1, 'M': 2, 'L': 2, 'XL': 1 };
+    } else {
+      activeSizes.forEach(sz => { sizeWeights[sz] = 1; });
+    }
+    const totalWeight = activeSizes.reduce((sum, sz) => sum + (sizeWeights[sz] || 1), 0);
+
+    for (const bItem of breakdownItems) {
       const sizeMap = {};
-      const shadeTotal = Math.max(shade.count, qtyPerShade);
-      const perSize = Math.max(1, Math.floor(shadeTotal / (activeSizes.length || 1)));
+      const itemQty = bItem.qty;
 
-      activeSizes.forEach(sz => {
-        sizeMap[sz] = perSize;
-      });
+      if (activeSizes.length === 1) {
+        sizeMap[activeSizes[0]] = itemQty;
+      } else {
+        let distributedSum = 0;
+        activeSizes.forEach((sz, sIdx) => {
+          if (sIdx === activeSizes.length - 1) {
+            sizeMap[sz] = Math.max(0, itemQty - distributedSum);
+          } else {
+            const w = sizeWeights[sz] || 1;
+            const szQty = Math.round(itemQty * (w / totalWeight));
+            sizeMap[sz] = szQty;
+            distributedSum += szQty;
+          }
+        });
+      }
+
       standardSizes.forEach(sz => {
         if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
       });
@@ -762,18 +991,27 @@ async function batchEnsureCuttingsMatrix(items) {
       matrixValues.push([
         headerId,
         lotNo || '',
-        shade.color,
-        1,
+        bItem.color,
+        tableNo,
         sizeMap['M'] || 0,
         sizeMap['L'] || 0,
         sizeMap['XL'] || 0,
         sizeMap['XXL'] || 0,
-        shadeTotal
+        itemQty
       ]);
     }
   }
 
   if (matrixValues.length === 0) return;
+
+  // Clear existing matrix rows for these headers to prevent duplicate data
+  if (headerIdsToClear.length > 0) {
+    for (let i = 0; i < headerIdsToClear.length; i += 100) {
+      const idChunk = headerIdsToClear.slice(i, i + 100);
+      const placeholders = idChunk.map(() => '?').join(', ');
+      await pool.execute(`DELETE FROM cuttings_matrix WHERE header_id IN (${placeholders})`, idChunk).catch(() => {});
+    }
+  }
 
   // Multi-row INSERT in chunks of 100 for high database throughput
   for (let i = 0; i < matrixValues.length; i += 100) {
@@ -788,17 +1026,78 @@ async function batchEnsureCuttingsMatrix(items) {
   }
 }
 
+// Helper to ensure cutting tables exist in MySQL
+export async function ensureCuttingTablesExist() {
+  try {
+    await pool.execute(`CREATE TABLE IF NOT EXISTS cutting_header (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      Lot_Number VARCHAR(255),
+      StartRow INT,
+      NumRows INT,
+      HeaderCols INT,
+      Fabric VARCHAR(255),
+      Garment_Type VARCHAR(255),
+      Style VARCHAR(255),
+      Sizes VARCHAR(255),
+      Shades TEXT,
+      Saved_At VARCHAR(255),
+      Date_of_Issue VARCHAR(255),
+      Supervisor VARCHAR(255),
+      Image_Url TEXT,
+      Party_Name VARCHAR(255),
+      Brand VARCHAR(255),
+      Season VARCHAR(255),
+      Direct_Stitching VARCHAR(255),
+      Challan_History TEXT,
+      Zip_Order_Date VARCHAR(255),
+      Zip_Received_Date VARCHAR(255),
+      WIP_Status TEXT,
+      Completed_Status TEXT,
+      MWK VARCHAR(255),
+      JobOrder_Date VARCHAR(255),
+      Manpower INT,
+      Cutting_Qty INT,
+      Stitching_Issue_Qty INT,
+      Priority VARCHAR(255),
+      Sticker VARCHAR(255),
+      zip_payload LONGTEXT
+    )`);
+
+    await pool.execute(`CREATE TABLE IF NOT EXISTS cuttings_matrix (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      header_id INT,
+      Lot_No VARCHAR(100),
+      Color VARCHAR(100),
+      Cutting_Table INT,
+      M INT,
+      L INT,
+      XL INT,
+      XXL INT,
+      Total_Pcs INT
+    )`);
+  } catch (err) {
+    console.warn('[DB] Warning ensuring cutting tables:', err.message);
+  }
+}
+
 // Reusable function to synchronize Google Sheets lots into MySQL database in batch (<300ms)
 export async function syncGoogleSheetsToDb(force = false) {
   const syncStartTime = Date.now();
   try {
-    const csvText = await getLotsCSV(force);
+    await ensureCuttingTablesExist();
+    const [csvText, matrixCsvText] = await Promise.all([
+      getLotsCSV(force),
+      getCuttingMatrixBlocksCSV(force).catch(() => '')
+    ]);
+
     if (!csvText) {
       console.warn('[Sync] No CSV text retrieved from Google Sheets.');
       return { success: false, error: 'Failed to download Google Sheet CSV.' };
     }
 
-    const currentHash = crypto.createHash('md5').update(csvText).digest('hex');
+    const lotMatrixMap = parseCuttingMatrixBlocks(matrixCsvText);
+
+    const currentHash = crypto.createHash('md5').update(csvText + matrixCsvText).digest('hex');
     if (!force && lastSyncedCsvHash && currentHash === lastSyncedCsvHash) {
       return {
         success: true,
@@ -864,27 +1163,39 @@ export async function syncGoogleSheetsToDb(force = false) {
 
       for (let i = 0; i < toInsert.length; i += chunkSize) {
         const chunk = toInsert.slice(i, i + chunkSize);
-        const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+        const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
         const flatParams = [];
 
         chunk.forEach(r => {
           const rowImg = extractRowImageUrl(r);
           flatParams.push(
             r._cleanLot,
+            parseInt(r['StartRow'], 10) || 0,
+            parseInt(r['NumRows'], 10) || 0,
+            parseInt(r['HeaderCols'], 10) || 6,
             (r['Fabric'] || '').substring(0, 255),
-            (r['Garment Type'] || '').substring(0, 255),
+            (r['Garment Type'] || r['Garment_Type'] || '').substring(0, 255),
             (r['Style'] || '').substring(0, 255),
-            (r['Size'] || '').substring(0, 255),
-            r['Shade'] || '',
-            new Date().toISOString(),
-            (r['Date'] || '').substring(0, 100),
-            (r['Submitted By'] || '').substring(0, 255),
-            (r['Party Name'] || '').substring(0, 255),
-            (r['Brand'] || '').substring(0, 255),
-            (r['Season'] || '').substring(0, 100),
-            (r['Direct Stitching'] || '').substring(0, 100),
-            parseInt(r['Quantity']) || 0,
-            (r['Priority'] || 'Normal').substring(0, 50),
+            (r['Sizes'] || r['Size'] || '').substring(0, 255),
+            r['Shades'] || r['Shade'] || '',
+            (r['Saved At'] || r['Saved_At'] || new Date().toISOString()).substring(0, 255),
+            (r['Date of Issue'] || r['Date_of_Issue'] || r['JobOrder Date'] || r['Date'] || '').substring(0, 100),
+            (r['Supervisor'] || r['Submitted By'] || '').substring(0, 255),
+            (r['PARTY NAME'] || r['Party Name'] || r['Party_Name'] || '').substring(0, 255),
+            (r['BRAND'] || r['Brand'] || '').substring(0, 255),
+            (r['SEASON'] || r['Season'] || '').substring(0, 100),
+            (r['DIRECT STITCHING'] || r['Direct Stitching'] || '').substring(0, 100),
+            r['CHALLAN HISTORY'] || r['Challan History'] || '',
+            (r['ZIP ORDER DATE'] || r['Zip Order Date'] || '').substring(0, 100),
+            (r['ZIP RECEIVED DATE'] || r['Zip Received Date'] || '').substring(0, 100),
+            r['WIP Status'] || '',
+            r['Completed Status'] || '',
+            (r['M/W/K'] || r['MWK'] || '').substring(0, 255),
+            (r['JobOrder Date'] || r['JobOrder_Date'] || '').substring(0, 100),
+            parseInt(r['Manpower'], 10) || 0,
+            parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10),
+            parseInt(r['Stitching Issue Qty'] || 0, 10),
+            (r['Prioirty'] || r['Priority'] || 'Normal').substring(0, 50),
             (r['Sticker'] || '').substring(0, 100),
             rowImg.substring(0, 1000),
             null
@@ -893,8 +1204,10 @@ export async function syncGoogleSheetsToDb(force = false) {
 
         await pool.execute(
           `INSERT INTO cutting_header (
-            Lot_Number, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At, Date_of_Issue, Supervisor,
-            Party_Name, Brand, Season, Direct_Stitching, Cutting_Qty, Priority, Sticker, Image_Url, zip_payload
+            Lot_Number, StartRow, NumRows, HeaderCols, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At,
+            Date_of_Issue, Supervisor, Party_Name, Brand, Season, Direct_Stitching, Challan_History,
+            Zip_Order_Date, Zip_Received_Date, WIP_Status, Completed_Status, MWK, JobOrder_Date,
+            Manpower, Cutting_Qty, Stitching_Issue_Qty, Priority, Sticker, Image_Url, zip_payload
           ) VALUES ${placeholders}`,
           flatParams
         );
@@ -922,14 +1235,16 @@ export async function syncGoogleSheetsToDb(force = false) {
             matrixChunkItems.push({
               headerId,
               lotNo: rowObj._cleanLot,
-              shadesStr: rowObj['Shade'],
-              sizesStr: rowObj['Size'],
-              totalQty: rowObj['Quantity']
+              shadesStr: rowObj['Shades'] || rowObj['Shade'] || '',
+              sizesStr: rowObj['Sizes'] || rowObj['Size'] || '',
+              totalQty: parseInt(rowObj['Cutting Qty'] || rowObj['Cutting_Qty'] || rowObj['Quantity'] || 0, 10),
+              challanHistory: rowObj['CHALLAN HISTORY'] || rowObj['Challan History'] || '',
+              cuttingTable: parseInt(rowObj['HeaderCols'] || 6, 10)
             });
           }
         });
 
-        await batchEnsureCuttingsMatrix(matrixChunkItems).catch(e => console.warn('[Matrix Batch Warning]:', e.message));
+        await batchEnsureCuttingsMatrix(matrixChunkItems, lotMatrixMap).catch(e => console.warn('[Matrix Batch Warning]:', e.message));
       }
     }
 
@@ -943,27 +1258,62 @@ export async function syncGoogleSheetsToDb(force = false) {
             const rowImg = extractRowImageUrl(r);
             await pool.execute(
               `UPDATE cutting_header SET
+                StartRow = COALESCE(NULLIF(?, 0), StartRow),
+                NumRows = COALESCE(NULLIF(?, 0), NumRows),
+                HeaderCols = COALESCE(NULLIF(?, 0), HeaderCols),
                 Fabric = COALESCE(NULLIF(?, ''), Fabric),
                 Garment_Type = COALESCE(NULLIF(?, ''), Garment_Type),
                 Style = COALESCE(NULLIF(?, ''), Style),
-                Brand = COALESCE(NULLIF(?, ''), Brand),
+                Sizes = COALESCE(NULLIF(?, ''), Sizes),
+                Shades = COALESCE(NULLIF(?, ''), Shades),
                 Party_Name = COALESCE(NULLIF(?, ''), Party_Name),
+                Brand = COALESCE(NULLIF(?, ''), Brand),
+                Season = COALESCE(NULLIF(?, ''), Season),
+                Direct_Stitching = COALESCE(NULLIF(?, ''), Direct_Stitching),
+                Challan_History = COALESCE(NULLIF(?, ''), Challan_History),
+                Date_of_Issue = COALESCE(NULLIF(?, ''), Date_of_Issue),
+                Supervisor = COALESCE(NULLIF(?, ''), Supervisor),
                 Cutting_Qty = COALESCE(NULLIF(?, 0), Cutting_Qty),
+                Priority = COALESCE(NULLIF(?, ''), Priority),
                 Image_Url = COALESCE(NULLIF(?, ''), Image_Url)
                WHERE id = ?`,
               [
+                parseInt(r['StartRow'], 10) || 0,
+                parseInt(r['NumRows'], 10) || 0,
+                parseInt(r['HeaderCols'], 10) || 6,
                 (r['Fabric'] || '').substring(0, 255),
-                (r['Garment Type'] || '').substring(0, 255),
+                (r['Garment Type'] || r['Garment_Type'] || '').substring(0, 255),
                 (r['Style'] || '').substring(0, 255),
-                (r['Brand'] || '').substring(0, 255),
-                (r['Party Name'] || '').substring(0, 255),
-                parseInt(r['Quantity']) || 0,
+                (r['Sizes'] || r['Size'] || '').substring(0, 255),
+                r['Shades'] || r['Shade'] || '',
+                (r['PARTY NAME'] || r['Party Name'] || r['Party_Name'] || '').substring(0, 255),
+                (r['BRAND'] || r['Brand'] || '').substring(0, 255),
+                (r['SEASON'] || r['Season'] || '').substring(0, 100),
+                (r['DIRECT STITCHING'] || r['Direct Stitching'] || '').substring(0, 100),
+                r['CHALLAN HISTORY'] || r['Challan History'] || '',
+                (r['Date of Issue'] || r['Date_of_Issue'] || r['JobOrder Date'] || r['Date'] || '').substring(0, 100),
+                (r['Supervisor'] || r['Submitted By'] || '').substring(0, 255),
+                parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10),
+                (r['Prioirty'] || r['Priority'] || 'Normal').substring(0, 50),
                 rowImg.substring(0, 1000),
                 id
               ]
             );
           })
         );
+
+        // Update matrix rows for updated chunk
+        const updateMatrixItems = chunk.map(({ id, row: r }) => ({
+          headerId: id,
+          lotNo: r._cleanLot,
+          shadesStr: r['Shades'] || r['Shade'] || '',
+          sizesStr: r['Sizes'] || r['Size'] || '',
+          totalQty: parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10),
+          challanHistory: r['CHALLAN HISTORY'] || r['Challan History'] || '',
+          cuttingTable: parseInt(r['HeaderCols'] || 6, 10)
+        }));
+        await batchEnsureCuttingsMatrix(updateMatrixItems, lotMatrixMap).catch(e => console.warn('[Matrix Update Warning]:', e.message));
+
         updated += chunk.length;
       }
     }
@@ -1329,6 +1679,48 @@ app.post('/api/sync-google-sheets', async (req, res) => {
   } catch (err) {
     console.error('[Sync] Error syncing Google Sheets to DB:', err.message);
     res.status(500).json({ error: 'Sync failed: ' + err.message });
+  }
+});
+
+// GET /api/sheet-config: Returns current active Google Sheet URL
+app.get('/api/sheet-config', (req, res) => {
+  try {
+    const url = getActiveSheetUrl();
+    let updatedAt = null;
+    if (fs.existsSync(SHEET_CONFIG_PATH)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, 'utf8'));
+        updatedAt = data.updatedAt;
+      } catch (_) {}
+    }
+    res.json({ success: true, url, updatedAt });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/sheet-config: Update Google Sheet source and optionally sync immediately
+app.post('/api/sheet-config', async (req, res) => {
+  try {
+    const rawInput = req.body.url || req.body.sheetId || req.body.input;
+    if (!rawInput || !String(rawInput).trim()) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid Google Sheet URL or Sheet ID' });
+    }
+    const newUrl = setActiveSheetUrl(rawInput);
+    const syncNow = req.body.syncNow !== false;
+    let syncResult = null;
+    if (syncNow) {
+      syncResult = await syncGoogleSheetsToDb(true);
+    }
+    res.json({
+      success: true,
+      url: newUrl,
+      syncResult,
+      message: `Google Sheet updated and synced successfully!`
+    });
+  } catch (err) {
+    console.error('Error updating sheet config:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -2096,6 +2488,170 @@ app.delete('/api/bone-issues/:id', async (req, res) => {
 });
 
 // ── Dedicated Elastic Issue Table Routes ───────────────────────────────────────
+
+// ── Elastic Conversion & Consumption Calculation Endpoint ──────────────────
+// Automatically calculates Per Pc Meter (Inches: E1 * 0.0254, CMs: E2 / 100), Total Requirement & Recommended Rolls
+app.post('/api/elastic/calculate', async (req, res) => {
+  try {
+    const {
+      lotNo = '',
+      pcs: rawPcs,
+      sizeInput: rawSize = 0,
+      unit = 'inch',
+      elasticUnit: rawElasticUnit,
+      tapeSizeInput: rawTape = 0,
+      tapeUnit: rawTapeUnit = 'cm',
+      rollLengthMtr = 25
+    } = req.body;
+
+    let pcs = parseInt(rawPcs, 10);
+    let itemName = '';
+    let supervisorName = '';
+    let brand = '';
+    let garmentType = '';
+    let fabric = '';
+
+    // If lotNo is given, fetch details from cutting_header if pcs or item is missing
+    if (lotNo) {
+      try {
+        const [rows] = await pool.execute(
+          'SELECT Lot_Number, Garment_Type, Style, Cutting_Qty, Supervisor, Brand, Fabric FROM cutting_header WHERE LOWER(Lot_Number) = LOWER(?)',
+          [String(lotNo).trim()]
+        );
+        if (rows.length > 0) {
+          const row = rows[0];
+          if (isNaN(pcs) || pcs <= 0) pcs = parseInt(row.Cutting_Qty, 10) || 0;
+          itemName = row.Garment_Type || row.Style || 'LOWER';
+          supervisorName = row.Supervisor || '';
+          brand = row.Brand || '';
+          garmentType = row.Garment_Type || '';
+          fabric = row.Fabric || '';
+        }
+      } catch (_) {}
+    }
+
+    if (isNaN(pcs) || pcs <= 0) {
+      pcs = 600; // Default pcs fallback
+    }
+
+    const size = Math.max(0, parseFloat(rawSize) || 0);
+    const tapeSize = Math.max(0, parseFloat(rawTape) || 0);
+    
+    // Support separate units for Elastic and Tape
+    const elasticUnit = String(rawElasticUnit || unit || 'inch').toLowerCase().includes('cm') ? 'cm' : 'inch';
+    const tapeUnit = String(rawTapeUnit || 'cm').toLowerCase().includes('cm') ? 'cm' : 'inch';
+
+    // Formulas:
+    // Inches: size * 0.0254
+    // CMs: size / 100
+    const elasticPerPcMtr = size > 0
+      ? (elasticUnit === 'cm' ? parseFloat((size / 100).toFixed(4)) : parseFloat((size * 0.0254).toFixed(4)))
+      : 0;
+
+    const tapePerPcMtr = tapeSize > 0
+      ? (tapeUnit === 'cm' ? parseFloat((tapeSize / 100).toFixed(4)) : parseFloat((tapeSize * 0.0254).toFixed(4)))
+      : 0;
+
+    // Total = Per Pc (In Mtr) * Pcs
+    const totalElasticMtr = parseFloat((pcs * elasticPerPcMtr).toFixed(4));
+    const totalTapeMtr = parseFloat((pcs * tapePerPcMtr).toFixed(4));
+    const rLength = parseFloat(rollLengthMtr) || 25;
+    const recommendedRolls = totalElasticMtr > 0 ? Math.ceil(totalElasticMtr / rLength) : 1;
+
+    const elasticFormula = elasticUnit === 'cm'
+      ? `${size} CM / 100 = ${elasticPerPcMtr} m`
+      : `${size} Inch × 0.0254 = ${elasticPerPcMtr} m`;
+
+    const tapeFormula = tapeUnit === 'cm'
+      ? `${tapeSize} CM / 100 = ${tapePerPcMtr} m`
+      : `${tapeSize} Inch × 0.0254 = ${tapePerPcMtr} m`;
+
+    res.status(200).json({
+      success: true,
+      lotNo,
+      itemName: itemName || 'LOWER',
+      pcs,
+      supervisorName,
+      brand,
+      garmentType,
+      fabric,
+      elasticUnit,
+      tapeUnit,
+      unit: elasticUnit,
+      elasticSizeInput: size,
+      tapeSizeInput: tapeSize,
+      elasticPerPcMtr,
+      tapePerPcMtr,
+      totalElasticMtr,
+      totalTapeMtr,
+      rollLengthMtr: rLength,
+      recommendedRolls,
+      elasticFormula,
+      tapeFormula,
+      formulaExplanation: `${elasticFormula} | ${tapeFormula}`
+    });
+  } catch (err) {
+    console.error('API POST /api/elastic/calculate error:', err.message);
+    res.status(500).json({ error: 'Calculation failed: ' + err.message });
+  }
+});
+
+app.get('/api/elastic/calculate', async (req, res) => {
+  try {
+    const {
+      lotNo = '',
+      pcs: rawPcs,
+      sizeInput: rawSize = 0,
+      unit = 'inch',
+      tapeSizeInput: rawTape = 0,
+      rollLengthMtr = 25
+    } = req.query;
+
+    let pcs = parseInt(rawPcs, 10) || 0;
+    let itemName = '';
+    let supervisorName = '';
+
+    if (lotNo) {
+      try {
+        const [rows] = await pool.execute(
+          'SELECT Lot_Number, Garment_Type, Style, Cutting_Qty, Supervisor FROM cutting_header WHERE LOWER(Lot_Number) = LOWER(?)',
+          [String(lotNo).trim()]
+        );
+        if (rows.length > 0) {
+          const row = rows[0];
+          if (!pcs) pcs = parseInt(row.Cutting_Qty, 10) || 0;
+          itemName = row.Garment_Type || row.Style || 'LOWER';
+          supervisorName = row.Supervisor || '';
+        }
+      } catch (_) {}
+    }
+
+    const size = Math.max(0, parseFloat(rawSize) || 0);
+    const isCm = String(unit).toLowerCase().includes('cm');
+    const elasticPerPcMtr = size > 0
+      ? (isCm ? parseFloat((size / 100).toFixed(4)) : parseFloat((size * 0.0254).toFixed(4)))
+      : 0;
+
+    const totalElasticMtr = parseFloat((pcs * elasticPerPcMtr).toFixed(4));
+    const rLength = parseFloat(rollLengthMtr) || 25;
+    const recommendedRolls = totalElasticMtr > 0 ? Math.ceil(totalElasticMtr / rLength) : 1;
+
+    res.status(200).json({
+      success: true,
+      lotNo,
+      itemName: itemName || 'LOWER',
+      pcs,
+      supervisorName,
+      unit: isCm ? 'cm' : 'inch',
+      elasticSizeInput: size,
+      elasticPerPcMtr,
+      totalElasticMtr,
+      recommendedRolls
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // GET all elastic issues from dedicated table (optional ?lotNo=)
 app.get('/api/elastic-issues', async (req, res) => {
