@@ -612,7 +612,7 @@ const LOTS_CSV_CACHE_PATH = path.join(CACHE_DIR, 'lots.csv');
 const LOTS_CACHE_TIME_PATH = path.join(CACHE_DIR, 'lots_cache_time.txt');
 const SHEET_CONFIG_PATH = path.join(CACHE_DIR, 'sheet_config.json');
 const DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/13ArpFOD7idmpv7QIRJQkD-tfswtkH6rNnEANtv2M7Ek/export?format=csv&gid=0';
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes TTL
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes TTL
 
 // Read persisted cache time from disk so restarts don't re-trigger fetch
 let lastFetchTime = 0;
@@ -1671,7 +1671,8 @@ app.post('/api/sheet-config', async (req, res) => {
 
 app.post('/api/sync-google-sheets', async (req, res) => {
   try {
-    const result = await syncGoogleSheetsToDb(true);
+    const force = req.body?.force === true;
+    const result = await syncGoogleSheetsToDb(force);
     if (!result.success) {
       return res.status(500).json({ error: result.error || 'Failed to sync Google Sheets' });
     }
@@ -3101,10 +3102,10 @@ const server = app.listen(PORT, () => {
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Startup sync warning:', err.message));
   }, 2000);
 
-  // Dedicated Incremental Sync Background Worker every 5 minutes (300 seconds)
+  // Dedicated Incremental Sync Background Worker every 30 minutes (1800 seconds)
   setInterval(() => {
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Sync warning:', err.message));
-  }, 300 * 1000);
+  }, 30 * 60 * 1000);
 });
 
 server.on('error', (err) => {
