@@ -1575,11 +1575,22 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         const rows = parseCSV(csvText);
         const target = lotNo.toLowerCase().trim();
 
+        // 1. Exact match on Lot Number or Job Order No
         matchedRow = rows.find(row => {
           const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
           const rowJob = getCol(row, 'Job Order No', 'Order No.', 'JobOrder No', 'Job Order').toLowerCase().trim();
-          return rowLot === target || rowJob === target || rowLot.includes(target) || (target.length >= 4 && target.includes(rowLot));
+          return (rowLot && rowLot === target) || (rowJob && rowJob === target);
         });
+
+        // 2. Substring match only if both candidate and target have sufficient length
+        if (!matchedRow) {
+          matchedRow = rows.find(row => {
+            const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
+            const rowJob = getCol(row, 'Job Order No', 'Order No.', 'JobOrder No', 'Job Order').toLowerCase().trim();
+            return (rowLot && (rowLot.includes(target) || (target.length >= 4 && rowLot.length >= 3 && target.includes(rowLot)))) ||
+                   (rowJob && (rowJob.includes(target) || (target.length >= 4 && rowJob.length >= 3 && target.includes(rowJob))));
+          });
+        }
       }
     } catch (csvErr) {
       console.warn(`[Lot Fetch] Main Google Sheet CSV error for ${lotNo}:`, csvErr.message);
@@ -1594,7 +1605,10 @@ app.get('/api/lot/:lotNo', async (req, res) => {
           const target = lotNo.toLowerCase().trim();
           matchedRow = cuttingRows.find(row => {
             const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
-            return rowLot === target || rowLot.includes(target);
+            return rowLot && rowLot === target;
+          }) || cuttingRows.find(row => {
+            const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
+            return rowLot && (rowLot.includes(target) || (target.length >= 4 && rowLot.length >= 3 && target.includes(rowLot)));
           });
           if (matchedRow) {
             console.log(`[Lot Fetch] Found lot "${lotNo}" in Cutting Google Sheet.`);
