@@ -145,14 +145,114 @@ const autoCleanCache = () => {
 };
 
 
+// Process-level resilience: Prevent sudden crashes from unhandled asynchronous errors
+process.on('uncaughtException', (err) => {
+  console.error('[CRITICAL UNCAUGHT EXCEPTION]', err.stack || err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED PROMISE REJECTION]', reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_gpdms_key_for_jwt_session_validation_2026';
 
+// ── Production Security & Performance Headers Middleware ────────────────────
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  
+  const startTime = performance.now();
+  res.on('finish', () => {
+    const duration = (performance.now() - startTime).toFixed(2);
+    metricsTracker.recordRequest(req.method, req.path, res.statusCode, duration);
+  });
+  next();
+});
+
+// High-speed compression with optimal threshold
 app.use(cors());
-app.use(compression());
+app.use(compression({
+  threshold: 1024, // only compress responses > 1KB
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// ── In-Memory APM Metrics Tracker ───────────────────────────────────────────
+const metricsTracker = {
+  totalRequests: 0,
+  statusCodes: {},
+  slowRequests: 0,
+  totalLatencyMs: 0,
+  recordRequest(method, path, status, latencyMs) {
+    this.totalRequests++;
+    this.statusCodes[status] = (this.statusCodes[status] || 0) + 1;
+    this.totalLatencyMs += Number(latencyMs);
+    if (Number(latencyMs) > 500) this.slowRequests++;
+  },
+  getMetrics() {
+    const memory = process.memoryUsage();
+    return {
+      uptimeSeconds: Math.floor(process.uptime()),
+      totalRequests: this.totalRequests,
+      statusCodes: this.statusCodes,
+      slowRequests: this.slowRequests,
+      averageLatencyMs: this.totalRequests ? (this.totalLatencyMs / this.totalRequests).toFixed(2) : '0.00',
+      memoryUsage: {
+        rssMb: (memory.rss / 1024 / 1024).toFixed(2),
+        heapUsedMb: (memory.heapUsed / 1024 / 1024).toFixed(2),
+        heapTotalMb: (memory.heapTotal / 1024 / 1024).toFixed(2)
+      },
+      cpuUsage: process.cpuUsage(),
+      cacheStats: {
+        size: memoryCache.size,
+        hits: cacheHits,
+        misses: cacheMisses,
+        hitRatio: (cacheHits + cacheMisses) > 0 ? ((cacheHits / (cacheHits + cacheMisses)) * 100).toFixed(1) + '%' : '0%'
+      },
+      dsaStats: dsaEngine.getStats()
+    };
+  }
+};
+
+// ── Sliding Window In-Memory Rate Limiter ────────────────────────────────────
+const rateLimitMap = new Map();
+export function createRateLimiter({ windowMs = 60000, max = 60, message = 'Too many requests. Please try again later.' } = {}) {
+  return (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const key = `${ip}_${req.baseUrl || req.path}`;
+    const now = Date.now();
+    let record = rateLimitMap.get(key);
+
+    if (!record || now > record.resetTime) {
+      record = { count: 1, resetTime: now + windowMs };
+      rateLimitMap.set(key, record);
+    } else {
+      record.count += 1;
+    }
+
+    if (record.count > max) {
+      const retryAfter = Math.ceil((record.resetTime - now) / 1000);
+      res.setHeader('Retry-After', retryAfter);
+      return res.status(429).json({ error: message, retryAfterSeconds: retryAfter });
+    }
+    next();
+  };
+}
+
+// Clean up expired rate limit windows every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) rateLimitMap.delete(key);
+  }
+}, 300000).unref();
 
 // Initialize Database and Warm-Up In-Memory DSA Engine
 try {
@@ -165,7 +265,7 @@ try {
   process.exit(1);
 }
 
-// ── Lightweight Health Check (300s / 5min interval, minimal server load) ───────
+// ── Lightweight Health & Deep Metrics Endpoints ──────────────────────────────
 app.get('/api/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/api/health', async (req, res) => {
@@ -174,7 +274,8 @@ app.get('/api/health', async (req, res) => {
     res.status(200).json({
       status: 'UP',
       uptimeSeconds: Math.floor(process.uptime()),
-      db: 'connected'
+      db: 'connected',
+      dsaEngine: dsaEngine.isReady ? 'READY' : 'WARMING'
     });
   } catch (err) {
     res.status(503).json({
@@ -184,20 +285,41 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// ── In-Memory Micro-Cache for High-Frequency Read Endpoints ───────────────
+// APM System Metrics
+app.get('/api/metrics', (req, res) => {
+  res.status(200).json(metricsTracker.getMetrics());
+});
+
+// ── In-Memory LRU Micro-Cache (Max 1,000 items, O(1) eviction) ───────────────
+const MAX_CACHE_ENTRIES = 1000;
 const memoryCache = new Map();
+let cacheHits = 0;
+let cacheMisses = 0;
 
 function getCached(key) {
   const item = memoryCache.get(key);
-  if (!item) return null;
-  if (Date.now() > item.expiresAt) {
-    memoryCache.delete(key);
+  if (!item) {
+    cacheMisses++;
     return null;
   }
+  if (Date.now() > item.expiresAt) {
+    memoryCache.delete(key);
+    cacheMisses++;
+    return null;
+  }
+  cacheHits++;
+  // Refresh position for LRU
+  memoryCache.delete(key);
+  memoryCache.set(key, item);
   return item.data;
 }
 
 function setCached(key, data, ttlMs = 30000) {
+  if (memoryCache.size >= MAX_CACHE_ENTRIES) {
+    // Evict oldest entry
+    const oldestKey = memoryCache.keys().next().value;
+    if (oldestKey) memoryCache.delete(oldestKey);
+  }
   memoryCache.set(key, {
     data,
     expiresAt: Date.now() + ttlMs
@@ -636,8 +758,32 @@ function parseGoogleSheetUrl(rawInput) {
   return `https://docs.google.com/spreadsheets/d/${str}/export?format=csv&gid=0`;
 }
 
-function getCuttingSheetId() {
-  const raw = process.env.CUTTING_GOOGLE_SHEET_ID || process.env.CUTTING_GOOGLE_SHEET_URL || process.env.ONLY_CUTTING_GOOGLE_SHEET_ID || process.env.ONLY_CUTTING_GOOGLE_SHEET_URL || process.env.GOOGLE_SHEET_ID || process.env.GOOGLE_SHEET_URL || '';
+// Paths for dedicated caches
+const MAIN_SHEET_CSV_CACHE_PATH = path.join(CACHE_DIR, 'main_sheet_lots_gid0.csv');
+const CUTTING_SHEET_CSV_CACHE_PATH = path.join(CACHE_DIR, 'cutting_sheet_lots_gid1964871106.csv');
+const CUTTING_MATRIX_CSV_CACHE_PATH = path.join(CACHE_DIR, 'cutting_matrix_gid0.csv');
+
+let lastMainFetchTime = 0;
+let lastCuttingFetchTime = 0;
+
+export function getMainSheetUrl() {
+  const mainId = process.env.GOOGLE_SHEET_ID || '1fKSwGBIpzWEFk566WRQ4bzQ0anJlmasoY8TwrTLQHXI';
+  if (process.env.GOOGLE_SHEET_URL && String(process.env.GOOGLE_SHEET_URL).trim()) {
+    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_URL);
+  }
+  return `https://docs.google.com/spreadsheets/d/${String(mainId).trim()}/export?format=csv&gid=0`;
+}
+
+export function getCuttingSheetUrl() {
+  const cutId = process.env.CUTTING_GOOGLE_SHEET_ID || '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
+  if (process.env.CUTTING_GOOGLE_SHEET_URL && String(process.env.CUTTING_GOOGLE_SHEET_URL).trim()) {
+    return parseGoogleSheetUrl(process.env.CUTTING_GOOGLE_SHEET_URL);
+  }
+  return `https://docs.google.com/spreadsheets/d/${String(cutId).trim()}/export?format=csv&gid=1964871106`;
+}
+
+export function getCuttingSheetId() {
+  const raw = process.env.CUTTING_GOOGLE_SHEET_ID || process.env.CUTTING_GOOGLE_SHEET_URL || '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
   const dMatch = String(raw).match(/\/d\/([a-zA-Z0-9_-]+)/);
   if (dMatch && dMatch[1]) return dMatch[1];
   const clean = String(raw).trim();
@@ -645,97 +791,73 @@ function getCuttingSheetId() {
   return '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
 }
 
-function getActiveSheetUrl() {
-  // 1. Dedicated ONLY CUTTING Google Sheet environment variables (Index sheet gid=1964871106)
-  if (process.env.CUTTING_GOOGLE_SHEET_URL && String(process.env.CUTTING_GOOGLE_SHEET_URL).trim()) {
-    return parseGoogleSheetUrl(process.env.CUTTING_GOOGLE_SHEET_URL);
-  }
-  if (process.env.ONLY_CUTTING_GOOGLE_SHEET_URL && String(process.env.ONLY_CUTTING_GOOGLE_SHEET_URL).trim()) {
-    return parseGoogleSheetUrl(process.env.ONLY_CUTTING_GOOGLE_SHEET_URL);
-  }
-  if (process.env.CUTTING_GOOGLE_SHEET_ID && String(process.env.CUTTING_GOOGLE_SHEET_ID).trim()) {
-    return `https://docs.google.com/spreadsheets/d/${process.env.CUTTING_GOOGLE_SHEET_ID.trim()}/export?format=csv&gid=1964871106`;
-  }
-  if (process.env.ONLY_CUTTING_GOOGLE_SHEET_ID && String(process.env.ONLY_CUTTING_GOOGLE_SHEET_ID).trim()) {
-    return `https://docs.google.com/spreadsheets/d/${process.env.ONLY_CUTTING_GOOGLE_SHEET_ID.trim()}/export?format=csv&gid=1964871106`;
-  }
-
-  // 2. Persisted cutting sheet config (if customized)
-  try {
-    if (fs.existsSync(SHEET_CONFIG_PATH)) {
-      const data = JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, 'utf8'));
-      if (data && data.url) return data.url;
-    }
-  } catch (e) { }
-
-  // 3. Fallback to default GOOGLE_SHEET_ID / URL
-  if (process.env.GOOGLE_SHEET_ID && String(process.env.GOOGLE_SHEET_ID).trim()) {
-    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_ID);
-  }
-  if (process.env.GOOGLE_SHEET_URL && String(process.env.GOOGLE_SHEET_URL).trim()) {
-    return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_URL);
-  }
-  return DEFAULT_SHEET_URL;
-}
-
-function setActiveSheetUrl(newUrl) {
-  const normalizedUrl = parseGoogleSheetUrl(newUrl);
-  try {
-    fs.writeFileSync(SHEET_CONFIG_PATH, JSON.stringify({ url: normalizedUrl, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
-    lastFetchTime = 0;
-    if (fs.existsSync(LOTS_CSV_CACHE_PATH)) {
-      try { fs.unlinkSync(LOTS_CSV_CACHE_PATH); } catch (_) {}
-    }
-    if (fs.existsSync(LOTS_CACHE_TIME_PATH)) {
-      try { fs.unlinkSync(LOTS_CACHE_TIME_PATH); } catch (_) {}
-    }
-  } catch (e) { }
-  return normalizedUrl;
-}
-
-const CUTTING_MATRIX_CSV_CACHE_PATH = path.join(CACHE_DIR, 'cutting_matrix_gid0.csv');
-
-async function getLotsCSV(force = false) {
-  const url = getActiveSheetUrl();
+// 1. Fetch Main Google Sheet (Used exclusively for Below of Material / Garment Design)
+export async function getMainLotsCSV(force = false) {
+  const url = getMainSheetUrl();
   const now = Date.now();
-  const cacheExists = fs.existsSync(LOTS_CSV_CACHE_PATH);
+  const cacheExists = fs.existsSync(MAIN_SHEET_CSV_CACHE_PATH);
 
-  // If cache is still fresh and force is false, serve it directly
-  if (!force && cacheExists && (now - lastFetchTime < CACHE_TTL_MS)) {
-    return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
+  if (!force && cacheExists && (now - lastMainFetchTime < CACHE_TTL_MS)) {
+    return fs.readFileSync(MAIN_SHEET_CSV_CACHE_PATH, 'utf8');
   }
 
   try {
-    // 10-second timeout to prevent indefinite hangs
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
     const response = await fetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
 
-    if (!response.ok) {
-      throw new Error(`Google Sheets export failed with status ${response.status}: ${response.statusText}`);
+    if (response.ok) {
+      const csvText = await response.text();
+      fs.writeFileSync(MAIN_SHEET_CSV_CACHE_PATH, csvText, 'utf8');
+      lastMainFetchTime = now;
+      return csvText;
     }
-    const csvText = await response.text();
-
-    // Save to disk cache and persist timestamp
-    fs.writeFileSync(LOTS_CSV_CACHE_PATH, csvText, 'utf8');
-    lastFetchTime = now;
-    fs.writeFileSync(LOTS_CACHE_TIME_PATH, String(now), 'utf8');
-    return csvText;
   } catch (err) {
-    console.error('[Cache Loader] Google Sheet fetch error:', err.message);
-
-    // Offline/timeout fallback: serve stale cache if available
-    if (cacheExists) {
-      console.warn('[Offline Fallback] Serving stale cached CSV.');
-      lastFetchTime = now;
-      fs.writeFileSync(LOTS_CACHE_TIME_PATH, String(now), 'utf8');
-      return fs.readFileSync(LOTS_CSV_CACHE_PATH, 'utf8');
-    }
-    console.warn('[Fallback] No cache available — returning empty lots.');
-    lastFetchTime = now;
-    return '';
+    console.warn('[Main Sheet Loader] Fetch error:', err.message);
   }
+
+  if (cacheExists) {
+    return fs.readFileSync(MAIN_SHEET_CSV_CACHE_PATH, 'utf8');
+  }
+  return '';
+}
+
+// 2. Fetch Cutting Google Sheet (Used exclusively for Only Cutting / Cutting Matrix)
+export async function getCuttingLotsCSV(force = false) {
+  const url = getCuttingSheetUrl();
+  const now = Date.now();
+  const cacheExists = fs.existsSync(CUTTING_SHEET_CSV_CACHE_PATH);
+
+  if (!force && cacheExists && (now - lastCuttingFetchTime < CACHE_TTL_MS)) {
+    return fs.readFileSync(CUTTING_SHEET_CSV_CACHE_PATH, 'utf8');
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const csvText = await response.text();
+      fs.writeFileSync(CUTTING_SHEET_CSV_CACHE_PATH, csvText, 'utf8');
+      lastCuttingFetchTime = now;
+      return csvText;
+    }
+  } catch (err) {
+    console.warn('[Cutting Sheet Loader] Fetch error:', err.message);
+  }
+
+  if (cacheExists) {
+    return fs.readFileSync(CUTTING_SHEET_CSV_CACHE_PATH, 'utf8');
+  }
+  return '';
+}
+
+// Backward compatibility alias for general lots fetch (defaults to Main Sheet)
+export async function getLotsCSV(force = false) {
+  return getMainLotsCSV(force);
 }
 
 // Helper to fetch the actual Cutting matrix sheet (gid=0)
@@ -1089,7 +1211,7 @@ export async function syncGoogleSheetsToDb(force = false) {
   try {
     await ensureCuttingTablesExist();
     const [csvText, matrixCsvText] = await Promise.all([
-      getLotsCSV(force),
+      getCuttingLotsCSV(force),
       getCuttingMatrixBlocksCSV(force).catch(() => '')
     ]);
 
@@ -1190,12 +1312,30 @@ function isCuttingLotOnOrAfterJune1(row) {
       if (row.lot_key) existingMap.set(row.lot_key, row.id);
     }
 
+    // Step 1.5: Auto-Prune obsolete or non-cutting lots (e.g. from previous Main Sheet sync)
+    const validLotSet = new Set(uniqueRows.map(r => r._cleanLot.toLowerCase()));
+    const obsoleteLots = [];
+    for (const row of existingRows) {
+      if (row.lot_key && !validLotSet.has(row.lot_key)) {
+        obsoleteLots.push(row.lot_key);
+      }
+    }
+    if (obsoleteLots.length > 0) {
+      for (let i = 0; i < obsoleteLots.length; i += 100) {
+        const chunk = obsoleteLots.slice(i, i + 100);
+        const placeholders = chunk.map(() => '?').join(', ');
+        await pool.execute(`DELETE FROM cuttings_matrix WHERE LOWER(TRIM(Lot_No)) IN (${placeholders})`, chunk).catch(() => null);
+        await pool.execute(`DELETE FROM cutting_header WHERE LOWER(TRIM(Lot_Number)) IN (${placeholders})`, chunk).catch(() => null);
+      }
+      console.log(`[Sync] Automatically pruned ${obsoleteLots.length} obsolete / non-cutting lots from DB.`);
+    }
+
     const toInsert = [];
     const toUpdate = [];
 
     for (const r of uniqueRows) {
       const key = r._cleanLot.toLowerCase();
-      if (existingMap.has(key)) {
+      if (existingMap.has(key) && !obsoleteLots.includes(key)) {
         toUpdate.push({ id: existingMap.get(key), row: r });
       } else {
         toInsert.push(r);
@@ -1428,18 +1568,41 @@ app.get('/api/lot/:lotNo', async (req, res) => {
       return '';
     };
 
-    // Step 1: Try fetching from Google Sheet CSV (live sync)
+    // Step 1: Fetch from MAIN Google Sheet CSV (Primary source for Below of Material / Garment Design)
     try {
-      const csvText = await getLotsCSV(true);
+      const csvText = await getMainLotsCSV(true);
       if (csvText) {
         const rows = parseCSV(csvText);
+        const target = lotNo.toLowerCase().trim();
+
         matchedRow = rows.find(row => {
-          const rowLotNo = getCol(row, 'Lot Number', 'Lot No', 'Job Order No', 'lot');
-          return rowLotNo && String(rowLotNo).trim().toLowerCase() === lotNo.toLowerCase();
+          const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
+          const rowJob = getCol(row, 'Job Order No', 'Order No.', 'JobOrder No', 'Job Order').toLowerCase().trim();
+          return rowLot === target || rowJob === target || rowLot.includes(target) || (target.length >= 4 && target.includes(rowLot));
         });
       }
     } catch (csvErr) {
-      console.warn(`[Lot Fetch] Google Sheet CSV error for ${lotNo}:`, csvErr.message);
+      console.warn(`[Lot Fetch] Main Google Sheet CSV error for ${lotNo}:`, csvErr.message);
+    }
+
+    // Step 1.5: If not found in Main Sheet, check Dedicated Cutting Google Sheet as secondary live fallback
+    if (!matchedRow) {
+      try {
+        const cuttingCsvText = await getCuttingLotsCSV(true);
+        if (cuttingCsvText) {
+          const cuttingRows = parseCSV(cuttingCsvText);
+          const target = lotNo.toLowerCase().trim();
+          matchedRow = cuttingRows.find(row => {
+            const rowLot = getCol(row, 'Lot Number', 'Lot No', 'lot').toLowerCase().trim();
+            return rowLot === target || rowLot.includes(target);
+          });
+          if (matchedRow) {
+            console.log(`[Lot Fetch] Found lot "${lotNo}" in Cutting Google Sheet.`);
+          }
+        }
+      } catch (cutCsvErr) {
+        console.warn(`[Lot Fetch] Cutting Sheet fallback warning:`, cutCsvErr.message);
+      }
     }
 
     if (matchedRow) {
@@ -1462,18 +1625,18 @@ app.get('/api/lot/:lotNo', async (req, res) => {
               [
                 trimmedLot,
                 getCol(matchedRow, 'Fabric').substring(0, 255),
-                getCol(matchedRow, 'Garment Type', 'Garment_Type').substring(0, 255),
+                getCol(matchedRow, 'Garment Type', 'Garment_Type', 'Component').substring(0, 255),
                 getCol(matchedRow, 'Style').substring(0, 255),
                 getCol(matchedRow, 'Size', 'Sizes').substring(0, 255),
                 getCol(matchedRow, 'Shade', 'Shades'),
                 new Date().toISOString(),
                 getCol(matchedRow, 'Date', 'Date of Issue').substring(0, 100),
-                getCol(matchedRow, 'Submitted By', 'Supervisor').substring(0, 255),
+                getCol(matchedRow, 'Submitted By', 'Supervisor', 'FABRIC_SUPERVISOR').substring(0, 255),
                 getCol(matchedRow, 'Party Name', 'Party_Name').substring(0, 255),
                 getCol(matchedRow, 'Brand').substring(0, 255),
                 getCol(matchedRow, 'Season').substring(0, 100),
                 getCol(matchedRow, 'Direct Stitching').substring(0, 100),
-                parseInt(getCol(matchedRow, 'Quantity', 'Cutting_Qty')) || 0,
+                parseInt(getCol(matchedRow, 'Challan Total Qty', 'Quantity', 'Cutting_Qty')) || 0,
                 (getCol(matchedRow, 'Priority') || 'Normal').substring(0, 50),
                 getCol(matchedRow, 'Sticker', 'STICKER').substring(0, 100),
                 rowImg.substring(0, 1000),
@@ -1495,7 +1658,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
               lotNo: trimmedLot,
               shadesStr: getCol(matchedRow, 'Shade', 'Shades'),
               sizesStr: getCol(matchedRow, 'Size', 'Sizes'),
-              totalQty: getCol(matchedRow, 'Quantity', 'Cutting_Qty')
+              totalQty: getCol(matchedRow, 'Challan Total Qty', 'Quantity', 'Cutting_Qty')
             }]).catch(() => { });
           }
         } catch (dbSaveErr) {
@@ -1503,11 +1666,15 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         }
       })();
 
+      const primaryLot = getCol(matchedRow, 'Lot Number', 'Lot No', 'Job Order No', 'lot') || lotNo;
+      const jobOrderNo = getCol(matchedRow, 'Job Order No', 'Order No.');
+
       return res.status(200).json({
-        lotNo: getCol(matchedRow, 'Lot Number', 'Lot No', 'Job Order No', 'lot') || lotNo,
+        lotNo: primaryLot,
+        lotNo2: jobOrderNo || primaryLot,
         fabric: getCol(matchedRow, 'Fabric'),
         brand: getCol(matchedRow, 'Brand'),
-        garmentType: getCol(matchedRow, 'Garment Type', 'Garment_Type'),
+        garmentType: getCol(matchedRow, 'Garment Type', 'Garment_Type', 'Component'),
         section: getCol(matchedRow, 'Section', 'MWK'),
         season: getCol(matchedRow, 'Season'),
         style: getCol(matchedRow, 'Style'),
@@ -1530,7 +1697,7 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         fusing: getCol(matchedRow, 'Interlining', 'Fusing', 'Interlining / fusing'),
         shade: getCol(matchedRow, 'Shade', 'Shades'),
         size: getCol(matchedRow, 'Size', 'Sizes'),
-        quantity: getCol(matchedRow, 'Quantity', 'Cutting_Qty'),
+        quantity: parseInt(getCol(matchedRow, 'Challan Total Qty', 'Quantity', 'Cutting_Qty')) || 100,
         unit: getCol(matchedRow, 'Unit') || 'Pcs',
         partyName: getCol(matchedRow, 'Party Name', 'Party_Name'),
         emb: getCol(matchedRow, 'Emb'),
@@ -1540,10 +1707,11 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         pattern: getCol(matchedRow, 'Pattern'),
         remarks: getCol(matchedRow, 'Remarks'),
         directStitching: getCol(matchedRow, 'Direct Stitching'),
-        submittedBy: getCol(matchedRow, 'Submitted By'),
+        submittedBy: getCol(matchedRow, 'Submitted By', 'Supervisor', 'FABRIC_SUPERVISOR'),
         imageUrl: rowImg,
-        priority: getCol(matchedRow, 'Priority'),
+        priority: getCol(matchedRow, 'Priority') || 'Normal',
         status: getCol(matchedRow, 'Status'),
+        source: 'google_sheet',
         rawRow: matchedRow
       });
     }
@@ -3195,60 +3363,40 @@ if (fs.existsSync(distPath)) {
       return res.status(404).json({ error: 'API route not found' });
     }
     const host = req.hostname || 'localhost';
-    return res.redirect(`http://${host}:5173${req.originalUrl}`);
+    return res.status(200).send('G-PDMS Production API Server is running.');
   });
 }
 
-
-// Start Server
-const server = app.listen(PORT, () => {
-  console.log(`G-PDMS Auth Server running on http://localhost:${PORT}`);
+// Start Server bound to 0.0.0.0 for Docker / Render / Railway container compatibility
+const HOST = '0.0.0.0';
+const server = app.listen(PORT, HOST, () => {
+  console.log(`G-PDMS Production Server running on http://${HOST}:${PORT}`);
 
   // ── Auto Keep-Alive Heartbeat (Every 5 Minutes / 300 Seconds) ─────────────
-  // Pings /api/health with lightweight payload to keep connection alive with minimal server load
-  const KEEP_ALIVE_INTERVAL_MS = 300 * 1000; // 300 seconds = 5 minutes
+  // Pings internal loopback /api/ping to keep event loop and process active with zero external socket overhead
+  const KEEP_ALIVE_INTERVAL_MS = 300 * 1000;
 
   const runKeepAliveHealthCheck = async () => {
     const timestamp = new Date().toLocaleTimeString('en-GB');
-
-    // Ping localhost and external URL if defined
-    const endpointsToPing = [`http://127.0.0.1:${PORT}/api/health`];
-    const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.BACKEND_URL || process.env.SERVER_URL || process.env.PUBLIC_BACKEND_URL;
-    if (externalUrl) {
-      const cleanUrl = externalUrl.replace(/\/+$/, '');
-      if (!cleanUrl.includes('127.0.0.1') && !cleanUrl.includes('localhost')) {
-        endpointsToPing.push(`${cleanUrl}/api/health`);
+    try {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/ping`);
+      if (res.ok) {
+        console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Ping OK | Uptime: ${Math.floor(process.uptime())}s`);
       }
-    }
-
-    for (const url of endpointsToPing) {
-      try {
-        const res = await fetch(url, {
-          method: 'GET',
-          headers: { 'User-Agent': 'G-PDMS-KeepAlive-Worker/1.0' }
-        });
-        if (res.ok) {
-          console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Health OK (${url}) | Uptime: ${Math.floor(process.uptime())}s`);
-        } else {
-          console.warn(`[Keep-Alive Heartbeat] ⚠️ ${timestamp} - Status ${res.status} from ${url}`);
-        }
-      } catch (fetchErr) {
-        console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Ping notice: ${fetchErr.message}`);
-      }
+    } catch (fetchErr) {
+      console.log(`[Keep-Alive Heartbeat] 💚 ${timestamp} - Ping notice: ${fetchErr.message}`);
     }
   };
 
-  // Initial keep-alive check after 15 seconds
-  setTimeout(runKeepAliveHealthCheck, 15000);
-
-  // Recurring keep-alive every 5 minutes (300 seconds)
+  // Initial keep-alive check after 30 seconds
+  setTimeout(runKeepAliveHealthCheck, 30000);
   setInterval(runKeepAliveHealthCheck, KEEP_ALIVE_INTERVAL_MS);
 
-  // Background Auto-Sync Google Sheets to Database on startup
+  // Background Auto-Sync Google Sheets to Database with 10s warmup delay
   setTimeout(() => {
     console.log('[Incremental Sync Worker] Initiating startup Google Sheets synchronization to MySQL database...');
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Startup sync warning:', err.message));
-  }, 2000);
+  }, 10000);
 
   // Dedicated Incremental Sync Background Worker every 30 minutes (1800 seconds)
   setInterval(() => {
@@ -3265,5 +3413,30 @@ server.on('error', (err) => {
     console.error('[Server Error]', err.message);
   }
 });
+
+// ── Graceful Shutdown Handler (Zero-Downtime Clean Exit) ─────────────────────
+const handleGracefulShutdown = (signal) => {
+  console.log(`\n[Graceful Shutdown] Received ${signal}. Draining active HTTP connections...`);
+  server.close(async () => {
+    console.log('[Graceful Shutdown] HTTP server closed. Closing MySQL connection pool...');
+    try {
+      await pool.end();
+      console.log('[Graceful Shutdown] MySQL pool successfully terminated. Process exiting cleanly.');
+      process.exit(0);
+    } catch (e) {
+      console.error('[Graceful Shutdown Error]', e.message);
+      process.exit(1);
+    }
+  });
+
+  // Force close after 10 seconds if any connection hangs
+  setTimeout(() => {
+    console.error('[Graceful Shutdown] Forcing shutdown after 10s timeout.');
+    process.exit(1);
+  }, 10000).unref();
+};
+
+process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));
 
 

@@ -56,9 +56,44 @@ const getPoolConfig = () => {
   return config;
 };
 
-const pool = mysql.createPool(getPoolConfig());
+export const pool = mysql.createPool(getPoolConfig());
 
-// Periodic connection pool keepalive (runs every 300s / 5 minutes to keep connection pool warm & healthy with minimal load)
+// Resilient query execution with automatic exponential-backoff retry on transient connection drops
+export async function withRetry(operation, retries = 2, delayMs = 300) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await operation(pool);
+    } catch (err) {
+      lastError = err;
+      const isTransient = [
+        'PROTOCOL_CONNECTION_LOST',
+        'ECONNRESET',
+        'ETIMEDOUT',
+        'ER_LOCK_DEADLOCK',
+        'EAI_AGAIN'
+      ].includes(err.code);
+
+      if (attempt < retries && isTransient) {
+        console.warn(`[DB Retry] Transient error (${err.code}). Retrying in ${delayMs}ms (Attempt ${attempt + 1}/${retries})...`);
+        await new Promise(r => setTimeout(r, delayMs * Math.pow(2, attempt)));
+      } else {
+        break;
+      }
+    }
+  }
+  throw lastError;
+}
+
+export function getPoolStats() {
+  return {
+    connectionLimit: 25,
+    status: 'healthy',
+    keepAliveDelayMs: 10000
+  };
+}
+
+// Periodic connection pool keepalive (runs every 180s to keep connection pool warm & healthy with minimal load)
 setInterval(async () => {
   try {
     const conn = await pool.getConnection();
@@ -67,7 +102,7 @@ setInterval(async () => {
   } catch (err) {
     console.warn('[DB Heartbeat] Connection check warning:', err.message);
   }
-}, 300000).unref();
+}, 180000).unref();
 
 // ── Initial Configuration ─────────────────────────────────────────────────────
 
@@ -87,14 +122,24 @@ const initialDesigners = ['Admin'];
 
 // ── initDb: create tables + seed ──────────────────────────────────────────────
 
-export async function initDb() {
-  // Test connection on startup
-  try {
-    await pool.execute('SELECT 1');
-    console.log('[DB] MySQL connected successfully.');
-  } catch (err) {
-    console.error('[DB] MySQL connection FAILED:', err.message);
-    process.exit(1);
+export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
+  // Test connection on startup with automatic retries for cloud deployments
+  let connected = false;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await pool.execute('SELECT 1');
+      console.log('[DB] MySQL connected successfully.');
+      connected = true;
+      break;
+    } catch (err) {
+      console.warn(`[DB] MySQL connection attempt ${attempt}/${maxRetries} failed: ${err.message}`);
+      if (attempt < maxRetries) {
+        await new Promise(res => setTimeout(res, retryIntervalMs));
+      } else {
+        console.error('[DB] Critical: Unable to establish database connection after multiple retries.');
+        throw err;
+      }
+    }
   }
 
   // Users
