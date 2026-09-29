@@ -1114,13 +1114,58 @@ export async function syncGoogleSheetsToDb(force = false) {
       return { success: true, inserted: 0, updated: 0, totalProcessed: 0 };
     }
 
-    // Filter valid rows & de-duplicate by lot number
+// Cutoff date for cutting reports: Only ingest/process data on or after 1 June 2026
+const CUTTING_DATA_CUTOFF_DATE = new Date('2026-06-01T00:00:00.000Z');
+
+function isCuttingLotOnOrAfterJune1(row) {
+  if (!row) return false;
+  const dateCandidates = [
+    row['Saved At'],
+    row['Saved_At'],
+    row['SavedAt'],
+    row['Date of Issue'],
+    row['Date_of_Issue'],
+    row['JobOrder Date'],
+    row['JobOrder_Date'],
+    row['ZIP ORDER DATE'],
+    row['Zip_Order_Date']
+  ];
+
+  for (const raw of dateCandidates) {
+    if (!raw || typeof raw !== 'string') continue;
+    const str = raw.trim();
+    if (!str) continue;
+
+    const d = new Date(str);
+    if (!isNaN(d.getTime()) && d.getFullYear() > 2000) {
+      return d >= CUTTING_DATA_CUTOFF_DATE;
+    }
+
+    const dmyMatch = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+    if (dmyMatch) {
+      const day = parseInt(dmyMatch[1], 10);
+      const month = parseInt(dmyMatch[2], 10) - 1;
+      const year = parseInt(dmyMatch[3], 10);
+      const parsed = new Date(year, month, day);
+      if (!isNaN(parsed.getTime())) {
+        return parsed >= CUTTING_DATA_CUTOFF_DATE;
+      }
+    }
+  }
+  return true;
+}
+
+    // Filter valid rows & de-duplicate by lot number (skipping records prior to 1 June 2026)
     const validRowsMap = new Map();
     for (const r of rows) {
       const rawLot = r['Lot Number'] || r['Lot No'] || r['Job Order No'];
       if (!rawLot || !rawLot.trim()) continue;
       const trimmedLot = rawLot.trim().substring(0, 100);
       if (trimmedLot.length > 50 || trimmedLot.toLowerCase().includes('total') || trimmedLot.toLowerCase().includes('summary')) {
+        continue;
+      }
+      // Performance optimization: skip old cutting lots prior to 1 June 2026
+      if (!isCuttingLotOnOrAfterJune1(r)) {
         continue;
       }
       const key = trimmedLot.toLowerCase();

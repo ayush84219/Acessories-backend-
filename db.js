@@ -2397,7 +2397,30 @@ export const getUndesignedCuttingLots = async () => {
         )
       ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
     `);
-    return rows;
+
+    // Strict Cutoff: Only return lots on or after 1 June 2026
+    const CUTOFF_DATE = new Date('2026-06-01T00:00:00.000Z');
+    return rows.filter(row => {
+      const dateCandidates = [row.Saved_At, row.Date_of_Issue, row.JobOrder_Date, row.Zip_Order_Date];
+      for (const raw of dateCandidates) {
+        if (!raw || typeof raw !== 'string') continue;
+        const str = raw.trim();
+        if (!str) continue;
+        const d = new Date(str);
+        if (!isNaN(d.getTime()) && d.getFullYear() > 2000) {
+          return d >= CUTOFF_DATE;
+        }
+        const dmyMatch = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+        if (dmyMatch) {
+          const day = parseInt(dmyMatch[1], 10);
+          const month = parseInt(dmyMatch[2], 10) - 1;
+          const year = parseInt(dmyMatch[3], 10);
+          const parsed = new Date(year, month, day);
+          if (!isNaN(parsed.getTime())) return parsed >= CUTOFF_DATE;
+        }
+      }
+      return true;
+    });
   } catch (err) {
     if (err.code === 'ER_NO_SUCH_TABLE') {
       await ensureCuttingSchema();
