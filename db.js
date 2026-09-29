@@ -567,9 +567,19 @@ export async function initDb() {
   // High-performance database query indexes
   try { await pool.execute(`CREATE INDEX idx_materials_stock ON materials (stock)`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_materials_category ON materials (category)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_materials_name ON materials (name(191))`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_materials_location ON materials (location(191))`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_materials_poNumber ON materials (poNumber)`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_designs_status ON designs (status)`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_designs_lotNo2 ON designs (lotNo2)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_designs_brand ON designs (brand)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_designs_category ON designs (category)`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_approval_status ON approval_requests (status)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_cutting_header_lot ON cutting_header (Lot_Number)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_cuttings_matrix_lot ON cuttings_matrix (Lot_No)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_po_vendor ON purchase_orders (vendorName(191))`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_weight_capture_mat ON weight_capture (materialName(191))`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_weight_capture_lot ON weight_capture (lotNo)`); } catch (_) { }
 
   // ── Initial Configuration Seed (Only settings/vendors if empty) ───────────
 
