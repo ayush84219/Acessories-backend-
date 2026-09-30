@@ -21,6 +21,7 @@ import {
   createDesign,
   updateDesignStatus,
   getAllMaterials,
+  getMaterialById,
   upsertMaterial,
   deleteMaterial,
   searchDirectSql,
@@ -103,9 +104,9 @@ process.on('uncaughtException', (err) => {
   console.error('[Server] Uncaught Exception (server continues):', err.message);
 });
 
-// Automatic cache size management configurations
-const MAX_CACHE_SIZE = 500 * 1024 * 1024; // 500 MB limit
-const TARGET_CACHE_SIZE = 350 * 1024 * 1024; // Clean down to 350 MB
+// Automatic cache size management configurations (tuned for 512MB RAM cloud environments)
+const MAX_CACHE_SIZE = 50 * 1024 * 1024; // 50 MB limit
+const TARGET_CACHE_SIZE = 25 * 1024 * 1024; // Clean down to 25 MB
 
 const autoCleanCache = () => {
   fs.readdir(CACHE_DIR, (err, files) => {
@@ -184,8 +185,26 @@ app.use(compression({
     return compression.filter(req, res);
   }
 }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ limit: '15mb', extended: true }));
+
+// ── Proactive Memory Watchdog & Garbage Collection for 512MB Cloud Containers ───
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const heapUsedMb = mem.heapUsed / 1024 / 1024;
+  const rssMb = mem.rss / 1024 / 1024;
+  
+  if (heapUsedMb > 180 || rssMb > 300) {
+    if (global.gc) {
+      try {
+        global.gc();
+        console.log(`[Memory Watchdog] Triggered GC. Heap was ${heapUsedMb.toFixed(1)}MB, RSS was ${rssMb.toFixed(1)}MB.`);
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+}, 30000);
 
 // ── In-Memory APM Metrics Tracker ───────────────────────────────────────────
 const metricsTracker = {
@@ -2250,6 +2269,20 @@ app.get('/api/materials', async (req, res) => {
   } catch (err) {
     console.error('API GET /api/materials error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve materials.' });
+  }
+});
+
+// GET single material by ID
+app.get('/api/materials/:id', async (req, res) => {
+  try {
+    const material = await getMaterialById(req.params.id);
+    if (!material) {
+      return res.status(404).json({ error: `Material with ID "${req.params.id}" not found.` });
+    }
+    res.status(200).json(material);
+  } catch (err) {
+    console.error('API GET /api/materials/:id error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch material details.' });
   }
 });
 

@@ -7,7 +7,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-// ── MySQL Connection Pool ──────────────────────────────────────────────────────
+// ── MySQL Connection Pool (Optimized for <512MB RAM Instances) ──────────────────
 const getPoolConfig = () => {
   const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
   if (connectionUri) {
@@ -21,11 +21,13 @@ const getPoolConfig = () => {
         database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
         ssl: { rejectUnauthorized: false },
         waitForConnections: true,
-        connectionLimit: 25,
+        connectionLimit: 8,
+        maxIdle: 4,
+        idleTimeout: 60000,
         queueLimit: 0,
         enableKeepAlive: true,
         keepAliveInitialDelay: 10000,
-        connectTimeout: 30000,
+        connectTimeout: 20000,
       };
     } catch (e) {
       console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
@@ -42,11 +44,13 @@ const getPoolConfig = () => {
     password: process.env.MYSQL_PASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
     database: (process.env.MYSQL_DATABASE || process.env.DB_NAME || 'accessories2').trim(),
     waitForConnections: true,
-    connectionLimit: 25,
+    connectionLimit: 8,
+    maxIdle: 4,
+    idleTimeout: 60000,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 10000,
-    connectTimeout: 30000,
+    connectTimeout: 20000,
   };
 
   if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
@@ -1284,6 +1288,23 @@ export const getAllMaterials = async (onlyPresent = false) => {
   }
   const [rows] = await pool.execute('SELECT * FROM materials ORDER BY id ASC');
   return rows;
+};
+
+export const getMaterialById = async (id) => {
+  if (!id) return null;
+  const clean = String(id).trim();
+  // 1. Exact ID match
+  const [rows] = await pool.execute('SELECT * FROM materials WHERE LOWER(id) = LOWER(?)', [clean]);
+  if (rows.length > 0) return rows[0];
+
+  // 2. Prefix / partial match
+  const [likeRows] = await pool.execute(
+    'SELECT * FROM materials WHERE LOWER(id) LIKE LOWER(?) OR LOWER(name) LIKE LOWER(?) ORDER BY id ASC LIMIT 1',
+    [`%${clean}%`, `%${clean}%`]
+  );
+  if (likeRows.length > 0) return likeRows[0];
+
+  return null;
 };
 
 export const upsertMaterial = async (m) => {
