@@ -5,16 +5,18 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node --max-old-space-size=256 --expose-gc server.js",
-    "dev": "node --max-old-space-size=256 --watch server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.11.0",
     "compression": "^1.8.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.4.0",
     "mysql2": "^3.3.0",
     "nodemailer": "^9.0.1",
     "xlsx": "^0.18.5"

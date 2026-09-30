@@ -86,6 +86,7 @@ import {
   deleteElasticIssue
 } from './db.js';
 import pool from './db.js';
+import cloudinary from './config/cloudinary.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -167,7 +168,7 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('X-XSS-Protection', '1; mode=block');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  
+
   const startTime = performance.now();
   res.on('finish', () => {
     const duration = (performance.now() - startTime).toFixed(2);
@@ -185,26 +186,8 @@ app.use(compression({
     return compression.filter(req, res);
   }
 }));
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ limit: '15mb', extended: true }));
-
-// ── Proactive Memory Watchdog & Garbage Collection for 512MB Cloud Containers ───
-setInterval(() => {
-  const mem = process.memoryUsage();
-  const heapUsedMb = mem.heapUsed / 1024 / 1024;
-  const rssMb = mem.rss / 1024 / 1024;
-  
-  if (heapUsedMb > 180 || rssMb > 300) {
-    if (global.gc) {
-      try {
-        global.gc();
-        console.log(`[Memory Watchdog] Triggered GC. Heap was ${heapUsedMb.toFixed(1)}MB, RSS was ${rssMb.toFixed(1)}MB.`);
-      } catch (e) {
-        // ignore
-      }
-    }
-  }
-}, 30000);
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ── In-Memory APM Metrics Tracker ───────────────────────────────────────────
 const metricsTracker = {
@@ -996,6 +979,54 @@ function parseCuttingMatrixBlocks(csvText) {
   return lotMatrixMap;
 }
 
+// Upload image route (Cloudinary)
+app.post('/api/upload-cloudinary-image', async (req, res) => {
+  try {
+    const { base64, folder } = req.body;
+    if (!base64) return res.status(400).json({ error: 'No image data provided' });
+
+    const uploadResponse = await cloudinary.uploader.upload(base64, {
+      folder: folder || 'accessories_uploads',
+      resource_type: 'image'
+    });
+
+    res.json({
+      success: true,
+      url: uploadResponse.secure_url,
+      public_id: uploadResponse.public_id
+    });
+  } catch (err) {
+    console.error('[Cloudinary Upload Error]:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to upload to Cloudinary' });
+  }
+});
+
+// Upload image route (Google Drive fallback)
+app.post('/api/upload-drive-image', async (req, res) => {
+  try {
+    const { base64, fileName, mimeType } = req.body;
+    if (!base64) return res.status(400).json({ error: 'No image data provided' });
+
+    const scriptUrl = process.env.GOOGLE_DRIVE_SCRIPT_URL;
+    const response = await fetch(scriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base64, fileName, mimeType })
+    });
+
+    const result = await response.json();
+    if (result.success) {
+      // Save result.url to MySQL database instead of the large base64 string
+      res.json({ success: true, url: result.url });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // In-memory hash of the last successfully synced CSV to eliminate duplicate processing
 let lastSyncedCsvHash = '';
 
@@ -1152,7 +1183,7 @@ async function batchEnsureCuttingsMatrix(items, lotMatrixMap = null) {
     for (let i = 0; i < headerIdsToClear.length; i += 100) {
       const idChunk = headerIdsToClear.slice(i, i + 100);
       const placeholders = idChunk.map(() => '?').join(', ');
-      await pool.execute(`DELETE FROM cuttings_matrix WHERE header_id IN (${placeholders})`, idChunk).catch(() => {});
+      await pool.execute(`DELETE FROM cuttings_matrix WHERE header_id IN (${placeholders})`, idChunk).catch(() => { });
     }
   }
 
@@ -1257,46 +1288,46 @@ export async function syncGoogleSheetsToDb(force = false) {
       return { success: true, inserted: 0, updated: 0, totalProcessed: 0 };
     }
 
-// Cutoff date for cutting reports: Only ingest/process data on or after 1 June 2026
-const CUTTING_DATA_CUTOFF_DATE = new Date('2026-06-01T00:00:00.000Z');
+    // Cutoff date for cutting reports: Only ingest/process data on or after 1 June 2026
+    const CUTTING_DATA_CUTOFF_DATE = new Date('2026-06-01T00:00:00.000Z');
 
-function isCuttingLotOnOrAfterJune1(row) {
-  if (!row) return false;
-  const dateCandidates = [
-    row['Saved At'],
-    row['Saved_At'],
-    row['SavedAt'],
-    row['Date of Issue'],
-    row['Date_of_Issue'],
-    row['JobOrder Date'],
-    row['JobOrder_Date'],
-    row['ZIP ORDER DATE'],
-    row['Zip_Order_Date']
-  ];
+    function isCuttingLotOnOrAfterJune1(row) {
+      if (!row) return false;
+      const dateCandidates = [
+        row['Saved At'],
+        row['Saved_At'],
+        row['SavedAt'],
+        row['Date of Issue'],
+        row['Date_of_Issue'],
+        row['JobOrder Date'],
+        row['JobOrder_Date'],
+        row['ZIP ORDER DATE'],
+        row['Zip_Order_Date']
+      ];
 
-  for (const raw of dateCandidates) {
-    if (!raw || typeof raw !== 'string') continue;
-    const str = raw.trim();
-    if (!str) continue;
+      for (const raw of dateCandidates) {
+        if (!raw || typeof raw !== 'string') continue;
+        const str = raw.trim();
+        if (!str) continue;
 
-    const d = new Date(str);
-    if (!isNaN(d.getTime()) && d.getFullYear() > 2000) {
-      return d >= CUTTING_DATA_CUTOFF_DATE;
-    }
+        const d = new Date(str);
+        if (!isNaN(d.getTime()) && d.getFullYear() > 2000) {
+          return d >= CUTTING_DATA_CUTOFF_DATE;
+        }
 
-    const dmyMatch = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
-    if (dmyMatch) {
-      const day = parseInt(dmyMatch[1], 10);
-      const month = parseInt(dmyMatch[2], 10) - 1;
-      const year = parseInt(dmyMatch[3], 10);
-      const parsed = new Date(year, month, day);
-      if (!isNaN(parsed.getTime())) {
-        return parsed >= CUTTING_DATA_CUTOFF_DATE;
+        const dmyMatch = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+        if (dmyMatch) {
+          const day = parseInt(dmyMatch[1], 10);
+          const month = parseInt(dmyMatch[2], 10) - 1;
+          const year = parseInt(dmyMatch[3], 10);
+          const parsed = new Date(year, month, day);
+          if (!isNaN(parsed.getTime())) {
+            return parsed >= CUTTING_DATA_CUTOFF_DATE;
+          }
+        }
       }
+      return true;
     }
-  }
-  return true;
-}
 
     // Filter valid rows & de-duplicate by lot number (skipping records prior to 1 June 2026)
     const validRowsMap = new Map();
@@ -1928,7 +1959,7 @@ app.get('/api/sheet-config', (req, res) => {
       try {
         const data = JSON.parse(fs.readFileSync(SHEET_CONFIG_PATH, 'utf8'));
         updatedAt = data.updatedAt;
-      } catch (_) {}
+      } catch (_) { }
     }
     res.json({ success: true, url, updatedAt });
   } catch (err) {
@@ -2832,7 +2863,7 @@ app.post('/api/elastic/calculate', async (req, res) => {
           garmentType = row.Garment_Type || '';
           fabric = row.Fabric || '';
         }
-      } catch (_) {}
+      } catch (_) { }
     }
 
     if (isNaN(pcs) || pcs <= 0) {
@@ -2841,7 +2872,7 @@ app.post('/api/elastic/calculate', async (req, res) => {
 
     const size = Math.max(0, parseFloat(rawSize) || 0);
     const tapeSize = Math.max(0, parseFloat(rawTape) || 0);
-    
+
     // Support separate units for Elastic and Tape
     const elasticUnit = String(rawElasticUnit || unit || 'inch').toLowerCase().includes('cm') ? 'cm' : 'inch';
     const tapeUnit = String(rawTapeUnit || 'cm').toLowerCase().includes('cm') ? 'cm' : 'inch';
@@ -2928,7 +2959,7 @@ app.get('/api/elastic/calculate', async (req, res) => {
           itemName = row.Garment_Type || row.Style || 'LOWER';
           supervisorName = row.Supervisor || '';
         }
-      } catch (_) {}
+      } catch (_) { }
     }
 
     const size = Math.max(0, parseFloat(rawSize) || 0);

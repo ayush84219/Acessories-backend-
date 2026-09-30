@@ -2,6 +2,25 @@ import mysql from 'mysql2/promise';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import cloudinary from './config/cloudinary.js';
+
+// Auto-upload helper for any base64 image strings entering the database
+export async function uploadBase64ToCloudinary(imageSource, folder = 'accessories/uploads') {
+  if (!imageSource || typeof imageSource !== 'string' || !imageSource.startsWith('data:image')) {
+    return imageSource || '';
+  }
+  try {
+    const res = await cloudinary.uploader.upload(imageSource, {
+      folder,
+      resource_type: 'image'
+    });
+    console.log(`[Cloudinary Auto-Upload] Transformed base64 image -> ${res.secure_url}`);
+    return res.secure_url || imageSource;
+  } catch (err) {
+    console.error('[Cloudinary Auto-Upload Error]:', err.message);
+    return imageSource;
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -629,6 +648,13 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`CREATE INDEX idx_po_vendor ON purchase_orders (vendorName(191))`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_weight_capture_mat ON weight_capture (materialName(191))`); } catch (_) { }
   try { await pool.execute(`CREATE INDEX idx_weight_capture_lot ON weight_capture (lotNo)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_weight_capture_code ON weight_capture (materialCode)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_weight_capture_status_date ON weight_capture (approvalStatus, capturedAt)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_cuttings_matrix_header ON cuttings_matrix (header_id)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_extra_mat_lot ON extra_material_issues (lot_id)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_order_acc_po ON order_accepted (poNumber)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_material_transfers_code ON material_transfers (materialCode)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_warehouse_locations_wh ON warehouse_locations (warehouse(191))`); } catch (_) { }
 
   // ── Initial Configuration Seed (Only settings/vendors if empty) ───────────
 
@@ -816,7 +842,7 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
   const location = data.storeLocation || 'Main Store';
   const poNumber = data.poNumber || 'N/A';
   const invoiceNo = data.invoiceNo || 'N/A';
-  const imageUrl = data.imageUrl || '';
+  const imageUrl = await uploadBase64ToCloudinary(data.imageUrl || '', 'accessories/materials');
 
   if (!name && !code) return;
 
@@ -921,6 +947,8 @@ export const createMaterialCapture = async (data) => {
     imageUrl = ''
   } = data;
 
+  const finalImageUrl = await uploadBase64ToCloudinary(imageUrl, 'accessories/weight_capture');
+
   const [result] = await pool.execute(
     `INSERT INTO weight_capture
      (materialCode,materialName,unit,category,supplier,lotNo,poNumber,invoiceNo,
@@ -932,7 +960,7 @@ export const createMaterialCapture = async (data) => {
       Number(grossWeightKg), Number(tareWeightKg), Number(netWeightKg),
       Number(weightPerPieceG), Number(sampleQty), Number(sampleWeightKg),
       Number(pieces), Number(packets),
-      barcodeId, status, approvalStatus, entryMode, remarks, imageUrl || '']
+      barcodeId, status, approvalStatus, entryMode, remarks, finalImageUrl || '']
   );
 
   const captureId = result.insertId;
@@ -1247,6 +1275,8 @@ export const getDesignById = async (id) => {
 
 export const createDesign = async (d) => {
   const repeatAgainst = d.repeat_against || null;
+  const finalImageUrl = await uploadBase64ToCloudinary(d.imageUrl || '', 'accessories/designs');
+
   if (d.created_at) {
     const localDate = new Date(d.created_at);
     const pad = n => String(n).padStart(2, '0');
@@ -1259,7 +1289,7 @@ export const createDesign = async (d) => {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [d.id, d.name, d.lotNo2, d.brand, d.category, d.designer, d.fabricType, d.targetSizes,
       d.colorCode, d.status, d.date, d.comments || '', d.section, d.season, d.style, d.tapeLace,
-      d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100, dbDate, repeatAgainst]
+      d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, finalImageUrl || '', d.quantity || 100, dbDate, repeatAgainst]
     );
   } else {
     await pool.execute(
@@ -1270,7 +1300,7 @@ export const createDesign = async (d) => {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [d.id, d.name, d.lotNo2, d.brand, d.category, d.designer, d.fabricType, d.targetSizes,
       d.colorCode, d.status, d.date, d.comments || '', d.section, d.season, d.style, d.tapeLace,
-      d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, d.imageUrl || '', d.quantity || 100, repeatAgainst]
+      d.bottomType, d.zip, d.sticker, d.collar, d.bone, d.fullBaju, d.bom, d.totalCost || 0, finalImageUrl || '', d.quantity || 100, repeatAgainst]
     );
   }
 };
