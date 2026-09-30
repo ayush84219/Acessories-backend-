@@ -3167,6 +3167,82 @@ export const deleteElasticIssue = async (idOrSlipNo) => {
   return true;
 };
 
+export const searchDirectSql = async ({
+  query = '',
+  category = '',
+  location = '',
+  minStock = null,
+  maxStock = null,
+  minCost = null,
+  maxCost = null,
+  page = 1,
+  limit = 50
+} = {}) => {
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 50));
+  const offset = (pageNum - 1) * limitNum;
+
+  const matConditions = [];
+  const matParams = [];
+
+  if (query) {
+    const qStr = `%${query.trim()}%`;
+    matConditions.push('(name LIKE ? OR id LIKE ? OR category LIKE ? OR poNumber LIKE ? OR location LIKE ? OR color LIKE ?)');
+    matParams.push(qStr, qStr, qStr, qStr, qStr, qStr);
+  }
+  if (category) {
+    matConditions.push('LOWER(category) = LOWER(?)');
+    matParams.push(category.trim());
+  }
+  if (location) {
+    matConditions.push('LOWER(location) = LOWER(?)');
+    matParams.push(location.trim());
+  }
+  if (minStock !== null && minStock !== '') {
+    matConditions.push('stock >= ?');
+    matParams.push(Number(minStock));
+  }
+  if (maxStock !== null && maxStock !== '') {
+    matConditions.push('stock <= ?');
+    matParams.push(Number(maxStock));
+  }
+  if (minCost !== null && minCost !== '') {
+    matConditions.push('cost >= ?');
+    matParams.push(Number(minCost));
+  }
+  if (maxCost !== null && maxCost !== '') {
+    matConditions.push('cost <= ?');
+    matParams.push(Number(maxCost));
+  }
+
+  const whereClause = matConditions.length > 0 ? `WHERE ${matConditions.join(' AND ')}` : '';
+  const sql = `
+    SELECT id, name, category, location, color, poNumber, invoiceNo, unit, stock, cost, imageUrl, 'material' AS itemType
+    FROM materials
+    ${whereClause}
+    ORDER BY id ASC
+    LIMIT ? OFFSET ?
+  `;
+
+  const [rows] = await pool.execute(sql, [...matParams, String(limitNum), String(offset)]);
+  return {
+    items: rows,
+    totalCount: rows.length,
+    page: pageNum,
+    limit: limitNum
+  };
+};
+
+export const getSearchSuggestionsSql = async (q, max = 8) => {
+  if (!q || typeof q !== 'string') return [];
+  const qStr = `%${q.trim()}%`;
+  const [rows] = await pool.execute(
+    'SELECT DISTINCT name FROM materials WHERE name LIKE ? LIMIT ?',
+    [qStr, String(Math.min(20, max))]
+  );
+  return rows.map(r => ({ text: r.name, freq: 1 }));
+};
+
 // ── Export pool as default ────────────────────────────────────────────────────
 export default pool;
 

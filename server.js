@@ -10,7 +10,6 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import os from 'os';
-import { dsaEngine } from './dsaSearchEngine.js';
 import {
   initDb,
   getUserByEmail,
@@ -24,6 +23,8 @@ import {
   getAllMaterials,
   upsertMaterial,
   deleteMaterial,
+  searchDirectSql,
+  getSearchSuggestionsSql,
   getAllApprovalRequests,
   createApprovalRequest,
   updateApprovalRequestStatus,
@@ -217,8 +218,7 @@ const metricsTracker = {
         hits: cacheHits,
         misses: cacheMisses,
         hitRatio: (cacheHits + cacheMisses) > 0 ? ((cacheHits / (cacheHits + cacheMisses)) * 100).toFixed(1) + '%' : '0%'
-      },
-      dsaStats: dsaEngine.getStats()
+      }
     };
   }
 };
@@ -256,12 +256,10 @@ setInterval(() => {
   }
 }, 300000).unref();
 
-// Initialize Database and Warm-Up In-Memory DSA Engine
+// Initialize Database
 try {
   await initDb();
   console.log('Database initialized successfully.');
-  // Initialize In-Memory DSA Search & Trie Engine for sub-millisecond search
-  warmUpDSASearchEngine().catch(e => console.warn('[DSA Init]', e.message));
 } catch (err) {
   console.error('Database initialization failed:', err.message);
   process.exit(1);
@@ -276,8 +274,7 @@ app.get('/api/health', async (req, res) => {
     res.status(200).json({
       status: 'UP',
       uptimeSeconds: Math.floor(process.uptime()),
-      db: 'connected',
-      dsaEngine: dsaEngine.isReady ? 'READY' : 'WARMING'
+      db: 'connected'
     });
   } catch (err) {
     res.status(503).json({
@@ -2180,104 +2177,58 @@ app.get('/api/design-history', async (req, res) => {
   }
 });
 
-// ── DSA In-Memory Search Engine Warmup & Routes ───────────────────────────────
-export async function warmUpDSASearchEngine() {
-  try {
-    const materials = await getAllMaterials();
-    const designs = await getSearchableDesigns();
-    const headers = await getSearchableCuttingHeaders();
-
-    const unifiedItems = [
-      ...(materials || []).map(m => ({ ...m, itemType: 'material' })),
-      ...(designs || []).map(d => ({
-        id: `design_${d.id}`,
-        name: d.name || `Lot #${d.id}`,
-        category: d.category || 'Design',
-        brand: d.brand || '',
-        style: d.style || '',
-        lotNo: d.id,
-        lotNo2: d.lotNo2,
-        stock: d.quantity || 0,
-        cost: d.totalCost || 0,
-        itemType: 'design'
-      })),
-      ...(headers || []).map(h => ({
-        id: `cutting_${h.id}`,
-        name: `Lot ${h.Lot_Number} (${h.Garment_Type || h.Style || 'Cutting'})`,
-        category: 'Cutting',
-        brand: h.Brand || '',
-        style: h.Style || '',
-        lotNo: h.Lot_Number,
-        stock: h.Cutting_Qty || 0,
-        itemType: 'cutting'
-      }))
-    ];
-
-    dsaEngine.buildIndex(unifiedItems);
-    if (typeof global.gc === 'function') {
-      try { global.gc(); } catch (_) { }
-    }
-  } catch (err) {
-    console.warn('[DSA Engine Warmup Warning]', err.message);
-  }
-}
-
-// GET High-performance DSA Search (O(1) Hash Map + O(m) Trie + O(n log n) Sort)
+// ── Direct Database Search Routes (Zero In-Memory Overhead) ───────────────────
 app.get('/api/search/dsa', async (req, res) => {
   try {
-    const { query, category, location, minStock, maxStock, minCost, maxCost, sortBy, sortOrder, page, limit } = req.query;
-    if (!dsaEngine.isReady) {
-      await warmUpDSASearchEngine();
-    }
-    const results = dsaEngine.search({
-      query: query || '',
-      category: category || '',
-      location: location || '',
-      minStock: minStock !== undefined && minStock !== '' ? minStock : null,
-      maxStock: maxStock !== undefined && maxStock !== '' ? maxStock : null,
-      minCost: minCost !== undefined && minCost !== '' ? minCost : null,
-      maxCost: maxCost !== undefined && maxCost !== '' ? maxCost : null,
-      sortBy: sortBy || 'name',
-      sortOrder: sortOrder || 'asc',
-      page: page || 1,
-      limit: limit || 50
+    const t0 = performance.now();
+    const results = await searchDirectSql(req.query);
+    const elapsed = (performance.now() - t0).toFixed(2);
+    res.setHeader('X-Search-Execution-Time', `${elapsed}ms`);
+    res.status(200).json({
+      ...results,
+      searchTimeMs: Number(elapsed),
+      dsaMetrics: {
+        algorithm: 'Direct Database SQL Index Query',
+        spaceComplexity: '0 MB (Direct SQL)',
+        executionTime: `${elapsed}ms`
+      }
     });
-    res.setHeader('X-DSA-Execution-Time', `${results.searchTimeMs}ms`);
-    res.status(200).json(results);
   } catch (err) {
     console.error('API GET /api/search/dsa error:', err.message);
-    res.status(500).json({ error: 'DSA search failed.' });
+    res.status(500).json({ error: 'Search failed.' });
   }
 });
 
-// GET Trie Prefix Auto-Suggestions (O(m))
+// GET Direct SQL Auto-Suggestions
 app.get('/api/search/suggest', async (req, res) => {
   try {
     const { q, max } = req.query;
-    if (!dsaEngine.isReady) {
-      await warmUpDSASearchEngine();
-    }
-    const suggestions = dsaEngine.suggest(q || '', parseInt(max, 10) || 8);
-    res.status(200).json(suggestions);
+    const t0 = performance.now();
+    const suggestions = await getSearchSuggestionsSql(q || '', parseInt(max, 10) || 8);
+    const elapsed = (performance.now() - t0).toFixed(2);
+    res.status(200).json({
+      prefix: q || '',
+      suggestions,
+      executionTime: `${elapsed}ms`
+    });
   } catch (err) {
     console.error('API GET /api/search/suggest error:', err.message);
     res.status(500).json({ error: 'Auto-suggest failed.' });
   }
 });
 
-// GET DSA Engine Stats
+// GET Search Stats
 app.get('/api/search/stats', (req, res) => {
-  res.status(200).json(dsaEngine.getStats());
+  res.status(200).json({
+    engine: 'Direct SQL Database Query',
+    memoryFootprint: '0 MB',
+    status: 'OPTIMIZED'
+  });
 });
 
-// POST Trigger Re-Index
-app.post('/api/search/reindex', async (req, res) => {
-  try {
-    await warmUpDSASearchEngine();
-    res.status(200).json({ message: 'DSA Index successfully rebuilt.', stats: dsaEngine.getStats() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// POST Trigger Re-Index (No-op in SQL mode)
+app.post('/api/search/reindex', (req, res) => {
+  res.status(200).json({ message: 'Direct SQL mode is active; no in-memory re-index needed.' });
 });
 
 // ── Materials Routes ─────────────────────────────────────────────────────────
@@ -2307,7 +2258,6 @@ app.post('/api/materials', async (req, res) => {
   try {
     const m = req.body;
     await upsertMaterial(m);
-    dsaEngine.upsert({ ...m, itemType: 'material' });
     invalidateCache('materials_');
     res.status(201).json({ message: 'Material saved successfully.', material: m });
   } catch (err) {
@@ -2321,7 +2271,6 @@ app.put('/api/materials/:id', async (req, res) => {
   try {
     const m = { ...req.body, id: req.params.id };
     await upsertMaterial(m);
-    dsaEngine.upsert({ ...m, itemType: 'material' });
     invalidateCache('materials_');
     res.status(200).json({ message: 'Material updated successfully.' });
   } catch (err) {
@@ -2334,7 +2283,6 @@ app.put('/api/materials/:id', async (req, res) => {
 app.delete('/api/materials/:id', async (req, res) => {
   try {
     await deleteMaterial(req.params.id);
-    dsaEngine.remove(req.params.id);
     invalidateCache('materials_');
     res.status(200).json({ message: 'Material deleted successfully.' });
   } catch (err) {
