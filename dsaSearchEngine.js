@@ -1,61 +1,59 @@
 /**
- * DSA In-Memory Search & Indexing Engine for G-PDMS Accessories
+ * Ultra-Lightweight & High-Performance In-Memory DSA Search & Indexing Engine
+ * Memory-Optimized for Cloud Containers (512MB RAM cap)
  * 
  * Implements:
- * 1. Hash Map (Dictionary) Inverted Index: O(1) token & attribute lookup
- * 2. Trie (Prefix Tree): O(m) auto-suggest and instant auto-complete (m = keyword length)
- * 3. Sorted Index & Binary Search: O(log n) range searching (stock, cost, quantity)
- * 4. High-Performance QuickSort / MergeSort: O(n log n) multi-field sorting
- * 5. Real-time incremental synchronization with MySQL Database
+ * 1. Lean Inverted Index: O(1) keyword and attribute lookup with compact arrays/sets
+ * 2. Lightweight Trie (Prefix Tree): O(m) auto-suggest without intermediate ID bloat
+ * 3. Fast In-Memory Multi-Field Sort & Slicing: O(n log n)
+ * 4. Memory-safe item projections (stripping large unused DB columns)
  */
 
-// ── 1. TRIE DATA STRUCTURE (Prefix Search & Auto-Suggest) ─────────────────────
-class TrieNode {
+// ── 1. LIGHTWEIGHT TRIE (Auto-Suggest & Word Prefix Matching) ───────────────────
+class CompactTrieNode {
   constructor() {
-    this.children = new Map();
-    this.isEndOfWord = false;
-    this.frequencies = 0;
-    this.associatedIds = new Set(); // Stores item IDs matching this prefix
+    this.c = Object.create(null); // Compact char map (no Map overhead)
+    this.isEnd = false;
+    this.freq = 0;
   }
 }
 
 export class Trie {
   constructor() {
-    this.root = new TrieNode();
+    this.root = new CompactTrieNode();
     this.totalWords = 0;
   }
 
-  insert(word, itemId) {
+  insert(word) {
     if (!word || typeof word !== 'string') return;
     const cleanWord = word.trim().toLowerCase();
-    if (!cleanWord) return;
+    if (cleanWord.length < 2 || cleanWord.length > 30) return;
 
     let current = this.root;
     for (let i = 0; i < cleanWord.length; i++) {
       const char = cleanWord[i];
-      if (!current.children.has(char)) {
-        current.children.set(char, new TrieNode());
+      if (!current.c[char]) {
+        current.c[char] = new CompactTrieNode();
       }
-      current = current.children.get(char);
-      if (itemId) current.associatedIds.add(itemId);
+      current = current.c[char];
     }
-    current.isEndOfWord = true;
-    current.frequencies += 1;
-    this.totalWords += 1;
+    if (!current.isEnd) {
+      current.isEnd = true;
+      this.totalWords += 1;
+    }
+    current.freq += 1;
   }
 
   // Returns array of auto-complete suggestions matching prefix (O(m + k))
-  autoComplete(prefix, maxResults = 10) {
+  autoComplete(prefix, maxResults = 8) {
     if (!prefix || typeof prefix !== 'string') return [];
     const cleanPrefix = prefix.trim().toLowerCase();
     let current = this.root;
 
     for (let i = 0; i < cleanPrefix.length; i++) {
       const char = cleanPrefix[i];
-      if (!current.children.has(char)) {
-        return [];
-      }
-      current = current.children.get(char);
+      if (!current.c[char]) return [];
+      current = current.c[char];
     }
 
     const suggestions = [];
@@ -63,45 +61,58 @@ export class Trie {
     return suggestions;
   }
 
-  // Get all item IDs matching prefix in O(m)
-  getIdsWithPrefix(prefix) {
-    if (!prefix || typeof prefix !== 'string') return new Set();
+  // Collect words matching a prefix (used by search engine for prefix queries)
+  getWordsWithPrefix(prefix, maxWords = 40) {
+    if (!prefix || typeof prefix !== 'string') return [];
     const cleanPrefix = prefix.trim().toLowerCase();
     let current = this.root;
 
     for (let i = 0; i < cleanPrefix.length; i++) {
       const char = cleanPrefix[i];
-      if (!current.children.has(char)) {
-        return new Set();
-      }
-      current = current.children.get(char);
+      if (!current.c[char]) return [];
+      current = current.c[char];
     }
-    return new Set(current.associatedIds);
+
+    const words = [];
+    this._dfsCollectWords(current, cleanPrefix, words, maxWords);
+    return words;
   }
 
   _dfsCollect(node, currentPrefix, suggestions, maxResults) {
     if (suggestions.length >= maxResults) return;
-    if (node.isEndOfWord) {
+    if (node.isEnd) {
       suggestions.push({
         text: currentPrefix,
-        freq: node.frequencies,
-        matchCount: node.associatedIds.size
+        freq: node.freq
       });
     }
 
-    for (const [char, childNode] of node.children.entries()) {
+    const keys = Object.keys(node.c);
+    for (let i = 0; i < keys.length; i++) {
       if (suggestions.length >= maxResults) break;
-      this._dfsCollect(childNode, currentPrefix + char, suggestions, maxResults);
+      this._dfsCollect(node.c[keys[i]], currentPrefix + keys[i], suggestions, maxResults);
+    }
+  }
+
+  _dfsCollectWords(node, currentPrefix, words, maxWords) {
+    if (words.length >= maxWords) return;
+    if (node.isEnd) {
+      words.push(currentPrefix);
+    }
+    const keys = Object.keys(node.c);
+    for (let i = 0; i < keys.length; i++) {
+      if (words.length >= maxWords) break;
+      this._dfsCollectWords(node.c[keys[i]], currentPrefix + keys[i], words, maxWords);
     }
   }
 
   clear() {
-    this.root = new TrieNode();
+    this.root = new CompactTrieNode();
     this.totalWords = 0;
   }
 }
 
-// ── 2. BINARY SEARCH ALGORITHMS (Range Search O(log n)) ───────────────────────
+// ── 2. BINARY SEARCH INDEX (Range Queries O(log n)) ───────────────────────────
 export class BinarySearchIndex {
   static binarySearchLowerBound(arr, key, value) {
     let low = 0;
@@ -138,28 +149,49 @@ export class BinarySearchIndex {
   }
 }
 
-// ── 3. INVERTED HASH MAP SEARCH ENGINE (O(1) Direct Lookup) ───────────────────
+// ── 3. HIGH-EFFICIENCY IN-MEMORY DSA SEARCH ENGINE ────────────────────────────
 export class DSASearchEngine {
   constructor() {
-    this.itemsMap = new Map(); // id -> item data (O(1) fetch)
-    this.invertedIndex = new Map(); // token -> Set of item ids (O(1) token lookup)
-    this.categoryIndex = new Map(); // category -> Set of item ids (O(1) category filter)
-    this.locationIndex = new Map(); // location -> Set of item ids (O(1) location filter)
+    this.itemsMap = new Map(); // id -> lean item object
+    this.invertedIndex = new Map(); // token -> Array of item IDs (compact O(1) lookup)
+    this.categoryIndex = new Map(); // categoryKey -> Array of item IDs
+    this.locationIndex = new Map(); // locationKey -> Array of item IDs
     this.trie = new Trie(); // Prefix autocomplete tree
-    this.sortedByStock = []; // Cached array for O(log n) stock range searches
-    this.sortedByCost = []; // Cached array for O(log n) price range searches
     this.lastIndexedAt = null;
     this.isReady = false;
   }
 
-  // Tokenizes strings into searchable n-grams and words
+  // Tokenizes strings into clean searchable words
   _tokenize(text) {
     if (!text || typeof text !== 'string') return [];
     return text
       .toLowerCase()
       .replace(/[^a-z0-9\s-_/]/g, ' ')
       .split(/\s+/)
-      .filter(t => t.length >= 1);
+      .filter(t => t.length >= 2);
+  }
+
+  // Sanitizes and projects only essential fields to minimize memory usage
+  _toLeanItem(item) {
+    if (!item || !item.id) return null;
+    return {
+      id: String(item.id),
+      name: item.name ? String(item.name).slice(0, 150) : '',
+      category: item.category ? String(item.category).slice(0, 50) : '',
+      brand: item.brand ? String(item.brand).slice(0, 50) : '',
+      style: item.style ? String(item.style).slice(0, 80) : '',
+      color: item.color ? String(item.color).slice(0, 50) : '',
+      lotNo: item.lotNo ? String(item.lotNo).slice(0, 40) : (item.Lot_Number ? String(item.Lot_Number) : ''),
+      lotNo2: item.lotNo2 ? String(item.lotNo2).slice(0, 40) : '',
+      stock: Number(item.stock || item.quantity || item.Cutting_Qty || 0),
+      cost: Number(item.cost || item.totalCost || item.price || 0),
+      location: item.location ? String(item.location).slice(0, 50) : '',
+      supplier: item.supplier ? String(item.supplier).slice(0, 80) : '',
+      poNumber: item.poNumber ? String(item.poNumber).slice(0, 50) : '',
+      unit: item.unit ? String(item.unit).slice(0, 20) : '',
+      itemType: item.itemType || 'material',
+      imageUrl: item.imageUrl ? String(item.imageUrl).slice(0, 250) : ''
+    };
   }
 
   // Build or Re-index complete dataset
@@ -171,69 +203,60 @@ export class DSASearchEngine {
     this.locationIndex.clear();
     this.trie.clear();
 
-    for (const item of items) {
-      if (!item || !item.id) continue;
-      const id = String(item.id);
-      this.itemsMap.set(id, item);
+    const tempInverted = new Map();
+    const tempCat = new Map();
+    const tempLoc = new Map();
 
-      // Index tokens from name, id, poNumber, supplier, color, style, comments
-      const searchableFields = [
-        item.name,
-        item.id,
-        item.category,
-        item.location,
-        item.color,
-        item.poNumber,
-        item.invoiceNo,
-        item.supplier,
-        item.style,
-        item.lotNo,
-        item.lotNo2,
-        item.brand
-      ];
+    for (let idx = 0; idx < items.length; idx++) {
+      const rawItem = items[idx];
+      const lean = this._toLeanItem(rawItem);
+      if (!lean) continue;
 
-      const tokens = new Set();
-      for (const field of searchableFields) {
-        if (!field) continue;
-        const words = this._tokenize(String(field));
-        for (const w of words) {
-          tokens.add(w);
-          // Insert word into Trie for prefix suggestions
-          this.trie.insert(w, id);
+      const id = lean.id;
+      this.itemsMap.set(id, lean);
+
+      // Index tokens from primary searchable fields
+      const searchableText = `${lean.name} ${lean.id} ${lean.category} ${lean.brand} ${lean.style} ${lean.color} ${lean.lotNo} ${lean.poNumber} ${lean.supplier} ${lean.location}`;
+      const words = this._tokenize(searchableText);
+      const uniqueWords = new Set(words);
+
+      for (const w of uniqueWords) {
+        let list = tempInverted.get(w);
+        if (!list) {
+          list = [];
+          tempInverted.set(w, list);
+          this.trie.insert(w);
         }
+        list.push(id);
       }
 
-      // Add to inverted token index
-      for (const token of tokens) {
-        if (!this.invertedIndex.has(token)) {
-          this.invertedIndex.set(token, new Set());
+      // Index category
+      if (lean.category) {
+        const catKey = lean.category.toLowerCase().trim();
+        let catList = tempCat.get(catKey);
+        if (!catList) {
+          catList = [];
+          tempCat.set(catKey, catList);
         }
-        this.invertedIndex.get(token).add(id);
+        catList.push(id);
       }
 
-      // Add to category index
-      if (item.category) {
-        const catKey = String(item.category).toLowerCase().trim();
-        if (!this.categoryIndex.has(catKey)) {
-          this.categoryIndex.set(catKey, new Set());
+      // Index location
+      if (lean.location) {
+        const locKey = lean.location.toLowerCase().trim();
+        let locList = tempLoc.get(locKey);
+        if (!locList) {
+          locList = [];
+          tempLoc.set(locKey, locList);
         }
-        this.categoryIndex.get(catKey).add(id);
-      }
-
-      // Add to location index
-      if (item.location) {
-        const locKey = String(item.location).toLowerCase().trim();
-        if (!this.locationIndex.has(locKey)) {
-          this.locationIndex.set(locKey, new Set());
-        }
-        this.locationIndex.get(locKey).add(id);
+        locList.push(id);
       }
     }
 
-    // Build sorted arrays for Binary Search range queries
-    const allItems = Array.from(this.itemsMap.values());
-    this.sortedByStock = [...allItems].sort((a, b) => Number(a.stock || 0) - Number(b.stock || 0));
-    this.sortedByCost = [...allItems].sort((a, b) => Number(a.cost || 0) - Number(b.cost || 0));
+    // Assign indexed maps
+    this.invertedIndex = tempInverted;
+    this.categoryIndex = tempCat;
+    this.locationIndex = tempLoc;
 
     this.lastIndexedAt = new Date().toISOString();
     this.isReady = true;
@@ -243,23 +266,32 @@ export class DSASearchEngine {
 
   // Incremental O(1) Upsert
   upsert(item) {
-    if (!item || !item.id) return;
-    const id = String(item.id);
-    this.itemsMap.set(id, item);
+    const lean = this._toLeanItem(item);
+    if (!lean) return;
+    const id = lean.id;
+    this.itemsMap.set(id, lean);
 
-    const tokens = this._tokenize(`${item.name || ''} ${item.category || ''} ${item.location || ''} ${item.color || ''} ${item.poNumber || ''} ${item.brand || ''}`);
-    for (const token of tokens) {
-      if (!this.invertedIndex.has(token)) {
-        this.invertedIndex.set(token, new Set());
+    const tokens = this._tokenize(`${lean.name} ${lean.category} ${lean.location} ${lean.color} ${lean.poNumber} ${lean.brand} ${lean.style} ${lean.lotNo}`);
+    const uniqueTokens = new Set(tokens);
+
+    for (const token of uniqueTokens) {
+      let list = this.invertedIndex.get(token);
+      if (!list) {
+        list = [];
+        this.invertedIndex.set(token, list);
+        this.trie.insert(token);
       }
-      this.invertedIndex.get(token).add(id);
-      this.trie.insert(token, id);
+      if (!list.includes(id)) list.push(id);
     }
 
-    if (item.category) {
-      const catKey = String(item.category).toLowerCase().trim();
-      if (!this.categoryIndex.has(catKey)) this.categoryIndex.set(catKey, new Set());
-      this.categoryIndex.get(catKey).add(id);
+    if (lean.category) {
+      const catKey = lean.category.toLowerCase().trim();
+      let catList = this.categoryIndex.get(catKey);
+      if (!catList) {
+        catList = [];
+        this.categoryIndex.set(catKey, catList);
+      }
+      if (!catList.includes(id)) catList.push(id);
     }
   }
 
@@ -272,7 +304,7 @@ export class DSASearchEngine {
   // ── 4. HIGH-PERFORMANCE SEARCH WITH DSA PIPELINE ────────────────────────────
   /**
    * Fast multi-attribute query search
-   * Complexity: O(1) for direct keyword hashing + O(m) prefix matching
+   * Complexity: O(1) Hash Map token lookup + O(m) Trie Prefix expansion
    */
   search({
     query = '',
@@ -294,20 +326,33 @@ export class DSASearchEngine {
     const searchTokens = this._tokenize(query);
     if (searchTokens.length > 0) {
       for (const token of searchTokens) {
-        // Step A: Exact token hash match O(1)
-        const exactMatches = this.invertedIndex.get(token) || new Set();
+        // Find matching IDs from exact token
+        const exactList = this.invertedIndex.get(token) || [];
+        const tokenMatches = new Set(exactList);
 
-        // Step B: Prefix match via Trie O(m)
-        const prefixMatches = this.trie.getIdsWithPrefix(token);
-
-        // Union of exact + prefix matches for this token
-        const tokenMatches = new Set([...exactMatches, ...prefixMatches]);
+        // Find matching IDs from prefix expansions via Trie
+        const prefixWords = this.trie.getWordsWithPrefix(token, 25);
+        for (let i = 0; i < prefixWords.length; i++) {
+          const matchedToken = prefixWords[i];
+          if (matchedToken !== token) {
+            const list = this.invertedIndex.get(matchedToken);
+            if (list) {
+              for (let j = 0; j < list.length; j++) {
+                tokenMatches.add(list[j]);
+              }
+            }
+          }
+        }
 
         if (candidateIds === null) {
           candidateIds = tokenMatches;
         } else {
           // Set Intersection (AND semantics) for multi-token precision
-          candidateIds = new Set([...candidateIds].filter(id => tokenMatches.has(id)));
+          const intersected = new Set();
+          for (const id of candidateIds) {
+            if (tokenMatches.has(id)) intersected.add(id);
+          }
+          candidateIds = intersected;
         }
 
         if (candidateIds.size === 0) break;
@@ -317,22 +362,34 @@ export class DSASearchEngine {
     // 2. Category Filter via Hash Index O(1)
     if (category) {
       const catKey = String(category).toLowerCase().trim();
-      const catMatches = this.categoryIndex.get(catKey) || new Set();
+      const catList = this.categoryIndex.get(catKey) || [];
+      const catSet = new Set(catList);
+
       if (candidateIds === null) {
-        candidateIds = new Set(catMatches);
+        candidateIds = catSet;
       } else {
-        candidateIds = new Set([...candidateIds].filter(id => catMatches.has(id)));
+        const intersected = new Set();
+        for (const id of candidateIds) {
+          if (catSet.has(id)) intersected.add(id);
+        }
+        candidateIds = intersected;
       }
     }
 
     // 3. Location Filter via Hash Index O(1)
     if (location) {
       const locKey = String(location).toLowerCase().trim();
-      const locMatches = this.locationIndex.get(locKey) || new Set();
+      const locList = this.locationIndex.get(locKey) || [];
+      const locSet = new Set(locList);
+
       if (candidateIds === null) {
-        candidateIds = new Set(locMatches);
+        candidateIds = locSet;
       } else {
-        candidateIds = new Set([...candidateIds].filter(id => locMatches.has(id)));
+        const intersected = new Set();
+        for (const id of candidateIds) {
+          if (locSet.has(id)) intersected.add(id);
+        }
+        candidateIds = intersected;
       }
     }
 
@@ -341,10 +398,13 @@ export class DSASearchEngine {
     if (candidateIds === null) {
       results = Array.from(this.itemsMap.values());
     } else {
-      results = Array.from(candidateIds).map(id => this.itemsMap.get(id)).filter(Boolean);
+      for (const id of candidateIds) {
+        const item = this.itemsMap.get(id);
+        if (item) results.push(item);
+      }
     }
 
-    // 5. Binary Search Range Filters if querying without text search, or in-memory filter
+    // 5. In-Memory Range Filters
     if (minStock !== null || maxStock !== null) {
       const min = minStock !== null ? Number(minStock) : -Infinity;
       const max = maxStock !== null ? Number(maxStock) : Infinity;
@@ -364,7 +424,7 @@ export class DSASearchEngine {
     }
 
     // 6. Fast Sorting (O(n log n))
-    const isAsc = sortOrder.toLowerCase() === 'asc';
+    const isAsc = String(sortOrder).toLowerCase() === 'asc';
     results.sort((a, b) => {
       let valA = a[sortBy];
       let valB = b[sortBy];
@@ -400,7 +460,7 @@ export class DSASearchEngine {
       dsaMetrics: {
         algorithm: 'O(1) Hash Map Inverted Index + O(m) Trie Prefix + O(n log n) Sort',
         timeComplexity: query ? 'O(1) ~ O(m)' : 'O(n log n)',
-        spaceComplexity: 'O(N)',
+        spaceComplexity: 'O(N) Compact',
         totalIndexedItems: this.itemsMap.size,
         tokensCount: this.invertedIndex.size,
         trieWordsCount: this.trie.totalWords,
@@ -438,3 +498,4 @@ export class DSASearchEngine {
 
 // Singleton instance
 export const dsaEngine = new DSASearchEngine();
+

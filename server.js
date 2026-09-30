@@ -45,6 +45,8 @@ import {
   createScanEntry,
   getAllScans,
   getAllCuttingHeaders,
+  getSearchableDesigns,
+  getSearchableCuttingHeaders,
   getAllDooriOrders,
   updateCuttingHeaderPayload,
   updateDooriPayload,
@@ -290,8 +292,8 @@ app.get('/api/metrics', (req, res) => {
   res.status(200).json(metricsTracker.getMetrics());
 });
 
-// ── In-Memory LRU Micro-Cache (Max 1,000 items, O(1) eviction) ───────────────
-const MAX_CACHE_ENTRIES = 1000;
+// ── In-Memory LRU Micro-Cache (Max 150 items, O(1) eviction for low-RAM containers) ───────────────
+const MAX_CACHE_ENTRIES = 150;
 const memoryCache = new Map();
 let cacheHits = 0;
 let cacheMisses = 0;
@@ -2182,8 +2184,8 @@ app.get('/api/design-history', async (req, res) => {
 export async function warmUpDSASearchEngine() {
   try {
     const materials = await getAllMaterials();
-    const designs = await getAllDesigns();
-    const headers = await getAllCuttingHeaders();
+    const designs = await getSearchableDesigns();
+    const headers = await getSearchableCuttingHeaders();
 
     const unifiedItems = [
       ...(materials || []).map(m => ({ ...m, itemType: 'material' })),
@@ -2212,6 +2214,9 @@ export async function warmUpDSASearchEngine() {
     ];
 
     dsaEngine.buildIndex(unifiedItems);
+    if (typeof global.gc === 'function') {
+      try { global.gc(); } catch (_) { }
+    }
   } catch (err) {
     console.warn('[DSA Engine Warmup Warning]', err.message);
   }

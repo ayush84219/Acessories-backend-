@@ -1231,6 +1231,11 @@ export const getAllDesigns = async () => {
   return rows;
 };
 
+export const getSearchableDesigns = async () => {
+  const [rows] = await pool.execute('SELECT id, name, lotNo2, brand, category, style, colorCode, quantity, totalCost, imageUrl FROM designs');
+  return rows;
+};
+
 export const getDesignById = async (id) => {
   const [rows] = await pool.execute('SELECT * FROM designs WHERE id = ?', [id]);
   return rows[0] || null;
@@ -2066,6 +2071,11 @@ export const getAllScans = async () => {
 
 export const getAllCuttingHeaders = async () => {
   const [rows] = await pool.execute('SELECT * FROM cutting_header ORDER BY Saved_At DESC');
+  return rows;
+};
+
+export const getSearchableCuttingHeaders = async () => {
+  const [rows] = await pool.execute('SELECT id, Lot_Number, Garment_Type, Style, Brand, Cutting_Qty FROM cutting_header ORDER BY id DESC');
   return rows;
 };
 

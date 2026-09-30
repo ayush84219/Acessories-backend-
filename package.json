@@ -5,8 +5,8 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node --max-old-space-size=384 --expose-gc server.js",
+    "dev": "node --max-old-space-size=384 --watch server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
