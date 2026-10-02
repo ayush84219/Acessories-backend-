@@ -471,8 +471,12 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     preparedBy           VARCHAR(255) DEFAULT '',
     authorizedBy         VARCHAR(255) DEFAULT '',
     remarks              TEXT,
+    entries              LONGTEXT,
+    status               VARCHAR(50) DEFAULT 'Dispatched',
     createdAt            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
+  try { await pool.execute(`ALTER TABLE rgp ADD COLUMN entries LONGTEXT`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE rgp ADD COLUMN status VARCHAR(50) DEFAULT 'Dispatched'`); } catch (_) { }
 
   // Weight Capture Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS weight_capture (
@@ -2111,9 +2115,46 @@ export const createScanEntry = async (scan) => {
        WHERE id = (SELECT max_id FROM (SELECT MAX(id) as max_id FROM zip WHERE LOWER(Lot_Number) = LOWER(?)) AS sub)`,
       [scan.supplier_name, now, lotNo]
     ).catch(() => { });
+  } else if (scan.scan_type === 'rgp_entry') {
+    // Outward gate pass issue
+    await pool.execute(
+      `UPDATE rgp SET status = 'Dispatched' WHERE LOWER(rgpNo) = LOWER(?)`,
+      [lotNo]
+    ).catch(() => { });
+  } else if (scan.scan_type === 'rgp_return') {
+    // Inward gate pass return
+    await pool.execute(
+      `UPDATE rgp SET status = 'Returned' WHERE LOWER(rgpNo) = LOWER(?)`,
+      [lotNo]
+    ).catch(() => { });
   }
 };
 
+export const getDooriByLotOrPo = async (query) => {
+  const q = String(query || '').trim();
+  const [rows] = await pool.execute(
+    'SELECT * FROM doori WHERE LOWER(Lot_Number) = LOWER(?) OR LOWER(po_number) = LOWER(?) ORDER BY id DESC LIMIT 1',
+    [q, q]
+  );
+  return rows[0] || null;
+};
+
+export const getZipByLotOrPo = async (query) => {
+  const q = String(query || '').trim();
+  // 1. Check zip table
+  const [zipRows] = await pool.execute(
+    'SELECT * FROM zip WHERE LOWER(Lot_Number) = LOWER(?) OR LOWER(po_number) = LOWER(?) ORDER BY id DESC LIMIT 1',
+    [q, q]
+  );
+  if (zipRows.length > 0) return zipRows[0];
+
+  // 2. Check cutting_header table
+  const [chRows] = await pool.execute(
+    'SELECT * FROM cutting_header WHERE LOWER(Lot_Number) = LOWER(?) ORDER BY id DESC LIMIT 1',
+    [q]
+  );
+  return chRows[0] || null;
+};
 
 export const getAllScans = async () => {
   const [rows] = await pool.execute('SELECT * FROM scans ORDER BY scanned_at DESC');
@@ -2438,12 +2479,30 @@ export const getRgpByNo = async (rgpNo) => {
   );
   if (rows.length === 0) return null;
   const r = rows[0];
-  return { ...r, entries: r.entries ? JSON.parse(r.entries) : [] };
+  let entries = [];
+  if (r.entries) {
+    try {
+      entries = typeof r.entries === 'string' ? JSON.parse(r.entries) : r.entries;
+    } catch (_) {
+      entries = [];
+    }
+  }
+  return { ...r, entries };
 };
 
 export const getAllRgps = async () => {
   const [rows] = await pool.execute('SELECT * FROM rgp ORDER BY id DESC');
-  return rows.map(r => ({ ...r, entries: r.entries ? JSON.parse(r.entries) : [] }));
+  return rows.map(r => {
+    let entries = [];
+    if (r.entries) {
+      try {
+        entries = typeof r.entries === 'string' ? JSON.parse(r.entries) : r.entries;
+      } catch (_) {
+        entries = [];
+      }
+    }
+    return { ...r, entries };
+  });
 };
 
 export const ensureCuttingSchema = async () => {

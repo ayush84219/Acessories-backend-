@@ -50,6 +50,8 @@ import {
   getSearchableDesigns,
   getSearchableCuttingHeaders,
   getAllDooriOrders,
+  getDooriByLotOrPo,
+  getZipByLotOrPo,
   updateCuttingHeaderPayload,
   updateDooriPayload,
   duplicateCuttingHeader,
@@ -3128,48 +3130,162 @@ app.get('/api/rgp/:rgpNo', async (req, res) => {
   }
 });
 
-// GET design by ID publicly (for barcode scanner form prefilling)
+// GET design/PO/RGP/Dori/Zip by ID publicly (for barcode scanner form prefilling)
 app.get('/api/public/lot/:lotNo', async (req, res) => {
   try {
-    const lotNo = req.params.lotNo;
-    const design = await getDesignById(lotNo);
-    if (!design) {
-      // Check if it is a Purchase Order
-      const po = await getPOByNumberOrId(lotNo);
-      if (po) {
-        const totalQty = po.items.reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
-        return res.status(200).json({
-          id: po.poNumber,
-          name: po.designName || 'Purchase Order',
-          bom: po.items.map(item => ({
-            name: item.name,
-            description: item.name,
-            status: 'Yes',
-            detail: String(item.qty)
-          })),
-          brand: po.vendorName,
-          category: po.designCategory || 'N/A',
-          style: po.poNumber,
-          quantity: totalQty,
-          date: po.date
-        });
-      }
-      return res.status(404).json({ error: `Design Lot or PO ${lotNo} not found in database.` });
+    const rawLotNo = req.params.lotNo;
+    const lotNo = String(rawLotNo || '').trim();
+    if (!lotNo) {
+      return res.status(400).json({ error: 'Lot/PO number is required.' });
     }
-    res.status(200).json({
-      id: design.id,
-      name: design.name,
-      bom: typeof design.bom === 'string' ? JSON.parse(design.bom) : design.bom,
-      brand: design.brand,
-      category: design.category,
-      style: design.style,
-      quantity: design.quantity,
-      date: design.date,
-      status: design.status
-    });
+
+    // 1. Check Standard Design by Lot ID
+    const design = await getDesignById(lotNo);
+    if (design) {
+      return res.status(200).json({
+        id: design.id,
+        name: design.name,
+        bom: typeof design.bom === 'string' ? JSON.parse(design.bom) : (design.bom || []),
+        brand: design.brand,
+        category: design.category,
+        style: design.style,
+        quantity: design.quantity,
+        date: design.date,
+        status: design.status,
+        type: 'design'
+      });
+    }
+
+    // 2. Check Purchase Order (PO)
+    const po = await getPOByNumberOrId(lotNo);
+    if (po) {
+      const totalQty = (po.items || []).reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
+      return res.status(200).json({
+        id: po.poNumber,
+        name: po.designName || 'Purchase Order',
+        bom: (po.items || []).map(item => ({
+          name: item.name,
+          description: item.name,
+          status: 'Yes',
+          detail: String(item.qty || 0)
+        })),
+        brand: po.vendorName,
+        category: po.designCategory || 'Purchase Order',
+        style: po.poNumber,
+        quantity: totalQty,
+        date: po.date,
+        type: 'po'
+      });
+    }
+
+    // 3. Check Returnable Gate Pass (RGP)
+    const rgp = await getRgpByNo(lotNo);
+    if (rgp) {
+      let parsedEntries = [];
+      try {
+        if (Array.isArray(rgp.entries)) parsedEntries = rgp.entries;
+        else if (typeof rgp.entries === 'string') parsedEntries = JSON.parse(rgp.entries);
+      } catch (_) { parsedEntries = []; }
+      const totalQty = parsedEntries.reduce((sum, e) => sum + (parseFloat(e.qty1) || 0), 0);
+      return res.status(200).json({
+        id: rgp.rgpNo,
+        name: `RGP: ${rgp.rgpType || 'Gate Pass'}`,
+        bom: parsedEntries.map(e => ({
+          name: e.itemDesc || `${rgp.rgpType} - Lot ${e.lotNo || ''}`,
+          description: e.itemDesc || `${rgp.rgpType} (${e.lotNo || ''})`,
+          status: 'Yes',
+          detail: String(e.qty1 || 0)
+        })),
+        brand: rgp.vendor,
+        category: rgp.department || 'Gate Pass',
+        style: rgp.rgpNo,
+        quantity: totalQty > 0 ? totalQty : 1,
+        date: rgp.date,
+        status: rgp.status || 'Dispatched',
+        type: 'rgp'
+      });
+    }
+
+    // 4. Check Dori Order (Doori)
+    const dori = await getDooriByLotOrPo(lotNo);
+    if (dori) {
+      let doriMaterials = [];
+      try {
+        if (dori.Dori_Selections) {
+          const parsed = typeof dori.Dori_Selections === 'string' ? JSON.parse(dori.Dori_Selections) : dori.Dori_Selections;
+          if (Array.isArray(parsed)) {
+            doriMaterials = parsed.map(d => ({
+              name: `Dori: ${d.shade || d.color || d.type || 'Custom'} (${d.size || ''})`,
+              description: `Dori ${d.shade || d.color || ''}`,
+              status: 'Yes',
+              detail: String(d.qty || d.quantity || dori.Total_Pieces || 0)
+            }));
+          }
+        }
+      } catch (_) {}
+      if (doriMaterials.length === 0) {
+        doriMaterials = [{
+          name: `Dori (${dori.Garment_Type || 'Garment'} - ${dori.Style || ''})`,
+          description: `Dori Material`,
+          status: 'Yes',
+          detail: String(dori.Total_Pieces || 0)
+        }];
+      }
+      return res.status(200).json({
+        id: dori.po_number || dori.Lot_Number,
+        name: `Dori PO - ${dori.Style || dori.Garment_Type || 'Dori'}`,
+        bom: doriMaterials,
+        brand: dori.Supplier_Name || 'Dori Supplier',
+        category: 'Dori / Drawstring',
+        style: dori.Style || '',
+        quantity: dori.Total_Pieces || 0,
+        date: dori.Issue_Date || dori.Timestamp,
+        type: 'dori'
+      });
+    }
+
+    // 5. Check Zip Order / Cutting Header
+    const zip = await getZipByLotOrPo(lotNo);
+    if (zip) {
+      let zipMaterials = [];
+      try {
+        if (zip.Zip_Selections) {
+          const parsed = typeof zip.Zip_Selections === 'string' ? JSON.parse(zip.Zip_Selections) : zip.Zip_Selections;
+          if (Array.isArray(parsed)) {
+            zipMaterials = parsed.map(z => ({
+              name: `Zip: ${z.color || z.shade || z.type || 'Standard'} (${z.size || z.inch || ''}")`,
+              description: `Zip ${z.color || ''}`,
+              status: 'Yes',
+              detail: String(z.qty || z.quantity || zip.Total_Pieces || zip.Cutting_Qty || 0)
+            }));
+          }
+        }
+      } catch (_) {}
+      if (zipMaterials.length === 0) {
+        zipMaterials = [{
+          name: `Zip (${zip.Garment_Type || 'Garment'} - ${zip.Style || ''})`,
+          description: `Zip Material`,
+          status: 'Yes',
+          detail: String(zip.Total_Pieces || zip.Cutting_Qty || 0)
+        }];
+      }
+      return res.status(200).json({
+        id: zip.po_number || zip.Lot_Number,
+        name: `Zip PO - ${zip.Style || zip.Garment_Type || 'Zip'}`,
+        bom: zipMaterials,
+        brand: zip.Supplier_Name || zip.Brand || 'Zip Supplier',
+        category: 'Zip / Fasteners',
+        style: zip.Style || '',
+        quantity: zip.Total_Pieces || zip.Cutting_Qty || 0,
+        date: zip.Issue_Date || zip.JobOrder_Date || zip.Saved_At,
+        type: 'zip'
+      });
+    }
+
+    return res.status(404).json({ error: `Record with Lot/PO/RGP number "${lotNo}" not found in database.` });
   } catch (err) {
     console.error('API GET /api/public/lot/:lotNo error:', err.stack);
-    res.status(500).json({ error: 'Failed to retrieve public design/PO info.' });
+    res.status(500).json({ error: 'Failed to retrieve public design/PO/RGP info.' });
   }
 });
 
