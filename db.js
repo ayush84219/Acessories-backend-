@@ -2787,12 +2787,12 @@ export const getMaterialTraceability = async (query = '') => {
 
     // Compute Packet-Level Breakdown with Barcodes
     const totalPackets = Math.max(1, Number(m.packets) || totalInwardPackets || 1);
-    const primaryBarcodeBase = (relatedCaptures[0]?.barcodeId) || `${matId}-A${String(totalPackets).padStart(2, '0')}`;
+    const primaryBarcodeBase = matId;
     const packetList = [];
     const pcsPerPkt = totalPackets > 0 ? Math.round((Number(m.stock) || 0) / totalPackets) : (Number(m.stock) || 0);
 
     for (let pIdx = 1; pIdx <= totalPackets; pIdx++) {
-      const packetBarcode = `${matId}-PKT${String(pIdx).padStart(3, '0')}`;
+      const packetBarcode = matId;
       packetList.push({
         packetNo: pIdx,
         totalPackets,
