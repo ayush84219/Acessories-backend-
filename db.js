@@ -714,6 +714,31 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     capacity    INT DEFAULT 20
   )`);
 
+  // Dedicated Lot Operations Summary Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS lot_operations_summary (
+    id                      INT AUTO_INCREMENT PRIMARY KEY,
+    lot_number              VARCHAR(100) NOT NULL UNIQUE,
+    style                   VARCHAR(150) DEFAULT '',
+    brand                   VARCHAR(150) DEFAULT '',
+    fabric_type             VARCHAR(150) DEFAULT '',
+    target_pcs              INT DEFAULT 0,
+    rgp_count               INT DEFAULT 0,
+    dori_count              INT DEFAULT 0,
+    zip_count               INT DEFAULT 0,
+    po_count                INT DEFAULT 0,
+    extra_pieces_count      INT DEFAULT 0,
+    scan_count              INT DEFAULT 0,
+    total_rgp_pcs           INT DEFAULT 0,
+    total_rgp_returned_pcs  INT DEFAULT 0,
+    total_received_pcs      INT DEFAULT 0,
+    vendors_summary         TEXT,
+    materials_summary       TEXT,
+    process_status          VARCHAR(100) DEFAULT 'In Progress',
+    is_completed            TINYINT(1) DEFAULT 0,
+    summary_json            LONGTEXT,
+    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+
   // Auto-sync warehouse_locations from configured warehouse_racks settings if custom racks exist
   try {
     const [hallSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_halls']);

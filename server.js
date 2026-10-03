@@ -2024,6 +2024,454 @@ app.get('/api/reports/undesigned-cutting-lots', async (req, res) => {
   }
 });
 
+// 7.2.1 Consolidated Lot-Wise Operations & Process Summary Report
+app.get('/api/reports/lot-wise-summary', async (req, res) => {
+  try {
+    const [
+      cuttingRows,
+      designRows,
+      rgpRows,
+      dooriRows,
+      zipRows,
+      poRows,
+      extraRows,
+      issueRows,
+      scanRows,
+      weightRows
+    ] = await Promise.all([
+      pool.execute('SELECT * FROM cutting_header').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM designs').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM rgp ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM doori ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM zip ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM purchase_orders ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM extra_material_issues ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM issue_logs ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM scans ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM weight_capture ORDER BY id DESC').then(r => r[0]).catch(() => [])
+    ]);
+
+    // Parse RGP entries safely
+    const parsedRgps = rgpRows.map(r => {
+      let entries = [];
+      try {
+        if (Array.isArray(r.entries)) entries = r.entries;
+        else if (typeof r.entries === 'string') entries = JSON.parse(r.entries || '[]');
+      } catch (_) { entries = []; }
+      return { ...r, parsedEntries: entries };
+    });
+
+    // Collect all unique lot numbers across all modules
+    const lotMap = new Map();
+
+    const getOrCreateLot = (rawLot) => {
+      if (!rawLot) return null;
+      const cleanLot = String(rawLot).trim();
+      if (!cleanLot || cleanLot.toLowerCase() === 'manual' || cleanLot.toLowerCase() === 'general') return null;
+      const key = cleanLot.toLowerCase();
+      if (!lotMap.has(key)) {
+        lotMap.set(key, {
+          lotNo: cleanLot,
+          style: '',
+          brand: '',
+          fabricType: '',
+          targetPieces: 0,
+          isRecreated: cleanLot.includes('-V'),
+          rgps: [],
+          dooriOrders: [],
+          zipOrders: [],
+          pos: [],
+          extraIssues: [],
+          issueLogs: [],
+          scans: [],
+          weightCaptures: [],
+          vendors: new Set(),
+          materials: []
+        });
+      }
+      return lotMap.get(key);
+    };
+
+    // 1. Process Cutting Lots & Designs
+    cuttingRows.forEach(c => {
+      const lot = getOrCreateLot(c.Lot_No);
+      if (lot) {
+        lot.style = lot.style || c.Style || '';
+        lot.brand = lot.brand || c.Brand || '';
+        lot.fabricType = lot.fabricType || c.Fabric_Type || '';
+        lot.targetPieces = lot.targetPieces || parseInt(c.Total_Pcs) || 0;
+      }
+    });
+
+    designRows.forEach(d => {
+      const lot = getOrCreateLot(d.id);
+      if (lot) {
+        lot.style = lot.style || d.style || '';
+        lot.brand = lot.brand || d.brand || '';
+        lot.fabricType = lot.fabricType || d.fabricType || '';
+        lot.targetPieces = lot.targetPieces || parseInt(d.quantity) || 0;
+      }
+    });
+
+    // 2. Process RGPs (entries contain lot numbers, and rgpNo itself could be a lot reference)
+    parsedRgps.forEach(r => {
+      const seenLotsForRgp = new Set();
+      if (Array.isArray(r.parsedEntries) && r.parsedEntries.length > 0) {
+        r.parsedEntries.forEach(entry => {
+          const entryLot = entry.lotNo || entry.lot_no || r.rgpNo;
+          const lot = getOrCreateLot(entryLot);
+          if (lot && !seenLotsForRgp.has(lot.lotNo.toLowerCase())) {
+            seenLotsForRgp.add(lot.lotNo.toLowerCase());
+            lot.rgps.push(r);
+            if (r.vendor) lot.vendors.add(r.vendor);
+          }
+        });
+      } else {
+        const lot = getOrCreateLot(r.rgpNo);
+        if (lot) {
+          lot.rgps.push(r);
+          if (r.vendor) lot.vendors.add(r.vendor);
+        }
+      }
+    });
+
+    // 3. Process Dori Orders
+    dooriRows.forEach(d => {
+      const lot = getOrCreateLot(d.Lot_Number);
+      if (lot) {
+        lot.dooriOrders.push(d);
+        if (d.Supplier_Name || d.Supplier) lot.vendors.add(d.Supplier_Name || d.Supplier);
+        lot.style = lot.style || d.Style || '';
+      }
+    });
+
+    // 4. Process Zip Orders
+    zipRows.forEach(z => {
+      const lot = getOrCreateLot(z.Lot_Number);
+      if (lot) {
+        lot.zipOrders.push(z);
+        if (z.Supplier_Name || z.Supplier) lot.vendors.add(z.Supplier_Name || z.Supplier);
+        lot.style = lot.style || z.Style || z.ch_style || '';
+      }
+    });
+
+    // 5. Process Purchase Orders
+    poRows.forEach(p => {
+      const lot = getOrCreateLot(p.designName || p.lotId);
+      if (lot) {
+        lot.pos.push(p);
+        if (p.vendorName) lot.vendors.add(p.vendorName);
+      }
+    });
+
+    // 6. Process Extra Material Issues
+    extraRows.forEach(ex => {
+      const lot = getOrCreateLot(ex.lot_no || ex.lot_id || ex.lotId);
+      if (lot) {
+        lot.extraIssues.push(ex);
+        lot.style = lot.style || ex.style || '';
+        lot.brand = lot.brand || ex.brand || '';
+      }
+    });
+
+    // 7. Process Issue Logs
+    issueRows.forEach(il => {
+      const lot = getOrCreateLot(il.lotId || il.lot_no);
+      if (lot) {
+        lot.issueLogs.push(il);
+      }
+    });
+
+    // 8. Process Scans
+    scanRows.forEach(s => {
+      const lot = getOrCreateLot(s.lot_number);
+      if (lot) {
+        lot.scans.push(s);
+        if (s.supplier_name) lot.vendors.add(s.supplier_name);
+      }
+    });
+
+    // Also match scans against RGP numbers for lots that have those RGPs
+    lotMap.forEach(lot => {
+      const rgpNos = new Set(lot.rgps.map(r => String(r.rgpNo).toLowerCase()));
+      scanRows.forEach(s => {
+        const scanLot = String(s.lot_number || '').trim().toLowerCase();
+        if (rgpNos.has(scanLot) && !lot.scans.some(existing => existing.id === s.id)) {
+          lot.scans.push(s);
+        }
+      });
+    });
+
+    // 9. Process Weight Captures
+    weightRows.forEach(w => {
+      const lot = getOrCreateLot(w.lotNo || w.lot_no);
+      if (lot) {
+        lot.weightCaptures.push(w);
+      }
+    });
+
+    // Build finalized summaries and completeness calculations
+    const summaryList = [];
+
+    for (const lot of lotMap.values()) {
+      // Calculate totals
+      let totalRgpPcs = 0;
+      let totalRgpReturnedPcs = 0;
+      let allRgpsReturned = true;
+
+      lot.rgps.forEach(r => {
+        const entries = r.parsedEntries || [];
+        const qty1 = entries.reduce((sum, e) => {
+          if (!e.lotNo || String(e.lotNo).toLowerCase() === lot.lotNo.toLowerCase()) {
+            return sum + (parseFloat(e.qty1) || 0);
+          }
+          return sum;
+        }, 0) || (parseFloat(r.qty) || 0);
+
+        totalRgpPcs += qty1;
+
+        // Check return scan
+        const isReturned = (r.status || '').toLowerCase() === 'returned' || lot.scans.some(s => 
+          (s.scan_type === 'rgp_return') && 
+          (String(s.lot_number).toLowerCase() === String(r.rgpNo).toLowerCase() || String(s.lot_number).toLowerCase() === lot.lotNo.toLowerCase())
+        );
+
+        if (isReturned) {
+          totalRgpReturnedPcs += qty1;
+        } else {
+          allRgpsReturned = false;
+        }
+      });
+
+      const totalDoriPcs = lot.dooriOrders.reduce((sum, d) => sum + (parseInt(d.Total_Pieces) || 0), 0);
+      const totalZipPcs = lot.zipOrders.reduce((sum, z) => sum + (parseInt(z.Total_Pieces_CH || z.Total_Pieces) || 0), 0);
+      const totalPoPcs = lot.pos.reduce((sum, p) => {
+        let itms = [];
+        try { itms = typeof p.items === 'string' ? JSON.parse(p.items) : (p.items || []); } catch (_) {}
+        return sum + itms.reduce((s, it) => s + (parseFloat(it.qty) || 0), 0);
+      }, 0);
+
+      const totalExtraPcs = lot.extraIssues.reduce((sum, ex) => {
+        let itms = [];
+        try { itms = Array.isArray(ex.items) ? ex.items : (typeof ex.items === 'string' ? JSON.parse(ex.items) : []); } catch (_) {}
+        return sum + (itms.reduce((s, it) => s + (parseFloat(it.totalRequired || it.qty || it.extraQty) || 0), 0) || parseFloat(ex.pieces) || 0);
+      }, 0);
+
+      // Scanners analysis
+      const gateEntryScans = lot.scans.filter(s => s.scan_type === 'gate_entry' || s.scan_type === 'supplier_entry');
+      const materialInScans = lot.scans.filter(s => s.scan_type === 'material_in');
+      const rgpOutScans = lot.scans.filter(s => s.scan_type === 'rgp_entry');
+      const rgpInScans = lot.scans.filter(s => s.scan_type === 'rgp_return');
+      const printingScans = lot.scans.filter(s => s.scan_type === 'printing_gate_out');
+
+      const totalReceivedPcs = materialInScans.reduce((sum, s) => sum + (parseFloat(s.quantity) || 0), 0);
+      const totalGateScannedPcs = gateEntryScans.reduce((sum, s) => sum + (parseFloat(s.quantity) || 0), 0);
+
+      // Material items compilation
+      const materialItemsMap = new Map();
+      const addMatItem = (name, color, qty, uom, source, meta) => {
+        if (!name) return;
+        const key = `${name}_${color || ''}_${source}`.toLowerCase();
+        if (!materialItemsMap.has(key)) {
+          materialItemsMap.set(key, { name, color: color || '—', qty: 0, uom: uom || 'PCS', source, meta: meta || '' });
+        }
+        materialItemsMap.get(key).qty += parseFloat(qty) || 0;
+      };
+
+      lot.rgps.forEach(r => {
+        (r.parsedEntries || []).forEach(e => {
+          if (!e.lotNo || String(e.lotNo).toLowerCase() === lot.lotNo.toLowerCase()) {
+            addMatItem(e.itemDesc || 'Fabric/Trims', '', e.qty1, e.uom || 'PCS', `RGP #${r.rgpNo}`, e.purpose || r.purpose);
+          }
+        });
+      });
+
+      lot.dooriOrders.forEach(d => {
+        addMatItem('Dori / Drawstring', '', d.Total_Pieces, 'PCS', `Dori PO #${d.po_number || d.Lot_Number}`, d.Style);
+      });
+
+      lot.zipOrders.forEach(z => {
+        addMatItem('Zipper Trims', z.Teeth_Color || '', z.Total_Pieces_CH || z.Total_Pieces, 'PCS', `Zip PO #${z.po_number || z.Lot_Number}`, z.Garment_Type);
+      });
+
+      lot.pos.forEach(p => {
+        let itms = [];
+        try { itms = typeof p.items === 'string' ? JSON.parse(p.items) : (p.items || []); } catch (_) {}
+        itms.forEach(it => {
+          addMatItem(it.name || it.description || 'Trims', it.color || '', it.qty, it.uom || 'PCS', `PO #${p.poNumber}`, p.vendorName);
+        });
+      });
+
+      lot.extraIssues.forEach(ex => {
+        let itms = [];
+        try { itms = Array.isArray(ex.items) ? ex.items : (typeof ex.items === 'string' ? JSON.parse(ex.items) : []); } catch (_) {}
+        itms.forEach(it => {
+          addMatItem(it.bomItemName || it.materialName || 'Extra Material', '', it.totalRequired || it.qty || it.extraQty, it.unit || 'PCS', `Extra #${ex.voucher_id || ex.voucherId || ex.id}`, ex.reason);
+        });
+      });
+
+      const compiledMaterials = Array.from(materialItemsMap.values());
+
+      // Check process completeness
+      const hasRgps = lot.rgps.length > 0;
+      const hasOrders = (lot.dooriOrders.length + lot.zipOrders.length + lot.pos.length) > 0;
+      const hasGateScans = gateEntryScans.length > 0;
+      const hasMaterialReceived = materialInScans.length > 0;
+      const rgpsComplete = !hasRgps || allRgpsReturned;
+
+      // Status determination
+      let processStatus = 'In Progress';
+      let isCompleted = false;
+
+      if (hasRgps && !allRgpsReturned) {
+        const isOverdue = lot.rgps.some(r => r.expectedReturnDate && new Date(r.expectedReturnDate) < new Date());
+        processStatus = isOverdue ? 'Overdue (Pending RGP Return)' : 'In Progress (Pending RGP Return)';
+      } else if (hasOrders && !hasGateScans && !hasMaterialReceived) {
+        processStatus = 'In Progress (Pending Gate In)';
+      } else if (hasOrders && hasGateScans && !hasMaterialReceived) {
+        processStatus = 'In Progress (Pending Store Inward)';
+      } else if ((hasOrders || hasRgps) && rgpsComplete) {
+        processStatus = 'Complete';
+        isCompleted = true;
+      } else if (lot.targetPieces > 0 && !hasOrders && !hasRgps) {
+        processStatus = 'BOM Registered';
+      }
+
+      // Classify RGP items by category (Tag, Dori, Zip, Fabric/Other)
+      const rgpTagList = [];
+      const rgpDoriList = [];
+      const rgpZipList = [];
+      const rgpFabricList = [];
+
+      lot.rgps.forEach(r => {
+        const entries = r.parsedEntries || [];
+        const isRet = (r.status || '').toLowerCase() === 'returned' || lot.scans.some(s => 
+          (s.scan_type === 'rgp_return') && 
+          (String(s.lot_number).toLowerCase() === String(r.rgpNo).toLowerCase() || String(s.lot_number).toLowerCase() === lot.lotNo.toLowerCase())
+        );
+        const rStatus = isRet ? 'Returned' : (r.status || 'Dispatched');
+
+        if (entries.length === 0) {
+          const typeStr = String(r.rgpType || r.purpose || '').toLowerCase();
+          const itemObj = {
+            rgpNo: r.rgpNo,
+            itemDesc: r.rgpType || 'RGP Pass',
+            qty: parseFloat(r.qty) || 0,
+            uom: 'PCS',
+            vendor: r.vendor || '—',
+            purpose: r.purpose || 'Processing',
+            status: rStatus,
+            date: r.date
+          };
+          if (typeStr.includes('tag') || typeStr.includes('label')) rgpTagList.push(itemObj);
+          else if (typeStr.includes('dori') || typeStr.includes('thread') || typeStr.includes('drawstring')) rgpDoriList.push(itemObj);
+          else if (typeStr.includes('zip') || typeStr.includes('fastener')) rgpZipList.push(itemObj);
+          else rgpFabricList.push(itemObj);
+        } else {
+          entries.forEach(e => {
+            const descStr = `${e.itemDesc || ''} ${r.rgpType || ''} ${e.purpose || ''} ${r.purpose || ''}`.toLowerCase();
+            const itemObj = {
+              rgpNo: r.rgpNo,
+              itemDesc: e.itemDesc || `${r.rgpType} - Lot ${e.lotNo || lot.lotNo}`,
+              qty: parseFloat(e.qty1 || e.qty) || 0,
+              uom: e.uom || 'PCS',
+              vendor: r.vendor || '—',
+              purpose: e.purpose || r.purpose || 'Processing',
+              status: rStatus,
+              date: r.date
+            };
+            if (descStr.includes('tag') || descStr.includes('label')) rgpTagList.push(itemObj);
+            else if (descStr.includes('dori') || descStr.includes('drawstring')) rgpDoriList.push(itemObj);
+            else if (descStr.includes('zip') || descStr.includes('chain')) rgpZipList.push(itemObj);
+            else rgpFabricList.push(itemObj);
+          });
+        }
+      });
+
+      const vendorsArray = Array.from(lot.vendors);
+
+      summaryList.push({
+        lotNo: lot.lotNo,
+        style: lot.style || '—',
+        brand: lot.brand || '—',
+        fabricType: lot.fabricType || '—',
+        targetPieces: lot.targetPieces,
+        isRecreated: lot.isRecreated,
+        totalRgpPcs,
+        totalRgpReturnedPcs,
+        totalDoriPcs,
+        totalZipPcs,
+        totalPoPcs,
+        totalExtraPcs,
+        totalReceivedPcs,
+        totalGateScannedPcs,
+        counts: {
+          rgp: lot.rgps.length,
+          rgpTags: rgpTagList.length,
+          rgpDori: rgpDoriList.length,
+          rgpZip: rgpZipList.length,
+          rgpFabric: rgpFabricList.length,
+          doori: lot.dooriOrders.length,
+          zip: lot.zipOrders.length,
+          po: lot.pos.length,
+          extra: lot.extraIssues.length,
+          scans: lot.scans.length,
+          gateScans: gateEntryScans.length,
+          materialInScans: materialInScans.length,
+          rgpOutScans: rgpOutScans.length,
+          rgpInScans: rgpInScans.length,
+          printingScans: printingScans.length,
+          weightCaptures: lot.weightCaptures.length
+        },
+        vendors: vendorsArray,
+        materials: compiledMaterials,
+        rgps: lot.rgps.map(r => ({
+          rgpNo: r.rgpNo,
+          vendor: r.vendor,
+          date: r.date,
+          expectedReturnDate: r.expectedReturnDate,
+          purpose: r.purpose,
+          status: r.status,
+          entries: r.parsedEntries
+        })),
+        rgpTagList,
+        rgpDoriList,
+        rgpZipList,
+        rgpFabricList,
+        dooriOrders: lot.dooriOrders,
+        zipOrders: lot.zipOrders,
+        pos: lot.pos,
+        extraIssues: lot.extraIssues,
+        scans: lot.scans,
+        gateInScans: gateEntryScans,
+        materialInScans,
+        materialOutScans: [...rgpOutScans, ...printingScans],
+        rgpReturnScans: rgpInScans,
+        processStatus,
+        isCompleted
+      });
+    }
+
+    // Sort summaryList by lotNo desc or numerical order
+    summaryList.sort((a, b) => {
+      const numA = parseInt(String(a.lotNo).replace(/\D/g, ''), 10) || 0;
+      const numB = parseInt(String(b.lotNo).replace(/\D/g, ''), 10) || 0;
+      return numB - numA;
+    });
+
+    res.status(200).json({
+      success: true,
+      totalLots: summaryList.length,
+      completedLots: summaryList.filter(s => s.isCompleted).length,
+      inProgressLots: summaryList.filter(s => !s.isCompleted).length,
+      data: summaryList
+    });
+  } catch (err) {
+    console.error('API GET /api/reports/lot-wise-summary error:', err);
+    res.status(500).json({ error: 'Failed to generate lot-wise summary report: ' + err.message });
+  }
+});
+
 // 7.3 Next PO Number Endpoint
 app.get('/api/next-po-number', async (req, res) => {
   try {
