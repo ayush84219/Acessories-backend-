@@ -88,7 +88,14 @@ import {
   deleteElasticIssue,
   getItemCodesSql,
   addItemCodeSql,
+  updateItemCodeSql,
   deleteItemCodeSql,
+  resequenceItemCodesSql,
+  generateTagItemCodesSql,
+  generatePatchAndTapeItemCodesSql,
+  getItemCodeMappingsSql,
+  saveItemCodeMappingSql,
+  autoMapAllCodesSql,
   addLedgerEntrySql,
   getItemCodeLedgerSql,
   accumulateOrInsertMaterialSql
@@ -3948,12 +3955,96 @@ app.post('/api/item-codes', async (req, res) => {
   }
 });
 
+app.put('/api/item-codes/:id', async (req, res) => {
+  try {
+    const { item_code, item_name, brand, style, category, uom, rate, mt_code } = req.body;
+    const updated = await updateItemCodeSql(req.params.id, { item_code, item_name, brand, style, category, uom, rate, mt_code });
+    res.json({ success: true, itemCode: updated, message: 'Item Code updated successfully' });
+  } catch (err) {
+    console.error('[API PUT /api/item-codes/:id error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.delete('/api/item-codes/:id', async (req, res) => {
   try {
     await deleteItemCodeSql(req.params.id);
     res.json({ success: true, message: 'Item Code deleted successfully' });
   } catch (err) {
     console.error('[API DELETE /api/item-codes error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/item-codes/resequence', async (req, res) => {
+  try {
+    const result = await resequenceItemCodesSql();
+    res.json({
+      success: true,
+      message: `Successfully re-sequenced ${result.count} item codes without gaps.`,
+      count: result.count,
+      updatedCount: result.updatedCount,
+      itemCodes: result.itemCodes
+    });
+  } catch (err) {
+    console.error('[API POST /api/item-codes/resequence error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Generate Item Codes from Tags MT Codes (Starting from ST00094) ───
+app.post('/api/item-codes/generate-from-tags', async (req, res) => {
+  try {
+    const result = await generateTagItemCodesSql();
+    res.json(result);
+  } catch (err) {
+    console.error('[API POST /api/item-codes/generate-from-tags error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Generate Item Codes from Patch & Tapes MT Codes (Starting from ST00141) ───
+app.post('/api/item-codes/generate-from-patch-tapes', async (req, res) => {
+  try {
+    const result = await generatePatchAndTapeItemCodesSql();
+    res.json(result);
+  } catch (err) {
+    console.error('[API POST /api/item-codes/generate-from-patch-tapes error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Item Code ⇄ MT Code Mappings API ─────────────────────────────────
+app.get('/api/item-codes/mappings', async (req, res) => {
+  try {
+    const data = await getItemCodeMappingsSql();
+    res.json({ success: true, ...data });
+  } catch (err) {
+    console.error('[API GET /api/item-codes/mappings error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/item-codes/map', async (req, res) => {
+  try {
+    const { item_code, mt_code } = req.body;
+    if (!item_code) {
+      return res.status(400).json({ success: false, error: 'item_code is required' });
+    }
+    const result = await saveItemCodeMappingSql({ item_code, mt_code });
+    res.json(result);
+  } catch (err) {
+    console.error('[API POST /api/item-codes/map error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/item-codes/auto-map-all', async (req, res) => {
+  try {
+    const result = await autoMapAllCodesSql();
+    res.json(result);
+  } catch (err) {
+    console.error('[API POST /api/item-codes/auto-map-all error]:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });

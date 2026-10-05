@@ -270,6 +270,20 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
 
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
+  try {
+    await pool.execute(`
+      UPDATE materials m
+      JOIN item_codes ic ON LOWER(TRIM(m.id)) = LOWER(TRIM(ic.mt_code))
+      SET m.itemCode = ic.item_code
+      WHERE (m.itemCode IS NULL OR m.itemCode = '') AND ic.mt_code IS NOT NULL AND ic.mt_code != ''
+    `);
+    await pool.execute(`
+      UPDATE weight_capture wc
+      JOIN item_codes ic ON LOWER(TRIM(wc.materialCode)) = LOWER(TRIM(ic.mt_code))
+      SET wc.itemCode = ic.item_code
+      WHERE (wc.itemCode IS NULL OR wc.itemCode = '') AND ic.mt_code IS NOT NULL AND ic.mt_code != ''
+    `);
+  } catch (_) { }
 
   // Approval Requests
   await pool.execute(`CREATE TABLE IF NOT EXISTS approval_requests (
@@ -1285,7 +1299,7 @@ export const clearAllWarehouseLocations = async () => {
 export const getAllMaterialCaptures = async (summaryOnly = false) => {
   if (summaryOnly) {
     const [rows] = await pool.execute(
-      'SELECT id, materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo, storeLocation, storeIncharge, grossWeightKg, tareWeightKg, netWeightKg, pieces, packets, barcodeId, status, approvalStatus, capturedAt, remarks FROM weight_capture ORDER BY capturedAt DESC'
+      'SELECT id, materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo, storeLocation, storeIncharge, grossWeightKg, tareWeightKg, netWeightKg, pieces, packets, barcodeId, status, approvalStatus, capturedAt, remarks, itemCode FROM weight_capture ORDER BY capturedAt DESC'
     );
     return rows;
   }
@@ -2511,7 +2525,13 @@ export const recordMaterialTransfer = async (t) => {
 };
 
 export const getMaterialTransfers = async () => {
-  const [rows] = await pool.execute('SELECT * FROM material_transfers ORDER BY transferredAt DESC');
+  const [rows] = await pool.execute(`
+    SELECT t.*, COALESCE(m.itemCode, ic.item_code, t.materialCode) AS itemCode 
+    FROM material_transfers t 
+    LEFT JOIN materials m ON t.materialCode = m.id 
+    LEFT JOIN item_codes ic ON t.materialCode = ic.mt_code 
+    ORDER BY t.transferredAt DESC
+  `);
   return rows;
 };
 
@@ -3416,20 +3436,31 @@ export const getSearchSuggestionsSql = async (q, max = 8) => {
 
 export const getItemCodesSql = async () => {
   const [rows] = await pool.execute('SELECT * FROM item_codes ORDER BY id DESC');
-  return rows;
+  // Auto-heal: If any rows have temporary _TMP_ codes, resequence them immediately
+  const hasTemp = (rows || []).some(r => String(r.item_code || '').startsWith('_TMP_') || String(r.item_code || '').startsWith('__TEMP_'));
+  if (hasTemp) {
+    try {
+      const res = await resequenceItemCodesSql();
+      return res.itemCodes;
+    } catch (e) {
+      console.warn('[DB] Auto-resequence notice:', e.message);
+    }
+  }
+  return rows || [];
 };
 
-export const addItemCodeSql = async ({ item_code, item_name, brand, style, category, uom = 'PCS', rate = 0 }) => {
+export const addItemCodeSql = async ({ item_code, item_name, brand, style, category, uom = 'PCS', rate = 0, mt_code = '' }) => {
   const [res] = await pool.execute(
-    `INSERT INTO item_codes (item_code, item_name, brand, style, category, uom, rate)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO item_codes (item_code, item_name, brand, style, category, uom, rate, mt_code)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
        item_name = VALUES(item_name),
        brand = VALUES(brand),
        style = VALUES(style),
        category = VALUES(category),
        uom = VALUES(uom),
-       rate = VALUES(rate)`,
+       rate = VALUES(rate),
+       mt_code = VALUES(mt_code)`,
     [
       String(item_code).trim(),
       String(item_name).trim(),
@@ -3437,15 +3468,536 @@ export const addItemCodeSql = async ({ item_code, item_name, brand, style, categ
       String(style || '').trim(),
       String(category || 'Trims').trim(),
       String(uom || 'PCS').trim(),
-      parseFloat(rate) || 0
+      parseFloat(rate) || 0,
+      String(mt_code || '').trim()
     ]
   );
-  return { id: res.insertId || res.id, item_code, item_name, brand, style, category, uom, rate };
+  if (mt_code && item_code) {
+    try {
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [String(item_code).trim(), String(mt_code).trim()]);
+    } catch (_) { }
+    try {
+      await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [String(item_code).trim(), String(mt_code).trim()]);
+    } catch (_) { }
+  }
+  return { id: res.insertId || res.id, item_code, item_name, brand, style, category, uom, rate, mt_code };
+};
+
+export const updateItemCodeSql = async (id, { item_code, item_name, brand, style, category, uom, rate, mt_code }) => {
+  const [existing] = await pool.execute('SELECT * FROM item_codes WHERE id = ? OR item_code = ? LIMIT 1', [String(id), String(id)]);
+  if (!existing || existing.length === 0) {
+    throw new Error(`Item code with ID ${id} not found`);
+  }
+  const current = existing[0];
+  const oldCode = current.item_code;
+  const oldMtCode = current.mt_code;
+
+  const newCode = item_code ? String(item_code).trim() : oldCode;
+  const newName = item_name !== undefined ? String(item_name).trim() : current.item_name;
+  const newBrand = brand !== undefined ? String(brand).trim() : current.brand;
+  const newStyle = style !== undefined ? String(style).trim() : current.style;
+  const newCategory = category !== undefined ? String(category).trim() : current.category;
+  const newUom = uom !== undefined ? String(uom).trim() : current.uom;
+  const newRate = rate !== undefined ? (parseFloat(rate) || 0) : current.rate;
+  const newMtCode = mt_code !== undefined ? String(mt_code).trim() : (current.mt_code || '');
+
+  await pool.execute(
+    `UPDATE item_codes 
+     SET item_code = ?, item_name = ?, brand = ?, style = ?, category = ?, uom = ?, rate = ?, mt_code = ?
+     WHERE id = ?`,
+    [newCode, newName, newBrand, newStyle, newCategory, newUom, newRate, newMtCode, current.id]
+  );
+
+  // Sync references if item_code changed
+  if (oldCode && newCode && oldCode !== newCode) {
+    try {
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
+    } catch (_) {}
+    try {
+      await pool.execute('UPDATE materials SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
+    } catch (_) {}
+    try {
+      await pool.execute('UPDATE item_code_ledger SET item_code = ? WHERE item_code = ?', [newCode, oldCode]);
+    } catch (_) {}
+  }
+
+  // Sync weight_capture & materials for mt_code
+  if (newMtCode) {
+    try {
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [newCode, newMtCode]);
+    } catch (_) {}
+    try {
+      await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [newCode, newMtCode]);
+    } catch (_) {}
+  } else if (oldMtCode && !newMtCode) {
+    try {
+      await pool.execute('UPDATE weight_capture SET itemCode = NULL WHERE materialCode = ?', [oldMtCode]);
+    } catch (_) {}
+    try {
+      await pool.execute('UPDATE materials SET itemCode = NULL WHERE id = ?', [oldMtCode]);
+    } catch (_) {}
+  }
+
+  return {
+    id: current.id,
+    item_code: newCode,
+    item_name: newName,
+    brand: newBrand,
+    style: newStyle,
+    category: newCategory,
+    uom: newUom,
+    rate: newRate,
+    mt_code: newMtCode
+  };
 };
 
 export const deleteItemCodeSql = async (id) => {
   await pool.execute('DELETE FROM item_codes WHERE id = ? OR item_code = ?', [String(id), String(id)]);
   return true;
+};
+
+export const resequenceItemCodesSql = async () => {
+  const [rows] = await pool.execute('SELECT * FROM item_codes ORDER BY id ASC');
+  if (!rows || rows.length === 0) {
+    return { count: 0, updatedCount: 0, itemCodes: [] };
+  }
+
+  // Sort logically by existing ST numeric code if valid, otherwise by original database ID
+  const sorted = [...rows].sort((a, b) => {
+    const matchA = String(a.item_code || '').match(/^ST(\d+)$/i);
+    const matchB = String(b.item_code || '').match(/^ST(\d+)$/i);
+    if (matchA && matchB) {
+      return parseInt(matchA[1], 10) - parseInt(matchB[1], 10);
+    }
+    if (matchA) return -1;
+    if (matchB) return 1;
+    return (a.id || 0) - (b.id || 0);
+  });
+
+  const updates = [];
+  const oldToNewMap = {};
+
+  sorted.forEach((item, index) => {
+    const seq = index + 1;
+    const newCode = `ST${String(seq).padStart(5, '0')}`;
+    const oldCode = item.item_code;
+    updates.push({
+      id: item.id,
+      oldCode,
+      newCode
+    });
+    if (oldCode && oldCode !== newCode) {
+      oldToNewMap[oldCode] = newCode;
+    }
+  });
+
+  // Step 1: Set temporary safe names to avoid unique constraint collision
+  for (let i = 0; i < updates.length; i++) {
+    const u = updates[i];
+    await pool.execute('UPDATE item_codes SET item_code = ? WHERE id = ?', [`__TMP_ST_${u.id}_${i}_${Date.now()}`, u.id]);
+  }
+
+  // Step 2: Assign proper clean sequential ST00001 codes
+  for (const u of updates) {
+    await pool.execute('UPDATE item_codes SET item_code = ? WHERE id = ?', [u.newCode, u.id]);
+  }
+
+  // Step 3: Update any references in ledger, materials, and weight_capture tables
+  for (const [oldCode, newCode] of Object.entries(oldToNewMap)) {
+    if (oldCode && !oldCode.startsWith('__TMP_') && !oldCode.startsWith('_TMP_')) {
+      try {
+        await pool.execute('UPDATE item_code_ledger SET item_code = ? WHERE item_code = ?', [newCode, oldCode]);
+      } catch (e) {
+        console.warn('[Resequence] ledger update notice:', e.message);
+      }
+      try {
+        await pool.execute('UPDATE materials SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
+      } catch (e) {
+        console.warn('[Resequence] materials update notice:', e.message);
+      }
+      try {
+        await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
+      } catch (e) {
+        console.warn('[Resequence] weight_capture update notice:', e.message);
+      }
+    }
+  }
+
+  const [freshRows] = await pool.execute('SELECT * FROM item_codes ORDER BY id DESC');
+  return {
+    count: updates.length,
+    updatedCount: Object.keys(oldToNewMap).length,
+    itemCodes: freshRows || []
+  };
+};
+
+// ── Convert Tags MT Codes into Item Codes (Starting from ST00094) ────────────
+export const generateTagItemCodesSql = async () => {
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM item_codes LIKE 'mt_code'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE item_codes ADD COLUMN mt_code VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM weight_capture LIKE 'itemCode'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  // 1. Find max existing sequence in item_codes
+  const [existingCodes] = await pool.execute('SELECT item_code FROM item_codes');
+  let maxSeq = 0;
+  (existingCodes || []).forEach(ic => {
+    const match = String(ic.item_code || '').match(/^ST(\d+)$/i);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (!isNaN(num) && num > maxSeq) maxSeq = num;
+    }
+  });
+
+  let nextSeqNum = Math.max(maxSeq + 1, 94);
+
+  // 2. Fetch all tag items from weight_capture
+  const [tagRows] = await pool.execute(
+    'SELECT * FROM weight_capture WHERE UPPER(category) LIKE "%TAG%" OR UPPER(materialName) LIKE "%TAG%" ORDER BY id ASC'
+  );
+
+  const createdItems = [];
+  for (const t of tagRows) {
+    const mtCode = String(t.materialCode || '').trim();
+    const matName = String(t.materialName || '').trim();
+    const supBrand = String(t.supplier || 'General').trim();
+
+    // Check if matching item_code already exists
+    const [existingMatch] = await pool.execute(
+      'SELECT * FROM item_codes WHERE mt_code = ? OR (LOWER(item_name) = LOWER(?) AND LOWER(brand) = LOWER(?)) LIMIT 1',
+      [mtCode, matName, supBrand]
+    );
+
+    let assignedItemCode = null;
+
+    if (existingMatch && existingMatch.length > 0) {
+      assignedItemCode = existingMatch[0].item_code;
+      if (!existingMatch[0].mt_code && mtCode) {
+        await pool.execute('UPDATE item_codes SET mt_code = ? WHERE id = ?', [mtCode, existingMatch[0].id]);
+      }
+    } else {
+      assignedItemCode = `ST${String(nextSeqNum).padStart(5, '0')}`;
+      nextSeqNum++;
+
+      const itemName = matName.toUpperCase();
+      const brand = supBrand.toUpperCase();
+      const style = String(t.lotNo || 'N/A').trim();
+      const category = 'Tags';
+      const uom = String(t.unit || 'PCS').trim().toUpperCase();
+      const rate = 0;
+
+      const [res] = await pool.execute(
+        `INSERT INTO item_codes (item_code, item_name, brand, style, category, uom, rate, mt_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [assignedItemCode, itemName, brand, style, category, uom, rate, mtCode]
+      );
+
+      createdItems.push({
+        id: res.insertId,
+        item_code: assignedItemCode,
+        mt_code: mtCode,
+        item_name: itemName,
+        brand,
+        style,
+        category,
+        uom,
+        rate,
+        pieces: t.pieces || 0
+      });
+    }
+
+    if (assignedItemCode && mtCode) {
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [assignedItemCode, mtCode]);
+    }
+  }
+
+  const [allItemCodes] = await pool.execute('SELECT * FROM item_codes ORDER BY id DESC');
+  return {
+    success: true,
+    createdCount: createdItems.length,
+    createdItems,
+    itemCodes: allItemCodes || []
+  };
+};
+
+export const generatePatchAndTapeItemCodesSql = async () => {
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM item_codes LIKE 'mt_code'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE item_codes ADD COLUMN mt_code VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM weight_capture LIKE 'itemCode'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM materials LIKE 'itemCode'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE materials ADD COLUMN itemCode VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  const normalizeCat = (rawCat) => {
+    const cat = String(rawCat || '').trim().toUpperCase();
+    if (cat.includes('MATEL') || cat.includes('METAL')) return 'Metal Patch';
+    if (cat.includes('PATCH')) return 'Patch';
+    if (cat.includes('TAPE')) return 'Tapes';
+    if (cat.includes('TAG')) return 'Tags';
+    if (cat.includes('LABEL')) return 'Labels';
+    return rawCat || 'Trims';
+  };
+
+  const [existingCodes] = await pool.execute('SELECT * FROM item_codes ORDER BY id ASC');
+  let maxSeq = 0;
+  existingCodes.forEach(ic => {
+    const match = String(ic.item_code || '').match(/^ST(\d+)$/i);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (!isNaN(num) && num > maxSeq) maxSeq = num;
+    }
+  });
+
+  let nextSeqNum = maxSeq + 1;
+
+  const [wcRows] = await pool.execute(
+    `SELECT * FROM weight_capture 
+     WHERE UPPER(category) LIKE '%PATCH%' 
+        OR UPPER(materialName) LIKE '%PATCH%' 
+        OR UPPER(category) LIKE '%MATEL%' 
+        OR UPPER(category) LIKE '%TAPE%' 
+        OR UPPER(materialName) LIKE '%TAPE%' 
+     ORDER BY id ASC`
+  );
+
+  const existingByMt = new Map();
+  const existingByNameBrand = new Map();
+
+  existingCodes.forEach(ic => {
+    if (ic.mt_code) {
+      existingByMt.set(String(ic.mt_code).trim().toUpperCase(), ic);
+    }
+    const key = `${String(ic.item_name || '').trim().toUpperCase()}|||${String(ic.brand || '').trim().toUpperCase()}`;
+    if (!existingByNameBrand.has(key)) {
+      existingByNameBrand.set(key, ic);
+    }
+  });
+
+  const createdItems = [];
+  const linkedItems = [];
+
+  for (const row of wcRows) {
+    const mtCode = String(row.materialCode || '').trim().toUpperCase();
+    const matName = String(row.materialName || '').trim().toUpperCase();
+    const supBrand = String(row.supplier || 'General').trim().toUpperCase();
+    const cat = normalizeCat(row.category || (matName.includes('TAPE') ? 'TAPES' : 'PATCH'));
+    const uom = String(row.unit || (cat === 'Tapes' ? 'MTR' : 'PCS')).trim().toUpperCase();
+    const style = String(row.lotNo || 'N/A').trim();
+    const rate = 0;
+
+    let assignedItemCode = null;
+
+    if (existingByMt.has(mtCode)) {
+      const existing = existingByMt.get(mtCode);
+      assignedItemCode = existing.item_code;
+    } else {
+      const key = `${matName}|||${supBrand}`;
+      const nameMatch = existingByNameBrand.get(key);
+
+      if (nameMatch && !nameMatch.mt_code) {
+        assignedItemCode = nameMatch.item_code;
+        await pool.execute('UPDATE item_codes SET mt_code = ? WHERE id = ?', [mtCode, nameMatch.id]);
+        nameMatch.mt_code = mtCode;
+        existingByMt.set(mtCode, nameMatch);
+        linkedItems.push({
+          id: nameMatch.id,
+          item_code: assignedItemCode,
+          mt_code: mtCode,
+          item_name: matName,
+          brand: supBrand,
+          category: cat,
+          uom,
+          rate
+        });
+      } else {
+        assignedItemCode = `ST${String(nextSeqNum).padStart(5, '0')}`;
+        nextSeqNum++;
+
+        const [res] = await pool.execute(
+          `INSERT INTO item_codes (item_code, item_name, brand, style, category, uom, rate, mt_code)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [assignedItemCode, matName, supBrand, style, cat, uom, rate, mtCode]
+        );
+
+        const newRec = {
+          id: res.insertId,
+          item_code: assignedItemCode,
+          mt_code: mtCode,
+          item_name: matName,
+          brand: supBrand,
+          style,
+          category: cat,
+          uom,
+          rate,
+          pieces: row.pieces || 0
+        };
+
+        existingByMt.set(mtCode, newRec);
+        existingByNameBrand.set(key, newRec);
+        createdItems.push(newRec);
+      }
+    }
+
+    if (assignedItemCode && mtCode) {
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [assignedItemCode, mtCode]);
+      await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [assignedItemCode, mtCode]);
+    }
+  }
+
+  const [allItemCodes] = await pool.execute('SELECT * FROM item_codes ORDER BY id DESC');
+  return {
+    success: true,
+    createdCount: createdItems.length,
+    linkedCount: linkedItems.length,
+    totalProcessed: wcRows.length,
+    createdItems,
+    linkedItems,
+    itemCodes: allItemCodes || []
+  };
+};
+
+// ── Get All Item Code ⇄ MT Code Mappings ──────────────────────────────────
+export const getItemCodeMappingsSql = async () => {
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM item_codes LIKE 'mt_code'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE item_codes ADD COLUMN mt_code VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  try {
+    const [cols] = await pool.execute("SHOW COLUMNS FROM weight_capture LIKE 'itemCode'");
+    if (cols.length === 0) {
+      await pool.execute("ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) DEFAULT ''");
+    }
+  } catch (_) { }
+
+  const [itemCodes] = await pool.execute('SELECT * FROM item_codes ORDER BY id ASC');
+  const [wcRows] = await pool.execute('SELECT id, materialCode, materialName, category, supplier, unit, pieces, packets, storeLocation, itemCode FROM weight_capture ORDER BY id ASC');
+
+  const wcByCode = new Map();
+  const wcByItemCode = new Map();
+  (wcRows || []).forEach(w => {
+    if (w.materialCode) wcByCode.set(String(w.materialCode).trim().toUpperCase(), w);
+    if (w.itemCode) wcByItemCode.set(String(w.itemCode).trim().toUpperCase(), w);
+  });
+
+  const mappings = (itemCodes || []).map(ic => {
+    const code = String(ic.item_code || '').trim().toUpperCase();
+    const mt = String(ic.mt_code || '').trim().toUpperCase();
+    const wcMatch = (mt ? wcByCode.get(mt) : null) || wcByItemCode.get(code);
+
+    return {
+      id: ic.id,
+      item_code: ic.item_code,
+      item_name: ic.item_name,
+      brand: ic.brand,
+      category: ic.category,
+      uom: ic.uom,
+      rate: ic.rate,
+      mt_code: ic.mt_code || wcMatch?.materialCode || '',
+      pieces: wcMatch?.pieces || 0,
+      packets: wcMatch?.packets || 0,
+      storeLocation: wcMatch?.storeLocation || 'Main Store',
+      isMapped: Boolean(ic.mt_code || (wcMatch && wcMatch.materialCode))
+    };
+  });
+
+  const mappedMtCodes = new Set(mappings.map(m => String(m.mt_code || '').trim().toUpperCase()).filter(Boolean));
+  const unlinkedWc = (wcRows || []).filter(w => !mappedMtCodes.has(String(w.materialCode || '').trim().toUpperCase())).map(w => ({
+    id: `wc_${w.id}`,
+    item_code: w.itemCode || '',
+    item_name: w.materialName,
+    brand: w.supplier,
+    category: w.category,
+    uom: w.unit,
+    rate: 0,
+    mt_code: w.materialCode,
+    pieces: w.pieces || 0,
+    packets: w.packets || 0,
+    storeLocation: w.storeLocation || 'Main Store',
+    isMapped: Boolean(w.itemCode)
+  }));
+
+  return { mappings, unlinkedWc, totalItemCodes: itemCodes.length, totalWc: wcRows.length };
+};
+
+// ── Save / Update Single Mapping ─────────────────────────────────────────
+export const saveItemCodeMappingSql = async ({ item_code, mt_code }) => {
+  const iCode = String(item_code || '').trim();
+  const mCode = String(mt_code || '').trim();
+
+  if (iCode) {
+    await pool.execute('UPDATE item_codes SET mt_code = ? WHERE item_code = ?', [mCode, iCode]);
+  }
+  if (mCode && iCode) {
+    await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [iCode, mCode]);
+    await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [iCode, mCode]);
+  } else if (!mCode && iCode) {
+    // If unlinking
+    await pool.execute('UPDATE weight_capture SET itemCode = NULL WHERE itemCode = ?', [iCode]);
+    await pool.execute('UPDATE materials SET itemCode = NULL WHERE itemCode = ?', [iCode]);
+  }
+  return { success: true, item_code: iCode, mt_code: mCode };
+};
+
+// ── Auto-Map All Unlinked MT Codes to ST Codes ───────────────────────────
+export const autoMapAllCodesSql = async () => {
+  const [itemCodes] = await pool.execute('SELECT * FROM item_codes');
+  const [wcRows] = await pool.execute('SELECT * FROM weight_capture');
+
+  let mappedCount = 0;
+
+  for (const ic of itemCodes) {
+    const icName = String(ic.item_name || '').trim().toLowerCase();
+    const icBrand = String(ic.brand || '').trim().toLowerCase();
+    const icCat = String(ic.category || '').trim().toLowerCase();
+
+    // Match in weight_capture by name, brand, or existing link
+    const match = wcRows.find(w => {
+      const wName = String(w.materialName || '').trim().toLowerCase();
+      const wBrand = String(w.supplier || '').trim().toLowerCase();
+      const wCat = String(w.category || '').trim().toLowerCase();
+
+      const sameName = (wName === icName);
+      const sameBrand = (!wBrand || !icBrand || wBrand === icBrand || icBrand.includes(wBrand) || wBrand.includes(icBrand));
+      const sameCat = (wCat === icCat || (wCat.includes('tag') && icCat.includes('tag')) || (wCat.includes('label') && icCat.includes('label')) || (wCat.includes('patch') && icCat.includes('patch')) || (wCat.includes('tape') && icCat.includes('tape')));
+
+      return sameName && (sameBrand || sameCat);
+    });
+
+    if (match && match.materialCode) {
+      await pool.execute('UPDATE item_codes SET mt_code = ? WHERE id = ?', [match.materialCode, ic.id]);
+      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE id = ?', [ic.item_code, match.id]);
+      await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [ic.item_code, match.materialCode]);
+      mappedCount++;
+    }
+  }
+
+  return { success: true, mappedCount };
 };
 
 // ── Item Code Ledger & Accumulate Stock SQL Handlers ─────────────────────────────
