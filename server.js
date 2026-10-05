@@ -85,7 +85,13 @@ import {
   deleteBoneIssue,
   createElasticIssue,
   getAllElasticIssues,
-  deleteElasticIssue
+  deleteElasticIssue,
+  getItemCodesSql,
+  addItemCodeSql,
+  deleteItemCodeSql,
+  addLedgerEntrySql,
+  getItemCodeLedgerSql,
+  accumulateOrInsertMaterialSql
 } from './db.js';
 import pool from './db.js';
 import cloudinary from './config/cloudinary.js';
@@ -3913,6 +3919,83 @@ app.post('/api/warehouse-locations/bulk', async (req, res) => {
     res.json({ success: true, count, message: `Successfully saved ${count} warehouse locations.` });
   } catch (err) {
     console.error('[API] warehouse-locations bulk POST error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Item Codes API Endpoints ─────────────────────────────────────────
+app.get('/api/item-codes', async (req, res) => {
+  try {
+    const items = await getItemCodesSql();
+    res.json({ success: true, data: items || [], itemCodes: items || [] });
+  } catch (err) {
+    console.error('[API GET /api/item-codes error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/item-codes', async (req, res) => {
+  try {
+    const { item_code, item_name, brand, style, category, uom, rate } = req.body;
+    if (!item_code || !item_name) {
+      return res.status(400).json({ success: false, error: 'item_code and item_name are required' });
+    }
+    const result = await addItemCodeSql({ item_code, item_name, brand, style, category, uom, rate });
+    res.json({ success: true, itemCode: result, message: 'Item Code created successfully' });
+  } catch (err) {
+    console.error('[API POST /api/item-codes error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/item-codes/:id', async (req, res) => {
+  try {
+    await deleteItemCodeSql(req.params.id);
+    res.json({ success: true, message: 'Item Code deleted successfully' });
+  } catch (err) {
+    console.error('[API DELETE /api/item-codes error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Item Code Ledger & Stock Accumulate API Endpoints ────────────────
+app.get('/api/item-code-ledger', async (req, res) => {
+  try {
+    const { item_code } = req.query;
+    const entries = await getItemCodeLedgerSql(item_code || null);
+    res.json({ success: true, ledger: entries || [] });
+  } catch (err) {
+    console.error('[API GET /api/item-code-ledger error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/item-code-ledger/:itemCode', async (req, res) => {
+  try {
+    const entries = await getItemCodeLedgerSql(req.params.itemCode);
+    res.json({ success: true, ledger: entries || [] });
+  } catch (err) {
+    console.error('[API GET /api/item-code-ledger/:itemCode error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/item-code-ledger', async (req, res) => {
+  try {
+    const entry = await addLedgerEntrySql(req.body);
+    res.json({ success: true, entry, message: 'Ledger entry recorded successfully' });
+  } catch (err) {
+    console.error('[API POST /api/item-code-ledger error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/materials/accumulate', async (req, res) => {
+  try {
+    const result = await accumulateOrInsertMaterialSql(req.body);
+    res.json({ success: true, material: result, message: result.isAccumulated ? 'Material stock accumulated into existing entry' : 'New material created' });
+  } catch (err) {
+    console.error('[API POST /api/materials/accumulate error]:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });

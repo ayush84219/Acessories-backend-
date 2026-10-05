@@ -235,6 +235,42 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     await pool.execute(`UPDATE materials SET location = color WHERE location = 'Main Store' OR location IS NULL`);
   } catch (_) { }
 
+  // Item Codes Registry Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS item_codes (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    item_code    VARCHAR(100) UNIQUE NOT NULL,
+    item_name    VARCHAR(255) NOT NULL,
+    brand        VARCHAR(100),
+    style        VARCHAR(100),
+    category     VARCHAR(100),
+    uom          VARCHAR(50) DEFAULT 'PCS',
+    rate         DOUBLE DEFAULT 0,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+
+  // Item Code Ledger / Audit Movement History Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS item_code_ledger (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    item_code        VARCHAR(100) NOT NULL,
+    transaction_type VARCHAR(50) NOT NULL,
+    po_number        VARCHAR(100) DEFAULT 'N/A',
+    lot_no           VARCHAR(100) DEFAULT 'N/A',
+    supplier_name    VARCHAR(255) DEFAULT 'N/A',
+    qty              DOUBLE DEFAULT 0,
+    net_wt           DOUBLE DEFAULT 0,
+    uom              VARCHAR(50) DEFAULT 'PCS',
+    location         VARCHAR(255) DEFAULT 'Main Store',
+    person_name      VARCHAR(255) DEFAULT 'System',
+    remarks          TEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX (item_code),
+    INDEX (po_number)
+  )`);
+
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
+
   // Approval Requests
   await pool.execute(`CREATE TABLE IF NOT EXISTS approval_requests (
     id              VARCHAR(100) PRIMARY KEY,
@@ -273,7 +309,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   )`);
   try {
     await pool.execute(`CREATE UNIQUE INDEX idx_po_number ON purchase_orders (poNumber)`);
-  } catch (_) {}
+  } catch (_) { }
 
   // Vendors
   await pool.execute(`CREATE TABLE IF NOT EXISTS vendors (
@@ -690,7 +726,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
           await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('designers_list', ?)", [JSON.stringify(finalDesigners)]);
         }
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 
   // Material Transfers Table
@@ -752,7 +788,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     if (rackSetting && rackSetting.length > 0 && rackSetting[0].setting_value) {
       try {
         parsedRacks = JSON.parse(rackSetting[0].setting_value);
-      } catch (_) {}
+      } catch (_) { }
     }
 
     if (Array.isArray(parsedRacks) && parsedRacks.length > 0) {
@@ -770,7 +806,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
       if (existing.length === 0) {
         await pool.execute(`CREATE INDEX ${indexName} ON ${table} (${columns})`);
       }
-    } catch (_) {}
+    } catch (_) { }
   };
 
   try {
@@ -1116,7 +1152,7 @@ export const getAllWarehouseLocations = async () => {
 
 export const bulkSaveWarehouseLocations = async (locationsArray) => {
   if (!Array.isArray(locationsArray) || locationsArray.length === 0) return 0;
-  
+
   const chunkSize = 100;
   let totalSaved = 0;
 
@@ -1217,7 +1253,7 @@ export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Mai
         await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
       }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   return { id: idOrCode, code: fullDisplay, warehouse, capacity: cap };
 };
@@ -1225,7 +1261,7 @@ export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Mai
 export const deleteWarehouseLocation = async (idOrCode) => {
   if (!idOrCode) return false;
   await pool.execute('DELETE FROM warehouse_locations WHERE id = ? OR code = ?', [idOrCode, idOrCode]);
-  
+
   // Also clean up from warehouse_racks in settings
   try {
     const [rackSetting] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key = ?', ['warehouse_racks']);
@@ -1236,7 +1272,7 @@ export const deleteWarehouseLocation = async (idOrCode) => {
         await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
       }
     }
-  } catch (_) {}
+  } catch (_) { }
   return true;
 };
 
@@ -1441,7 +1477,7 @@ export const deleteMaterial = async (id) => {
   await pool.execute('DELETE FROM materials WHERE id=?', [id]);
   try {
     await pool.execute('DELETE FROM weight_capture WHERE materialCode=?', [id]);
-  } catch (_) {}
+  } catch (_) { }
 };
 
 // ── Approval Requests ─────────────────────────────────────────────────────────
@@ -1480,7 +1516,7 @@ export const updateApprovalRequestStatus = async (id, status, extra = {}) => {
       let parsedItems = [];
       try {
         parsedItems = typeof ar.items === 'string' ? JSON.parse(ar.items) : (ar.items || []);
-      } catch (_) {}
+      } catch (_) { }
 
       const firstItem = Array.isArray(parsedItems) && parsedItems.length > 0 ? parsedItems[0] : {};
       const targetPo = (firstItem.poNumber || ar.lotId || '').trim();
@@ -1608,7 +1644,7 @@ export const getAllPOs = async () => {
         });
       }
     });
-  } catch (_) {}
+  } catch (_) { }
 
   return rows.map(r => {
     let items = [];
@@ -1657,7 +1693,7 @@ export const getAcceptedOrders = async () => {
       "SELECT * FROM weight_capture WHERE approvalStatus = 'Approved' OR approvalStatus IS NULL ORDER BY id ASC"
     );
     captures = rows;
-  } catch (_) {}
+  } catch (_) { }
 
   const cleanPo = str => String(str || '').trim().toLowerCase().replace(/^po-?/i, '');
 
@@ -1754,7 +1790,7 @@ export const getPOByNumberOrId = async (poIdentifier) => {
         [(po.poNumber || '').toLowerCase()]
       );
       totalReceived = Number(recvRows[0]?.totalPieces) || 0;
-    } catch (_) {}
+    } catch (_) { }
 
     let computedStatus = po.status || 'Sent to Vendor';
     if (totalOrdered > 0) {
@@ -2043,9 +2079,9 @@ export const getNextGeneralPoNumber = async () => {
   try {
     const [rows] = await pool.execute('SELECT poNumber FROM purchase_orders');
     const [wcRows] = await pool.execute('SELECT poNumber FROM weight_capture WHERE poNumber IS NOT NULL AND poNumber != \'\'');
-    
+
     const allPos = [...rows.map(r => r.poNumber), ...wcRows.map(r => r.poNumber)].filter(Boolean);
-    
+
     let maxNum = 11000;
     for (const po of allPos) {
       const match = String(po).match(/PO-?(\d+)/i) || String(po).match(/(\d+)/);
@@ -2578,7 +2614,7 @@ export const ensureCuttingSchema = async () => {
       XXL INT,
       Total_Pcs INT
     )`);
-  } catch (_) {}
+  } catch (_) { }
 };
 
 export const getUndesignedCuttingLots = async () => {
@@ -2737,13 +2773,13 @@ export const checkInwardEligibility = async ({ poNumber = '', materialName = '',
 
 export const getMaterialTraceability = async (query = '') => {
   const q = String(query || '').trim().toLowerCase();
-  
+
   // 1. Fetch materials
   const [allMaterials] = await pool.execute('SELECT * FROM materials ORDER BY name ASC');
-  
+
   // 2. Fetch weight_captures
   const [allCaptures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id DESC');
-  
+
   // 3. Fetch issue_logs / material_issues
   let issueLogs = [];
   try {
@@ -2753,7 +2789,7 @@ export const getMaterialTraceability = async (query = '') => {
     try {
       const [iRows] = await pool.execute('SELECT * FROM issue_logs ORDER BY id DESC');
       issueLogs = iRows;
-    } catch (_) {}
+    } catch (_) { }
   }
 
   // 4. Fetch material_transfers
@@ -2761,14 +2797,14 @@ export const getMaterialTraceability = async (query = '') => {
   try {
     const [tRows] = await pool.execute('SELECT * FROM material_transfers ORDER BY id DESC');
     transfers = tRows;
-  } catch (_) {}
+  } catch (_) { }
 
   // 5. Fetch scanner_logs
   let scanLogs = [];
   try {
     const [sRows] = await pool.execute('SELECT * FROM scanner_logs ORDER BY id DESC');
     scanLogs = sRows;
-  } catch (_) {}
+  } catch (_) { }
 
   // 6. Fetch cutting_header for Lot metadata
   let cuttingLots = {};
@@ -2777,7 +2813,7 @@ export const getMaterialTraceability = async (query = '') => {
     cRows.forEach(c => {
       cuttingLots[String(c.Lot_Number).trim()] = c;
     });
-  } catch (_) {}
+  } catch (_) { }
 
   // Filter materials matching query
   const matchedMaterials = allMaterials.filter(m => {
@@ -2801,8 +2837,8 @@ export const getMaterialTraceability = async (query = '') => {
       const cName = String(c.materialName || '').trim().toLowerCase();
       const cBarcode = String(c.barcodeId || '').trim().toLowerCase();
       return (cCode && (cCode === matId.toLowerCase() || cCode.includes(matId.toLowerCase()))) ||
-             (cName && (cName === matName || cName.includes(matName) || matName.includes(cName))) ||
-             (cBarcode && cBarcode.includes(matId.toLowerCase()));
+        (cName && (cName === matName || cName.includes(matName) || matName.includes(cName))) ||
+        (cBarcode && cBarcode.includes(matId.toLowerCase()));
     });
 
     // Related issue logs (Consumption / Issue against Cutting Lots)
@@ -2819,7 +2855,7 @@ export const getMaterialTraceability = async (query = '') => {
         const iId = String(it.materialId || '').trim().toLowerCase();
         const iName = String(it.name || it.materialName || '').trim().toLowerCase();
         return (iId && iId === matId.toLowerCase()) ||
-               (iName && (iName === matName || iName.includes(matName) || matName.includes(iName)));
+          (iName && (iName === matName || iName.includes(matName) || matName.includes(iName)));
       });
 
       if (matchingItem) {
@@ -3375,7 +3411,192 @@ export const getSearchSuggestionsSql = async (q, max = 8) => {
     'SELECT DISTINCT name FROM materials WHERE name LIKE ? LIMIT ?',
     [qStr, String(Math.min(20, max))]
   );
-  return rows.map(r => ({ text: r.name, freq: 1 }));
+  return (rows || []).map(r => r.name);
+};
+
+export const getItemCodesSql = async () => {
+  const [rows] = await pool.execute('SELECT * FROM item_codes ORDER BY id DESC');
+  return rows;
+};
+
+export const addItemCodeSql = async ({ item_code, item_name, brand, style, category, uom = 'PCS', rate = 0 }) => {
+  const [res] = await pool.execute(
+    `INSERT INTO item_codes (item_code, item_name, brand, style, category, uom, rate)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       item_name = VALUES(item_name),
+       brand = VALUES(brand),
+       style = VALUES(style),
+       category = VALUES(category),
+       uom = VALUES(uom),
+       rate = VALUES(rate)`,
+    [
+      String(item_code).trim(),
+      String(item_name).trim(),
+      String(brand || '').trim(),
+      String(style || '').trim(),
+      String(category || 'Trims').trim(),
+      String(uom || 'PCS').trim(),
+      parseFloat(rate) || 0
+    ]
+  );
+  return { id: res.insertId || res.id, item_code, item_name, brand, style, category, uom, rate };
+};
+
+export const deleteItemCodeSql = async (id) => {
+  await pool.execute('DELETE FROM item_codes WHERE id = ? OR item_code = ?', [String(id), String(id)]);
+  return true;
+};
+
+// ── Item Code Ledger & Accumulate Stock SQL Handlers ─────────────────────────────
+export const addLedgerEntrySql = async ({
+  item_code,
+  transaction_type = 'INWARD',
+  po_number = 'N/A',
+  lot_no = 'N/A',
+  supplier_name = 'N/A',
+  qty = 0,
+  net_wt = 0,
+  uom = 'PCS',
+  location = 'Main Store',
+  person_name = 'System',
+  remarks = ''
+}) => {
+  if (!item_code) return null;
+  const [res] = await pool.execute(
+    `INSERT INTO item_code_ledger 
+     (item_code, transaction_type, po_number, lot_no, supplier_name, qty, net_wt, uom, location, person_name, remarks)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(item_code).trim(),
+      String(transaction_type).trim().toUpperCase(),
+      String(po_number || 'N/A').trim(),
+      String(lot_no || 'N/A').trim(),
+      String(supplier_name || 'N/A').trim(),
+      parseFloat(qty) || 0,
+      parseFloat(net_wt) || 0,
+      String(uom || 'PCS').trim(),
+      String(location || 'Main Store').trim(),
+      String(person_name || 'System').trim(),
+      String(remarks || '').trim()
+    ]
+  );
+  return { id: res.insertId, item_code, transaction_type, po_number, qty };
+};
+
+export const getItemCodeLedgerSql = async (itemCode = null) => {
+  if (itemCode) {
+    const [rows] = await pool.execute(
+      `SELECT * FROM item_code_ledger WHERE item_code = ? ORDER BY id DESC`,
+      [String(itemCode).trim()]
+    );
+    return rows || [];
+  }
+  const [rows] = await pool.execute(
+    `SELECT * FROM item_code_ledger ORDER BY id DESC LIMIT 500`
+  );
+  return rows || [];
+};
+
+export const accumulateOrInsertMaterialSql = async ({
+  itemCode,
+  name,
+  category = 'Trims',
+  supplier = 'N/A',
+  lotNo = 'N/A',
+  poNumber = 'N/A',
+  invoiceNo = 'N/A',
+  location = 'Main Store',
+  pieces = 0,
+  weightPerPieceG = 0,
+  netWeightKg = 0,
+  cost = 0,
+  uom = 'PCS',
+  personName = 'System'
+}) => {
+  const code = (itemCode || '').trim();
+  const matName = (name || '').trim();
+
+  // 1. Check if material with matching itemCode or exact name exists in materials table
+  let existing = null;
+  if (code) {
+    const [rows] = await pool.execute(
+      `SELECT * FROM materials WHERE itemCode = ? OR name = ? LIMIT 1`,
+      [code, code]
+    );
+    if (rows && rows.length > 0) existing = rows[0];
+  }
+
+  if (!existing && matName) {
+    const [rows] = await pool.execute(
+      `SELECT * FROM materials WHERE name = ? LIMIT 1`,
+      [matName]
+    );
+    if (rows && rows.length > 0) existing = rows[0];
+  }
+
+  if (existing) {
+    // ACCUMULATE stock in existing material record
+    const updatedPieces = (parseInt(existing.pieces, 10) || 0) + (parseInt(pieces, 10) || 0);
+    const updatedNetWt = (parseFloat(existing.netWeightKg) || 0) + (parseFloat(netWeightKg) || 0);
+
+    await pool.execute(
+      `UPDATE materials SET
+         pieces = ?,
+         netWeightKg = ?,
+         location = ?,
+         supplier = COALESCE(NULLIF(?, 'N/A'), supplier),
+         poNumber = COALESCE(NULLIF(?, 'N/A'), poNumber),
+         invoiceNo = COALESCE(NULLIF(?, 'N/A'), invoiceNo)
+       WHERE id = ?`,
+      [updatedPieces, updatedNetWt, location || existing.location, supplier, poNumber, invoiceNo, existing.id]
+    );
+
+    // Log Inward Transaction to Ledger
+    if (code || existing.itemCode) {
+      await addLedgerEntrySql({
+        item_code: code || existing.itemCode,
+        transaction_type: 'INWARD',
+        po_number: poNumber,
+        lot_no: lotNo,
+        supplier_name: supplier,
+        qty: pieces,
+        net_wt: netWeightKg,
+        uom: uom,
+        location: location,
+        person_name: personName,
+        remarks: `Accumulated ${pieces} ${uom} into existing stock (Total: ${updatedPieces})`
+      });
+    }
+
+    return { ...existing, pieces: updatedPieces, netWeightKg: updatedNetWt, isAccumulated: true };
+  } else {
+    // INSERT new material record
+    const matId = `MAT-${Date.now()}`;
+    await pool.execute(
+      `INSERT INTO materials (id, itemCode, name, category, supplier, lotNo, poNumber, invoiceNo, location, pieces, weightPerPieceG, netWeightKg, cost, unit)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [matId, code || null, matName || code, category, supplier, lotNo, poNumber, invoiceNo, location, pieces, weightPerPieceG, netWeightKg, cost, uom]
+    );
+
+    if (code) {
+      await addLedgerEntrySql({
+        item_code: code,
+        transaction_type: 'INWARD',
+        po_number: poNumber,
+        lot_no: lotNo,
+        supplier_name: supplier,
+        qty: pieces,
+        net_wt: netWeightKg,
+        uom: uom,
+        location: location,
+        person_name: personName,
+        remarks: `Initial inward entry of ${pieces} ${uom}`
+      });
+    }
+
+    return { id: matId, itemCode: code, name: matName, pieces, netWeightKg, isAccumulated: false };
+  }
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────
