@@ -1941,9 +1941,18 @@ export const getSetting = async (key) => {
 };
 
 export const setSetting = async (key, value) => {
+  const newStr = JSON.stringify(value);
+  try {
+    const [rows] = await pool.execute('SELECT setting_value FROM settings WHERE setting_key=?', [key]);
+    if (rows[0] && rows[0].setting_value === newStr) {
+      // Setting value is already identical; skip redundant DB writes and sync logs
+      return;
+    }
+  } catch (_) {}
+
   await pool.execute(
     'REPLACE INTO settings (setting_key,setting_value) VALUES (?,?)',
-    [key, JSON.stringify(value)]
+    [key, newStr]
   );
 
   // If warehouse_racks is updated, automatically sync to warehouse_locations table
@@ -2172,16 +2181,14 @@ export const getNextPoNumber = async (type) => {
 export const getNextGeneralPoNumber = async () => {
   try {
     const [rows] = await pool.execute('SELECT poNumber FROM purchase_orders');
-    const [wcRows] = await pool.execute('SELECT poNumber FROM weight_capture WHERE poNumber IS NOT NULL AND poNumber != \'\'');
-
-    const allPos = [...rows.map(r => r.poNumber), ...wcRows.map(r => r.poNumber)].filter(Boolean);
 
     let maxNum = 11000;
-    for (const po of allPos) {
-      const match = String(po).match(/PO-?(\d+)/i) || String(po).match(/(\d+)/);
+    for (const r of rows) {
+      if (!r.poNumber) continue;
+      const match = String(r.poNumber).match(/PO-?(\d+)/i) || String(r.poNumber).match(/^(\d{5})$/);
       if (match) {
         const n = parseInt(match[1], 10);
-        if (n >= 11000 && n < 20000 && n > maxNum) {
+        if (n >= 11000 && n < 12000 && n > maxNum) {
           maxNum = n;
         }
       }
