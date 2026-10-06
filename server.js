@@ -204,6 +204,54 @@ app.use(compression({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// ── In-Memory LRU Micro-Cache (Max 150 items, O(1) eviction for low-RAM containers) ───────────────
+const MAX_CACHE_ENTRIES = 150;
+const memoryCache = new Map();
+let cacheHits = 0;
+let cacheMisses = 0;
+
+function getCached(key) {
+  const item = memoryCache.get(key);
+  if (!item) {
+    cacheMisses++;
+    return null;
+  }
+  if (Date.now() > item.expiresAt) {
+    memoryCache.delete(key);
+    cacheMisses++;
+    return null;
+  }
+  cacheHits++;
+  // Refresh position for LRU
+  memoryCache.delete(key);
+  memoryCache.set(key, item);
+  return item.data;
+}
+
+function setCached(key, data, ttlMs = 30000) {
+  if (memoryCache.size >= MAX_CACHE_ENTRIES) {
+    // Evict oldest entry
+    const oldestKey = memoryCache.keys().next().value;
+    if (oldestKey) memoryCache.delete(oldestKey);
+  }
+  memoryCache.set(key, {
+    data,
+    expiresAt: Date.now() + ttlMs
+  });
+}
+
+function invalidateCache(prefix) {
+  if (!prefix) {
+    memoryCache.clear();
+    return;
+  }
+  for (const key of memoryCache.keys()) {
+    if (key.startsWith(prefix)) {
+      memoryCache.delete(key);
+    }
+  }
+}
+
 // ── In-Memory APM Metrics Tracker ───────────────────────────────────────────
 const metricsTracker = {
   totalRequests: 0,
@@ -305,54 +353,6 @@ app.get('/api/health', async (req, res) => {
 app.get('/api/metrics', (req, res) => {
   res.status(200).json(metricsTracker.getMetrics());
 });
-
-// ── In-Memory LRU Micro-Cache (Max 150 items, O(1) eviction for low-RAM containers) ───────────────
-const MAX_CACHE_ENTRIES = 150;
-const memoryCache = new Map();
-let cacheHits = 0;
-let cacheMisses = 0;
-
-function getCached(key) {
-  const item = memoryCache.get(key);
-  if (!item) {
-    cacheMisses++;
-    return null;
-  }
-  if (Date.now() > item.expiresAt) {
-    memoryCache.delete(key);
-    cacheMisses++;
-    return null;
-  }
-  cacheHits++;
-  // Refresh position for LRU
-  memoryCache.delete(key);
-  memoryCache.set(key, item);
-  return item.data;
-}
-
-function setCached(key, data, ttlMs = 30000) {
-  if (memoryCache.size >= MAX_CACHE_ENTRIES) {
-    // Evict oldest entry
-    const oldestKey = memoryCache.keys().next().value;
-    if (oldestKey) memoryCache.delete(oldestKey);
-  }
-  memoryCache.set(key, {
-    data,
-    expiresAt: Date.now() + ttlMs
-  });
-}
-
-function invalidateCache(prefix) {
-  if (!prefix) {
-    memoryCache.clear();
-    return;
-  }
-  for (const key of memoryCache.keys()) {
-    if (key.startsWith(prefix)) {
-      memoryCache.delete(key);
-    }
-  }
-}
 
 // Mail Transporter Configuration
 const getTransporter = () => {

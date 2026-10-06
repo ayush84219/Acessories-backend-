@@ -881,8 +881,25 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
       // Operations & Approvals
       ensureIndex('zip', 'idx_zip_lot', 'Lot_Number'),
       ensureIndex('zip', 'idx_zip_po', 'po_number'),
+      ensureIndex('doori', 'idx_doori_lot', 'Lot_Number'),
+      ensureIndex('doori', 'idx_doori_po', 'po_number'),
+      ensureIndex('rgp', 'idx_rgp_date', 'date'),
+      ensureIndex('rgp', 'idx_rgp_status', 'status'),
+      ensureIndex('rgp', 'idx_rgp_vendor', 'vendor(191)'),
+      ensureIndex('item_code_ledger', 'idx_icl_item_code_created', 'item_code, created_at'),
+      ensureIndex('item_code_ledger', 'idx_icl_lot_no', 'lot_no'),
+      ensureIndex('item_code_ledger', 'idx_icl_po_number', 'po_number'),
+      ensureIndex('item_codes', 'idx_ic_brand', 'brand'),
+      ensureIndex('item_codes', 'idx_ic_category', 'category'),
+      ensureIndex('item_codes', 'idx_ic_style', 'style'),
+      ensureIndex('design_history', 'idx_dh_lot', 'lotId'),
+      ensureIndex('design_history', 'idx_dh_action', 'action'),
+      ensureIndex('extra_material_issues', 'idx_emi_lot', 'lot_id'),
+      ensureIndex('extra_material_issues', 'idx_emi_status', 'status'),
+      ensureIndex('lot_operations_summary', 'idx_los_status', 'process_status'),
       ensureIndex('issue_logs', 'idx_issue_lot', 'lotId'),
       ensureIndex('scans', 'idx_scans_lot_date', 'lot_number, scanned_at'),
+      ensureIndex('scans', 'idx_scans_scan_type', 'scan_type'),
       ensureIndex('approval_requests', 'idx_ar_type_status', 'type, status'),
       ensureIndex('users', 'idx_users_email', 'email'),
       ensureIndex('users', 'idx_users_role', 'role')
@@ -1391,11 +1408,18 @@ export const updateDesignStatus = async (id, status, comments) => {
 // ── Materials ─────────────────────────────────────────────────────────────────
 
 export const getAllMaterials = async (onlyPresent = false) => {
-  if (onlyPresent) {
-    const [rows] = await pool.execute('SELECT * FROM materials WHERE stock > 0 ORDER BY id ASC');
-    return rows;
-  }
-  const [rows] = await pool.execute('SELECT * FROM materials ORDER BY id ASC');
+  const filter = onlyPresent ? 'WHERE m.stock > 0' : '';
+  const sql = `
+    SELECT 
+      m.*, 
+      COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS itemCode, 
+      COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS stCode 
+    FROM materials m 
+    LEFT JOIN item_codes ic ON LOWER(TRIM(m.id)) = LOWER(TRIM(ic.mt_code))
+    ${filter}
+    ORDER BY m.id ASC
+  `;
+  const [rows] = await pool.execute(sql);
   return rows;
 };
 
@@ -3378,40 +3402,55 @@ export const searchDirectSql = async ({
 
   if (query) {
     const qStr = `%${query.trim()}%`;
-    matConditions.push('(name LIKE ? OR id LIKE ? OR category LIKE ? OR poNumber LIKE ? OR location LIKE ? OR color LIKE ?)');
-    matParams.push(qStr, qStr, qStr, qStr, qStr, qStr);
+    matConditions.push('(m.name LIKE ? OR m.id LIKE ? OR m.category LIKE ? OR m.poNumber LIKE ? OR m.location LIKE ? OR m.color LIKE ? OR m.itemCode LIKE ? OR ic.item_code LIKE ?)');
+    matParams.push(qStr, qStr, qStr, qStr, qStr, qStr, qStr, qStr);
   }
   if (category) {
-    matConditions.push('LOWER(category) = LOWER(?)');
+    matConditions.push('LOWER(m.category) = LOWER(?)');
     matParams.push(category.trim());
   }
   if (location) {
-    matConditions.push('LOWER(location) = LOWER(?)');
+    matConditions.push('LOWER(m.location) = LOWER(?)');
     matParams.push(location.trim());
   }
   if (minStock !== null && minStock !== '') {
-    matConditions.push('stock >= ?');
+    matConditions.push('m.stock >= ?');
     matParams.push(Number(minStock));
   }
   if (maxStock !== null && maxStock !== '') {
-    matConditions.push('stock <= ?');
+    matConditions.push('m.stock <= ?');
     matParams.push(Number(maxStock));
   }
   if (minCost !== null && minCost !== '') {
-    matConditions.push('cost >= ?');
+    matConditions.push('m.cost >= ?');
     matParams.push(Number(minCost));
   }
   if (maxCost !== null && maxCost !== '') {
-    matConditions.push('cost <= ?');
+    matConditions.push('m.cost <= ?');
     matParams.push(Number(maxCost));
   }
 
   const whereClause = matConditions.length > 0 ? `WHERE ${matConditions.join(' AND ')}` : '';
   const sql = `
-    SELECT id, name, category, location, color, poNumber, invoiceNo, unit, stock, cost, imageUrl, 'material' AS itemType
-    FROM materials
+    SELECT 
+      m.id, 
+      m.name, 
+      m.category, 
+      m.location, 
+      m.color, 
+      m.poNumber, 
+      m.invoiceNo, 
+      m.unit, 
+      m.stock, 
+      m.cost, 
+      m.imageUrl,
+      COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS itemCode,
+      COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS stCode,
+      'material' AS itemType
+    FROM materials m
+    LEFT JOIN item_codes ic ON LOWER(TRIM(m.id)) = LOWER(TRIM(ic.mt_code))
     ${whereClause}
-    ORDER BY id ASC
+    ORDER BY m.id ASC
     LIMIT ? OFFSET ?
   `;
 
