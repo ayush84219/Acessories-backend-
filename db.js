@@ -806,8 +806,40 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     }
 
     if (Array.isArray(parsedRacks) && parsedRacks.length > 0) {
-      await bulkSaveWarehouseLocations(parsedRacks);
-      console.log(`[DB] Synced ${parsedRacks.length} custom locations to warehouse_locations table.`);
+      // Canonicalize all settings racks
+      const cleanedMap = new Map();
+      parsedRacks.forEach(r => {
+        const rawCode = (r.code !== undefined && r.code !== null) ? String(r.code).trim() : (r.name || '');
+        const cleanDisplay = canonicalizeLocationCode(rawCode, r.warehouse || 'Main Store');
+        if (!cleanDisplay) return;
+        const slug = cleanDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const wh = cleanDisplay.includes(' - ') ? cleanDisplay.split(' - ')[0].trim() : (r.warehouse || 'Main Store');
+        const shortRack = cleanDisplay.includes(' - ') ? cleanDisplay.split(' - ').slice(1).join(' - ') : cleanDisplay;
+        if (!cleanedMap.has(slug)) {
+          cleanedMap.set(slug, {
+            id: slug,
+            name: shortRack,
+            code: cleanDisplay,
+            warehouse: wh,
+            capacity: Number(r.capacity) > 0 ? Number(r.capacity) : 20
+          });
+        }
+      });
+      const cleanedRacks = Array.from(cleanedMap.values());
+      await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(cleanedRacks)]);
+      await bulkSaveWarehouseLocations(cleanedRacks);
+      console.log(`[DB] Synced and cleaned ${cleanedRacks.length} custom locations to warehouse_locations table.`);
+    }
+
+    // Auto-clean any legacy corrupted rack names (e.g. "Main Store - Rack Main Store - RACK 1")
+    const [existingLocRows] = await pool.execute("SELECT id, code, warehouse, capacity FROM warehouse_locations");
+    for (const row of existingLocRows) {
+      const clean = canonicalizeLocationCode(row.code, row.warehouse);
+      const cleanSlug = clean.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      if (clean && (clean !== row.code || row.id !== cleanSlug)) {
+        await pool.execute("DELETE FROM warehouse_locations WHERE id = ?", [row.id]);
+        await pool.execute("INSERT INTO warehouse_locations (id, code, warehouse, capacity) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)", [cleanSlug, clean, row.warehouse || 'Main Store', row.capacity || 20]);
+      }
     }
   } catch (syncErr) {
     console.warn('[DB] Could not initialize/sync warehouse_locations on startup:', syncErr.message);
@@ -1181,6 +1213,33 @@ export const getAllWarehouseLocations = async () => {
   return rows;
 };
 
+export const canonicalizeLocationCode = (rawStr, defaultWarehouse = 'Main Store') => {
+  if (!rawStr) return '';
+  let str = String(rawStr).trim().replace(/\(\d+\s*pkts?\)/gi, '').trim();
+  if (!str || str.toLowerCase() === 'n/a' || str.toLowerCase() === 'null') return '';
+
+  // Extract rack number or alphanumeric identifier if present
+  const rackNumMatch = str.match(/rack\s*(\d+[a-z]?)/i) || str.match(/(\d+[a-z]?)$/i);
+  const rackNum = rackNumMatch ? rackNumMatch[1] : '';
+
+  // Extract warehouse / hall
+  let warehouse = 'Main Store';
+  if (/\bhall\s*(\d+)/i.test(str)) {
+    const h = str.match(/\bhall\s*(\d+)/i);
+    warehouse = `Hall ${h[1]}`;
+  } else if (/\bmain\s*store\b/i.test(str)) {
+    warehouse = 'Main Store';
+  } else if (defaultWarehouse) {
+    warehouse = defaultWarehouse.replace(/^rack\s+/i, '').trim() || 'Main Store';
+  }
+
+  if (rackNum) {
+    return `${warehouse} - RACK ${rackNum}`;
+  }
+
+  return `${warehouse} - ${str}`;
+};
+
 export const bulkSaveWarehouseLocations = async (locationsArray) => {
   if (!Array.isArray(locationsArray) || locationsArray.length === 0) return 0;
 
@@ -1193,17 +1252,14 @@ export const bulkSaveWarehouseLocations = async (locationsArray) => {
     const params = [];
 
     for (const r of chunk) {
-      const warehouse = r.warehouse || 'Hall 1';
-      const codeStr = (r.code !== undefined && r.code !== null) ? String(r.code).trim() : '';
-      let rackLabel = r.name ? String(r.name).trim() : '';
-      if (!rackLabel) {
-        rackLabel = codeStr ? `Rack ${codeStr}` : 'Rack';
-      } else if (codeStr && !rackLabel.toLowerCase().includes(codeStr.toLowerCase())) {
-        rackLabel = `${rackLabel} ${codeStr}`;
-      }
-      const fullDisplay = `${warehouse} - ${rackLabel}`;
-      const slug = r.id || `${warehouse}-${rackLabel}`.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      const capacity = Number(r.capacity) || 10;
+      const defaultWh = r.warehouse || 'Main Store';
+      const rawCode = (r.code !== undefined && r.code !== null) ? String(r.code).trim() : (r.name || '');
+      const fullDisplay = canonicalizeLocationCode(rawCode, defaultWh);
+      if (!fullDisplay) continue;
+
+      const warehouse = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : defaultWh;
+      const slug = r.id && !r.id.includes('rack-main-store') ? r.id : fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const capacity = Number(r.capacity) > 0 ? Number(r.capacity) : 20;
 
       valuePlaceholders.push('(?, ?, ?, ?)');
       params.push(slug, fullDisplay, warehouse, capacity);
@@ -1214,37 +1270,37 @@ export const bulkSaveWarehouseLocations = async (locationsArray) => {
                    VALUES ${valuePlaceholders.join(', ')}
                    ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`;
       await pool.execute(sql, params);
-      totalSaved += chunk.length;
+      totalSaved += valuePlaceholders.length;
     }
   }
 
   return totalSaved;
 };
 
-export const createWarehouseLocation = async ({ id, code, warehouse = 'Hall 1', capacity = 10 }) => {
-  const cleanCode = String(code || 'Rack').trim();
-  const fullDisplay = cleanCode.toLowerCase().includes(warehouse.toLowerCase()) ? cleanCode : `${warehouse} - ${cleanCode}`;
+export const createWarehouseLocation = async ({ id, code, warehouse = 'Main Store', capacity = 20 }) => {
+  const fullDisplay = canonicalizeLocationCode(code, warehouse) || `${warehouse} - Rack 1`;
+  const wh = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : warehouse;
   const slug = id || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const cap = Number(capacity) > 0 ? Number(capacity) : 10;
+  const cap = Number(capacity) > 0 ? Number(capacity) : 20;
   await pool.execute(
     `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
      VALUES (?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
-    [slug, fullDisplay, warehouse, cap]
+    [slug, fullDisplay, wh, cap]
   );
-  return { id: slug, code: fullDisplay, warehouse, capacity: cap };
+  return { id: slug, code: fullDisplay, warehouse: wh, capacity: cap };
 };
 
 export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Main Store', capacity = 20 }) => {
   if (!idOrCode) throw new Error('Location identifier is required');
-  const cleanCode = String(code || 'Rack').trim();
-  const fullDisplay = cleanCode.toLowerCase().includes(warehouse.toLowerCase()) ? cleanCode : `${warehouse} - ${cleanCode}`;
+  const fullDisplay = canonicalizeLocationCode(code, warehouse) || `${warehouse} - Rack 1`;
+  const wh = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : warehouse;
   const cap = Number(capacity) > 0 ? Number(capacity) : 20;
 
   // Try updating by id or code
   const [result] = await pool.execute(
     `UPDATE warehouse_locations SET code = ?, warehouse = ?, capacity = ? WHERE id = ? OR code = ?`,
-    [fullDisplay, warehouse, cap, idOrCode, idOrCode]
+    [fullDisplay, wh, cap, idOrCode, idOrCode]
   );
 
   // If no existing record matched, insert it
@@ -1254,7 +1310,7 @@ export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Mai
       `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
        VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
-      [slug, fullDisplay, warehouse, cap]
+      [slug, fullDisplay, wh, cap]
     );
   }
 
