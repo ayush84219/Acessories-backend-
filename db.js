@@ -3082,11 +3082,11 @@ export const createExtraMaterialIssue = async (data) => {
     const baseQty = Number(it.baseQty || it.base_qty || it.previouslyIssued || it.previouslyIssuedQty || 0);
     const extraQty = Number(it.totalRequired || it.extraQty || it.extra_qty || it.quantity || it.qty || 0);
     const extraPercentage = Number(it.issuePercentage || it.percentage || it.extraPercentage || it.extra_percentage || 0);
-    const maxAllowedQty = Number(it.maxAllowedQty || it.max_allowed_qty || (baseQty * 0.05) || 0);
+    const maxAllowedQty = Number(it.maxAllowedQty || it.max_allowed_qty || (baseQty * 0.01) || 0);
     const excessQty = Number(it.excessQty || it.excess_qty || Math.max(0, extraQty - maxAllowedQty) || 0);
     const reason = it.reason || it.extraReason || it.extra_reason || 'Cutting Wastage / Excess Loss';
     const remarks = it.remarks || it.extraRemarks || it.extra_remarks || '';
-    const exceedsLimit = (it.exceedsLimit || it.exceeds_limit || extraPercentage > 5.0) ? 1 : 0;
+    const exceedsLimit = (it.exceedsLimit || it.exceeds_limit || extraPercentage > 1.0) ? 1 : 0;
 
     const [res] = await pool.execute(
       `INSERT INTO extra_material_issues (
