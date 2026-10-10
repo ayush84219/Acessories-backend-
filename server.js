@@ -3085,9 +3085,9 @@ app.put('/api/doori-orders/:lotNo/payload', async (req, res) => {
 // GET next unique PO number (auto-increment per type)
 app.get('/api/po-number/next/:type', async (req, res) => {
   try {
-    const type = req.params.type; // 'zip', 'doori', 'bone', 'bone_issue', 'elastic', or 'elastic_issue'
-    if (!['zip', 'doori', 'bone', 'bone_issue', 'elastic', 'elastic_issue'].includes(type)) {
-      return res.status(400).json({ error: 'Type must be zip, doori, bone, bone_issue, elastic, or elastic_issue.' });
+    const type = req.params.type; // 'zip', 'doori', 'bone', 'bone_issue', 'elastic', 'elastic_issue', 'elastic_wo', 'bone_wo', or 'tape_wo'
+    if (!['zip', 'doori', 'bone', 'bone_issue', 'elastic', 'elastic_issue', 'elastic_wo', 'bone_wo', 'tape_wo'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be zip, doori, bone, bone_issue, elastic, elastic_issue, elastic_wo, bone_wo, or tape_wo.' });
     }
     const poNumber = await getNextPoNumber(type);
     res.status(200).json({ poNumber });

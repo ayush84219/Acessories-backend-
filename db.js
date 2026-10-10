@@ -2155,6 +2155,64 @@ export const getAllHistory = async () => {
 
 // ── PO Number counter (atomic, stored in settings) ──────────────────────────
 export const getNextPoNumber = async (type) => {
+  // Without Lot sequences: elastic-w/o-01, bone-w/o-01, tape-w/o-01
+  if (type === 'elastic_wo' || type === 'elastic-wo' || type === 'elastic_w_o') {
+    const key = 'elastic_wo_counter';
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_wo_counter', '0')"); } catch (_) {}
+      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
+      const next = (parseInt(row?.setting_value || '0', 10) + 1);
+      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
+      await conn.commit();
+      return `elastic-w/o-${String(next).padStart(2, '0')}`;
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    } finally {
+      conn.release();
+    }
+  }
+
+  if (type === 'bone_wo' || type === 'bone-wo') {
+    const key = 'bone_wo_counter';
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('bone_wo_counter', '0')"); } catch (_) {}
+      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
+      const next = (parseInt(row?.setting_value || '0', 10) + 1);
+      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
+      await conn.commit();
+      return `bone-w/o-${String(next).padStart(2, '0')}`;
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    } finally {
+      conn.release();
+    }
+  }
+
+  if (type === 'tape_wo' || type === 'tape-wo') {
+    const key = 'tape_wo_counter';
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('tape_wo_counter', '0')"); } catch (_) {}
+      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
+      const next = (parseInt(row?.setting_value || '0', 10) + 1);
+      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
+      await conn.commit();
+      return `tape-w/o-${String(next).padStart(2, '0')}`;
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    } finally {
+      conn.release();
+    }
+  }
+
   // type = 'zip' → returns 'ZIP-PO-0001' | type = 'doori' → returns 'DORI-PO-0001' | type = 'bone'/'bone_issue' → returns 'BONE-ISSUE-0001' | type = 'elastic'/'elastic_issue' → returns 'ELASTIC-ISSUE-0001'
   const key = type === 'zip' ? 'zip_po_counter' : (type === 'bone' || type === 'bone_issue') ? 'bone_issue_counter' : (type === 'elastic' || type === 'elastic_issue') ? 'elastic_issue_counter' : 'doori_po_counter';
   const prefix = type === 'zip' ? 'ZIP-PO' : (type === 'bone' || type === 'bone_issue') ? 'BONE-ISSUE' : (type === 'elastic' || type === 'elastic_issue') ? 'ELASTIC-ISSUE' : 'DORI-PO';
