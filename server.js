@@ -14,6 +14,7 @@ import {
   initDb,
   getUserByEmail,
   getUserById,
+  getAllUsers,
   createUser,
   verifyUserOtp,
   updateUserOtp,
@@ -669,6 +670,17 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Get Profile API Error:', err.message);
     res.status(500).json({ error: 'Server error fetching user profile.' });
+  }
+});
+
+// 6. Retrieve All Registered Users (Signup Name, Gmail/Email, Role)
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await getAllUsers();
+    res.status(200).json(users);
+  } catch (err) {
+    console.error('Get All Users API Error:', err.message);
+    res.status(500).json({ error: 'Server error fetching registered users.' });
   }
 });
 
@@ -3300,7 +3312,8 @@ app.post('/api/elastic/calculate', async (req, res) => {
       elasticUnit: rawElasticUnit,
       tapeSizeInput: rawTape = 0,
       tapeUnit: rawTapeUnit = 'cm',
-      rollLengthMtr = 25
+      rollLengthMtr,
+      elasticWidth = '1 Inch (Standard)'
     } = req.body;
 
     let pcs = parseInt(rawPcs, 10);
@@ -3327,10 +3340,35 @@ app.post('/api/elastic/calculate', async (req, res) => {
           fabric = row.Fabric || '';
         }
       } catch (_) { }
+
+      // If still missing pcs or item details, look up in Main Google Sheet CSV
+      if ((isNaN(pcs) || pcs <= 0) || !itemName) {
+        try {
+          const csvText = await getMainLotsCSV(false);
+          if (csvText) {
+            const rows = parseCSV(csvText);
+            const target = String(lotNo).toLowerCase().trim();
+            const matchedRow = rows.find(row => {
+              const rowLot = (row['Lot Number'] || row['Lot No'] || row['lot'] || '').toLowerCase().trim();
+              const rowJob = (row['Job Order No'] || row['Order No.'] || '').toLowerCase().trim();
+              return (rowLot && rowLot === target) || (rowJob && rowJob === target);
+            });
+            if (matchedRow) {
+              const q = parseInt(matchedRow['Challan Total Qty'] || matchedRow['Quantity'] || matchedRow['Qty'] || 0, 10);
+              if ((isNaN(pcs) || pcs <= 0) && q > 0) pcs = q;
+              if (!itemName) itemName = matchedRow['Garment Type'] || matchedRow['Style'] || 'LOWER';
+              if (!supervisorName) supervisorName = matchedRow['Supervisor'] || '';
+              if (!brand) brand = matchedRow['Brand'] || '';
+              if (!garmentType) garmentType = matchedRow['Garment Type'] || '';
+              if (!fabric) fabric = matchedRow['Fabric'] || '';
+            }
+          }
+        } catch (_) { }
+      }
     }
 
-    if (isNaN(pcs) || pcs <= 0) {
-      pcs = 600; // Default pcs fallback
+    if (isNaN(pcs) || pcs < 0) {
+      pcs = 0;
     }
 
     const size = Math.max(0, parseFloat(rawSize) || 0);
@@ -3354,16 +3392,27 @@ app.post('/api/elastic/calculate', async (req, res) => {
     // Total = Per Pc (In Mtr) * Pcs
     const totalElasticMtr = parseFloat((pcs * elasticPerPcMtr).toFixed(4));
     const totalTapeMtr = parseFloat((pcs * tapePerPcMtr).toFixed(4));
-    const rLength = parseFloat(rollLengthMtr) || 25;
+
+    // Elastic roll divisor rule:
+    // 1 Inch is divided by 25
+    // 1.5 Inch and 2 Inch are divided by 23
+    const widthStr = String(elasticWidth || '').toLowerCase();
+    const is23Divisor = widthStr.includes('1.5') || widthStr.includes('2');
+    const rLength = rollLengthMtr ? parseFloat(rollLengthMtr) : (is23Divisor ? 23 : 25);
     const recommendedRolls = totalElasticMtr > 0 ? Math.ceil(totalElasticMtr / rLength) : 1;
+    const effectiveWidthLabel = widthStr.includes('1.5') ? '1.5 Inch' : widthStr.includes('2') ? '2 Inch' : '1 Inch';
+    const rollExplanation = `${totalElasticMtr} Mtr / ${rLength} = ${recommendedRolls} Roll(s) (${effectiveWidthLabel})`;
 
     const elasticFormula = elasticUnit === 'cm'
       ? `${size} CM / 100 = ${elasticPerPcMtr} m`
-      : `${size} Inch × 0.0254 = ${elasticPerPcMtr} m`;
+      : `${size} Inch * 0.0254 = ${elasticPerPcMtr} m`;
 
-    const tapeFormula = tapeUnit === 'cm'
-      ? `${tapeSize} CM / 100 = ${tapePerPcMtr} m`
-      : `${tapeSize} Inch × 0.0254 = ${tapePerPcMtr} m`;
+    // Tape calculation:
+    // User requested rule: "in tape no need input normal first asked pieces after pic divide by 45 after that those amount issue make this type"
+    // Pcs / 45 = Rolls
+    const tapeExactRolls = pcs > 0 ? parseFloat((pcs / 45).toFixed(2)) : 0;
+    const tapeRolls = pcs > 0 ? Math.ceil(pcs / 45) : 0;
+    const tapeFormula = `${pcs} Pcs / 45 = ${tapeExactRolls} ==> ${tapeRolls} Roll(s)`;
 
     res.status(200).json({
       success: true,
@@ -3383,11 +3432,18 @@ app.post('/api/elastic/calculate', async (req, res) => {
       tapePerPcMtr,
       totalElasticMtr,
       totalTapeMtr,
+      tapeRolls,
+      tapeExactRolls,
+      totalTapeRolls: tapeRolls,
+      elasticWidth,
+      effectiveWidthLabel,
       rollLengthMtr: rLength,
+      rollDivisor: rLength,
       recommendedRolls,
+      rollExplanation,
       elasticFormula,
       tapeFormula,
-      formulaExplanation: `${elasticFormula} | ${tapeFormula}`
+      formulaExplanation: `${elasticFormula} | ${totalElasticMtr} Mtr / ${rLength} = ${recommendedRolls} Roll(s)`
     });
   } catch (err) {
     console.error('API POST /api/elastic/calculate error:', err.message);

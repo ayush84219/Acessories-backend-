@@ -1388,6 +1388,11 @@ export const getUserById = async (id) => {
   return rows[0] || null;
 };
 
+export const getAllUsers = async () => {
+  const [rows] = await pool.execute('SELECT id, name, email, role, verified, created_at FROM users ORDER BY id ASC');
+  return rows;
+};
+
 export const createUser = async (name, email, password, role, otp_code = null, otp_expires = null) => {
   const createdAt = toMysqlDatetime(new Date());
   const formattedOtpExpires = toMysqlDatetime(otp_expires);
