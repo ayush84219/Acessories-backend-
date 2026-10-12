@@ -512,15 +512,22 @@ app.post('/api/auth/register', async (req, res) => {
       }
     }
 
-    // Check if user exists
-    const userExists = await getUserByEmail(email);
-    if (userExists) {
-      return res.status(400).json({ error: 'User with this email already exists.' });
-    }
-
     // Hash Password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
+
+    // Check if user exists
+    const userExists = await getUserByEmail(email);
+    if (userExists) {
+      // With valid Security Code, update existing account password and role so user is never locked out
+      await pool.execute(
+        'UPDATE users SET password = ?, name = ?, role = ?, verified = 1 WHERE id = ?',
+        [hashedPassword, name, role, userExists.id]
+      );
+      return res.status(201).json({
+        message: 'Account updated successfully! You can now log in with your updated credentials.'
+      });
+    }
 
     // Save in DB
     await createUser(name, email, hashedPassword, role, null, null);
@@ -2046,6 +2053,124 @@ app.get('/api/reports/undesigned-cutting-lots', async (req, res) => {
   } catch (err) {
     console.error('API GET /api/reports/undesigned-cutting-lots error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve undesigned cutting lots.' });
+  }
+});
+
+// 7.2.0 BOM Created (Material Not Issued) Report
+app.get('/api/reports/bom-created-not-issued', async (req, res) => {
+  try {
+    const [
+      designRows,
+      cuttingRows,
+      issueRows,
+      elasticRows,
+      extraRows
+    ] = await Promise.all([
+      pool.execute('SELECT * FROM designs ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM cutting_header').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM issue_logs').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM elastic_issues').then(r => r[0]).catch(() => []),
+      pool.execute('SELECT * FROM extra_material_issues').then(r => r[0]).catch(() => [])
+    ]);
+
+    // Map cutting rows by lot number
+    const cuttingMap = new Map();
+    cuttingRows.forEach(c => {
+      const lot = String(c.Lot_Number || c.Lot_No || '').trim().toLowerCase();
+      if (lot) cuttingMap.set(lot, c);
+    });
+
+    // Map issues by lot number
+    const issuedLotsSet = new Set();
+    const issueCountsMap = new Map();
+
+    const recordIssueForLot = (rawLot, count = 1) => {
+      if (!rawLot) return;
+      const key = String(rawLot).trim().toLowerCase();
+      if (!key) return;
+      issuedLotsSet.add(key);
+      issueCountsMap.set(key, (issueCountsMap.get(key) || 0) + count);
+    };
+
+    issueRows.forEach(il => {
+      let matCount = 0;
+      try {
+        const mats = typeof il.materials === 'string' ? JSON.parse(il.materials || '[]') : (il.materials || []);
+        matCount = Array.isArray(mats) ? mats.length : 1;
+      } catch (_) { matCount = 1; }
+      if (matCount > 0 && !il.isReturn) {
+        recordIssueForLot(il.lotId || il.lot_no, matCount);
+      }
+    });
+
+    elasticRows.forEach(el => {
+      recordIssueForLot(el.lotNo || el.lotId, 1);
+    });
+
+    extraRows.forEach(ex => {
+      recordIssueForLot(ex.lot_no || ex.lot_id || ex.lotId, 1);
+    });
+
+    // Process all designs
+    const pendingLots = [];
+
+    designRows.forEach(d => {
+      const lotId = String(d.id || d.lotNo || '').trim();
+      if (!lotId) return;
+      const lotKey = lotId.toLowerCase();
+
+      // Check if any materials issued
+      const isIssued = issuedLotsSet.has(lotKey);
+      const totalIssuedCount = issueCountsMap.get(lotKey) || 0;
+
+      // Parse BOM
+      let bomItems = [];
+      try {
+        if (Array.isArray(d.bom)) bomItems = d.bom;
+        else if (typeof d.bom === 'string') bomItems = JSON.parse(d.bom || '[]');
+      } catch (_) { bomItems = []; }
+
+      const cutting = cuttingMap.get(lotKey) || {};
+
+      pendingLots.push({
+        id: d.id,
+        lotNo: lotId,
+        style: d.style || cutting.Style || '',
+        brand: d.brand || cutting.Brand || '',
+        fabricType: d.fabricType || cutting.Fabric_Type || cutting.Fabric || '',
+        garmentType: d.garmentType || cutting.Garment_Type || 'Garment',
+        targetPieces: parseInt(d.quantity) || parseInt(cutting.Total_Pcs) || parseInt(cutting.Cutting_Qty) || 0,
+        cuttingQty: parseInt(cutting.Cutting_Qty) || parseInt(cutting.Total_Pcs) || parseInt(d.quantity) || 0,
+        bomDate: d.createdAt || d.created_at || d.updatedAt || cutting.Date_of_Issue || '',
+        bomStatus: d.status || 'BOM Created',
+        designer: d.actorName || d.designer || d.created_by || 'Designer',
+        materialsRequired: bomItems,
+        materialsCount: bomItems.length,
+        totalIssuedCount,
+        isIssued,
+        issueStatus: isIssued ? (totalIssuedCount < bomItems.length ? 'Partially Issued' : 'Issued') : 'Material Not Issued',
+        cuttingDetails: {
+          shades: cutting.Shades || '',
+          sizes: cutting.Sizes || '',
+          partyName: cutting.Party_Name || '',
+          supervisor: cutting.Supervisor || ''
+        }
+      });
+    });
+
+    // By default, filter to lots where totalIssuedCount === 0 (or filter requested in query)
+    const filterType = req.query.filter || 'not_issued'; // 'not_issued', 'all', 'partial'
+    let filteredResults = pendingLots;
+    if (filterType === 'not_issued') {
+      filteredResults = pendingLots.filter(l => !l.isIssued || l.totalIssuedCount === 0);
+    } else if (filterType === 'partial') {
+      filteredResults = pendingLots.filter(l => l.isIssued && l.totalIssuedCount < l.materialsCount);
+    }
+
+    res.status(200).json(filteredResults);
+  } catch (err) {
+    console.error('API GET /api/reports/bom-created-not-issued error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve BOM created pending material issue lots.' });
   }
 });
 
@@ -4219,9 +4344,11 @@ const server = app.listen(PORT, HOST, () => {
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`\n[ERROR] Port ${PORT} is already in use.`);
-    console.error(`To kill the old process, run in PowerShell:\n`);
-    console.error(`    Stop-Process -Id (Get-NetTCPConnection -LocalPort ${PORT}).OwningProcess -Force\n`);
+    console.error(`\n[Server Notice] Port ${PORT} is temporarily busy. Retrying in 1.5 seconds...`);
+    setTimeout(() => {
+      try { server.close(); } catch (_) {}
+      server.listen(PORT, HOST);
+    }, 1500);
   } else {
     console.error('[Server Error]', err.message);
   }
