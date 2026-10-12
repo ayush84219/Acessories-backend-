@@ -3309,6 +3309,7 @@ export const getAllBoneIssues = async (lotNo = null) => {
     shade: r.shade,
     size: r.size,
     remarks: r.remarks,
+    payload: r.payload,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   }));
@@ -3493,6 +3494,7 @@ export const getAllElasticIssues = async (lotNo = null) => {
     totalTapeMtr: parseFloat(r.total_tape_mtr || 0),
     total_tape_mtr: parseFloat(r.total_tape_mtr || 0),
     remarks: r.remarks,
+    payload: r.payload,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   }));
