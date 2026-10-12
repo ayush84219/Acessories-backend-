@@ -2160,59 +2160,99 @@ export const getAllHistory = async () => {
 
 // ── PO Number counter (atomic, stored in settings) ──────────────────────────
 export const getNextPoNumber = async (type) => {
-  // Without Lot sequences: elastic-w/o-01, bone-w/o-01, tape-w/o-01
+  // Without Lot sequences: elastic-w/o-1, bone-w/o-1, tape-w/o-1, other-w/o-1 (strict sequential auto-increment)
   if (type === 'elastic_wo' || type === 'elastic-wo' || type === 'elastic_w_o') {
-    const key = 'elastic_wo_counter';
+    const prefix = 'elastic-w/o-';
     const conn = await pool.getConnection();
     try {
-      await conn.beginTransaction();
-      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_wo_counter', '0')"); } catch (_) {}
-      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
-      const next = (parseInt(row?.setting_value || '0', 10) + 1);
-      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
-      await conn.commit();
-      return `elastic-w/o-${String(next).padStart(2, '0')}`;
-    } catch (e) {
-      await conn.rollback();
-      throw e;
+      const [rows1] = await conn.execute("SELECT id FROM issue_logs WHERE LOWER(id) LIKE 'elastic-w/o-%'");
+      let [rows2] = [[]];
+      try {
+        [rows2] = await conn.execute("SELECT slip_no as id FROM elastic_issue WHERE LOWER(slip_no) LIKE 'elastic-w/o-%'");
+      } catch (_) {}
+      let max = 0;
+      for (const r of [...rows1, ...rows2]) {
+        const s = String(r.id || '').toLowerCase();
+        if (s.startsWith(prefix)) {
+          const n = parseInt(s.replace(prefix, ''), 10);
+          if (!isNaN(n) && n > max) max = n;
+        }
+      }
+      const next = max + 1;
+      try {
+        await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('elastic_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
+      } catch (_) {}
+      return `${prefix}${next}`;
     } finally {
       conn.release();
     }
   }
 
   if (type === 'bone_wo' || type === 'bone-wo') {
-    const key = 'bone_wo_counter';
+    const prefix = 'bone-w/o-';
     const conn = await pool.getConnection();
     try {
-      await conn.beginTransaction();
-      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('bone_wo_counter', '0')"); } catch (_) {}
-      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
-      const next = (parseInt(row?.setting_value || '0', 10) + 1);
-      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
-      await conn.commit();
-      return `bone-w/o-${String(next).padStart(2, '0')}`;
-    } catch (e) {
-      await conn.rollback();
-      throw e;
+      const [rows1] = await conn.execute("SELECT id FROM issue_logs WHERE LOWER(id) LIKE 'bone-w/o-%'");
+      let [rows2] = [[]];
+      try {
+        [rows2] = await conn.execute("SELECT slip_no as id FROM bone_issue WHERE LOWER(slip_no) LIKE 'bone-w/o-%'");
+      } catch (_) {}
+      let max = 0;
+      for (const r of [...rows1, ...rows2]) {
+        const s = String(r.id || '').toLowerCase();
+        if (s.startsWith(prefix)) {
+          const n = parseInt(s.replace(prefix, ''), 10);
+          if (!isNaN(n) && n > max) max = n;
+        }
+      }
+      const next = max + 1;
+      try {
+        await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('bone_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
+      } catch (_) {}
+      return `${prefix}${next}`;
     } finally {
       conn.release();
     }
   }
 
   if (type === 'tape_wo' || type === 'tape-wo') {
-    const key = 'tape_wo_counter';
+    const prefix = 'tape-w/o-';
     const conn = await pool.getConnection();
     try {
-      await conn.beginTransaction();
-      try { await conn.execute("INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('tape_wo_counter', '0')"); } catch (_) {}
-      const [[row]] = await conn.execute('SELECT setting_value FROM settings WHERE setting_key = ?', [key]);
-      const next = (parseInt(row?.setting_value || '0', 10) + 1);
-      await conn.execute('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [String(next), key]);
-      await conn.commit();
-      return `tape-w/o-${String(next).padStart(2, '0')}`;
-    } catch (e) {
-      await conn.rollback();
-      throw e;
+      const [rows1] = await conn.execute("SELECT id FROM issue_logs WHERE LOWER(id) LIKE 'tape-w/o-%'");
+      let max = 0;
+      for (const r of rows1) {
+        const s = String(r.id || '').toLowerCase();
+        if (s.startsWith(prefix)) {
+          const n = parseInt(s.replace(prefix, ''), 10);
+          if (!isNaN(n) && n > max) max = n;
+        }
+      }
+      const next = max + 1;
+      try {
+        await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('tape_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
+      } catch (_) {}
+      return `${prefix}${next}`;
+    } finally {
+      conn.release();
+    }
+  }
+
+  if (type === 'other_wo' || type === 'other-wo') {
+    const prefix = 'other-w/o-';
+    const conn = await pool.getConnection();
+    try {
+      const [rows1] = await conn.execute("SELECT id FROM issue_logs WHERE LOWER(id) LIKE 'other-w/o-%'");
+      let max = 0;
+      for (const r of rows1) {
+        const s = String(r.id || '').toLowerCase();
+        if (s.startsWith(prefix)) {
+          const n = parseInt(s.replace(prefix, ''), 10);
+          if (!isNaN(n) && n > max) max = n;
+        }
+      }
+      const next = max + 1;
+      return `${prefix}${next}`;
     } finally {
       conn.release();
     }
