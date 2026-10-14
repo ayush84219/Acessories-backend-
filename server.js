@@ -807,28 +807,28 @@ let lastMainFetchTime = 0;
 let lastCuttingFetchTime = 0;
 
 export function getMainSheetUrl() {
-  const mainId = process.env.GOOGLE_SHEET_ID || '1fKSwGBIpzWEFk566WRQ4bzQ0anJlmasoY8TwrTLQHXI';
+  const mainId = process.env.GOOGLE_SHEET_ID || '';
   if (process.env.GOOGLE_SHEET_URL && String(process.env.GOOGLE_SHEET_URL).trim()) {
     return parseGoogleSheetUrl(process.env.GOOGLE_SHEET_URL);
   }
-  return `https://docs.google.com/spreadsheets/d/${String(mainId).trim()}/export?format=csv&gid=0`;
+  return mainId ? `https://docs.google.com/spreadsheets/d/${String(mainId).trim()}/export?format=csv&gid=0` : '';
 }
 
 export function getCuttingSheetUrl() {
-  const cutId = process.env.CUTTING_GOOGLE_SHEET_ID || '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
+  const cutId = process.env.CUTTING_GOOGLE_SHEET_ID || '';
   if (process.env.CUTTING_GOOGLE_SHEET_URL && String(process.env.CUTTING_GOOGLE_SHEET_URL).trim()) {
     return parseGoogleSheetUrl(process.env.CUTTING_GOOGLE_SHEET_URL);
   }
-  return `https://docs.google.com/spreadsheets/d/${String(cutId).trim()}/export?format=csv&gid=1964871106`;
+  return cutId ? `https://docs.google.com/spreadsheets/d/${String(cutId).trim()}/export?format=csv&gid=1964871106` : '';
 }
 
 export function getCuttingSheetId() {
-  const raw = process.env.CUTTING_GOOGLE_SHEET_ID || process.env.CUTTING_GOOGLE_SHEET_URL || '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
+  const raw = process.env.CUTTING_GOOGLE_SHEET_ID || process.env.CUTTING_GOOGLE_SHEET_URL || '';
   const dMatch = String(raw).match(/\/d\/([a-zA-Z0-9_-]+)/);
   if (dMatch && dMatch[1]) return dMatch[1];
   const clean = String(raw).trim();
   if (clean && !clean.includes('/')) return clean;
-  return '1Hj3JeJEKB43aYYWv8gk2UhdU6BWuEQfCg5pBlTdBMNA';
+  return '';
 }
 
 // 1. Fetch Main Google Sheet (Used exclusively for Below of Material / Garment Design)

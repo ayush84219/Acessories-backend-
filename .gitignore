@@ -25,6 +25,10 @@ database.db
 logs/
 npm-debug.log*
 
+# Scratch, cache & temp files
+*.txt
+cache/
+
 # OS and Editor files
 .vscode/
 .idea/

@@ -1,5 +1,8 @@
-const apiKey = 'AIzaSyAomDFBkOySlIxKWSKGHe6ATv9gvaBr7uk';
-const spreadsheetId = '1BZ-ufmxeqa9XdU-jkuIgeNxHvhnYKjWj4UpnI3bHJKo';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const apiKey = process.env.GOOGLE_API_KEY || '';
+const spreadsheetId = process.env.RGP_SPREADSHEET_ID || '';
 
 async function checkPatterns() {
   const itemsUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Fabric_RGP_Items!A1:Z?key=${apiKey}`;

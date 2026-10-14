@@ -1,7 +1,7 @@
 import { pool } from './db.js';
 
-const DEFAULT_API_KEY = "AIzaSyAomDFBkOySlIxKWSKGHe6ATv9gvaBr7uk";
-const DEFAULT_SPREADSHEET_ID = "1hy43mDxXtGVq4jeMV_NxX25Q7tnX55NnplN7eqpT74k";
+const DEFAULT_API_KEY = process.env.GOOGLE_API_KEY || "";
+const DEFAULT_SPREADSHEET_ID = process.env.PO_SPREADSHEET_ID || "";
 
 export async function ensureOldPurchaseOrdersTable() {
   await pool.execute(`CREATE TABLE IF NOT EXISTS old_purchase_orders (
