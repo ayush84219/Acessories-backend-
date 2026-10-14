@@ -960,59 +960,119 @@ const toMysqlDatetime = (dateInput) => {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 };
 
+export const findExistingMaterial = async ({ id, itemCode, name } = {}) => {
+  const cleanId = (id || '').trim();
+  const cleanCode = (itemCode || '').trim();
+  const cleanName = (name || '').trim();
+
+  // 1. Direct ID match
+  if (cleanId) {
+    const [rows] = await pool.execute('SELECT * FROM materials WHERE LOWER(TRIM(id)) = LOWER(TRIM(?))', [cleanId]);
+    if (rows.length > 0) return rows[0];
+  }
+
+  // 2. Direct itemCode match in materials table
+  const searchCode = cleanCode || cleanId;
+  if (searchCode) {
+    const [codeRows] = await pool.execute(
+      'SELECT * FROM materials WHERE LOWER(TRIM(itemCode)) = LOWER(TRIM(?)) OR LOWER(TRIM(id)) = LOWER(TRIM(?))',
+      [searchCode, searchCode]
+    );
+    if (codeRows.length > 0) return codeRows[0];
+
+    // 3. Mapping from item_codes table
+    const [icRows] = await pool.execute(
+      'SELECT mt_code FROM item_codes WHERE LOWER(TRIM(item_code)) = LOWER(TRIM(?)) AND mt_code IS NOT NULL AND mt_code != ""',
+      [searchCode]
+    );
+    if (icRows.length > 0 && icRows[0].mt_code) {
+      const [mtRows] = await pool.execute(
+        'SELECT * FROM materials WHERE LOWER(TRIM(id)) = LOWER(TRIM(?))',
+        [icRows[0].mt_code]
+      );
+      if (mtRows.length > 0) return mtRows[0];
+    }
+  }
+
+  // 4. Exact name match (case-insensitive)
+  if (cleanName) {
+    const [nameRows] = await pool.execute(
+      'SELECT * FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))',
+      [cleanName]
+    );
+    if (nameRows.length > 0) return nameRows[0];
+  }
+
+  return null;
+};
+
 export const addOrUpdateMaterialFromCapture = async (data) => {
   const name = (data.materialName || '').trim();
-  const code = (data.materialCode || '').trim();
+  const code = (data.materialCode || data.itemCode || '').trim();
   const pieces = Number(data.pieces) || 0;
   const packets = Number(data.packets) || 1;
   const unit = data.unit || 'Pcs';
   const category = data.category || 'Accessory';
-  const location = data.storeLocation || 'Main Store';
+  const location = data.storeLocation || data.location || 'Main Store';
   const poNumber = data.poNumber || 'N/A';
   const invoiceNo = data.invoiceNo || 'N/A';
   const imageUrl = await uploadBase64ToCloudinary(data.imageUrl || '', 'accessories/materials');
 
-  if (!name && !code) return;
+  if (!name && !code) return null;
 
-  // Search by exact id (materialCode) first if present
-  let rows = [];
-  if (code) {
-    const [idRows] = await pool.execute('SELECT * FROM materials WHERE id = ?', [code]);
-    rows = idRows;
-  }
-  // Fall back to matching name only if no materialCode was provided
-  if (rows.length === 0 && name && !code) {
-    const [nameRows] = await pool.execute('SELECT * FROM materials WHERE name = ?', [name]);
-    rows = nameRows;
-  }
+  const existing = await findExistingMaterial({ id: code, itemCode: code, name });
 
-  if (rows.length > 0) {
-    // Existing material found -> add pieces to stock and update packets
-    const existing = rows[0];
+  if (existing) {
+    // Existing material found -> add pieces to stock and accumulate packets
     const updatedStock = (Number(existing.stock) || 0) + pieces;
+    const updatedPackets = (Number(existing.packets) || 0) + packets;
     await pool.execute(
-      'UPDATE materials SET stock = ?, packets = ?, unit = COALESCE(NULLIF(?, ""), unit), name = COALESCE(NULLIF(?, ""), name), location = COALESCE(NULLIF(?, ""), location), category = COALESCE(NULLIF(?, ""), category), poNumber = COALESCE(NULLIF(?, ""), poNumber), invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo), imageUrl = COALESCE(NULLIF(?, ""), imageUrl) WHERE id = ?',
-      [updatedStock, packets, data.unit || existing.unit, name || existing.name, location || existing.location, category || existing.category, poNumber || existing.poNumber, invoiceNo || existing.invoiceNo, imageUrl || existing.imageUrl || '', existing.id]
+      `UPDATE materials SET
+        stock = ?,
+        packets = ?,
+        unit = COALESCE(NULLIF(?, ""), unit),
+        location = COALESCE(NULLIF(?, ""), location),
+        category = COALESCE(NULLIF(?, ""), category),
+        poNumber = COALESCE(NULLIF(?, ""), poNumber),
+        invoiceNo = COALESCE(NULLIF(?, ""), invoiceNo),
+        imageUrl = COALESCE(NULLIF(?, ""), imageUrl),
+        itemCode = COALESCE(NULLIF(itemCode, ""), ?)
+       WHERE id = ?`,
+      [
+        updatedStock,
+        updatedPackets,
+        data.unit || existing.unit,
+        location || existing.location,
+        category || existing.category,
+        poNumber || existing.poNumber,
+        invoiceNo || existing.invoiceNo,
+        imageUrl || existing.imageUrl || '',
+        (code && code.startsWith('ST')) ? code : (existing.itemCode || ''),
+        existing.id
+      ]
     );
-    console.log(`[DB] Updated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${packets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+    console.log(`[DB] Accumulated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${updatedPackets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+    return existing.id;
   } else {
     // New material -> insert into materials table
-    const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
+    const matId = (code && !code.startsWith('ST')) ? code : `M${Math.floor(1000 + Math.random() * 9000)}`;
+    const finalItemCode = (code && code.startsWith('ST')) ? code : (data.itemCode || null);
     await pool.execute(
-      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl]
+      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl || '', finalItemCode]
     );
     console.log(`[DB] Created new material in Stock DB: ${matId} - ${name} (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+    return matId;
   }
 };
 
 export const syncWeightCapturesToMaterials = async () => {
   try {
     const [captures] = await pool.execute(
-      "SELECT materialCode, materialName, category, pieces, unit, storeLocation, packets, poNumber, invoiceNo, approvalStatus FROM weight_capture ORDER BY id ASC"
+      "SELECT materialCode, materialName, category, pieces, unit, storeLocation, packets, poNumber, invoiceNo, approvalStatus, itemCode FROM weight_capture ORDER BY id ASC"
     );
     for (const c of captures) {
-      const code = (c.materialCode || '').trim();
+      const code = (c.materialCode || c.itemCode || '').trim();
       const name = (c.materialName || 'Accessory Material').trim();
       const category = (c.category || 'Accessory').trim();
       const pieces = Number(c.pieces) || 0;
@@ -1023,27 +1083,27 @@ export const syncWeightCapturesToMaterials = async () => {
       const invoiceNo = c.invoiceNo || 'N/A';
 
       if (!code && !name) continue;
-      const matId = code || `M${Math.floor(1000 + Math.random() * 9000)}`;
 
-      const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [matId]);
-      if (existing.length > 0) {
-        const ext = existing[0];
-        const newName = ext.name === 'Accessory Material' || !ext.name ? name : ext.name;
-        const newCategory = ext.category === 'Accessory' || !ext.category ? category : ext.category;
-        const newUnit = !ext.unit ? unit : ext.unit;
-        const newPo = (!ext.poNumber || ext.poNumber === 'N/A') ? poNumber : ext.poNumber;
-        const newInv = (!ext.invoiceNo || ext.invoiceNo === 'N/A') ? invoiceNo : ext.invoiceNo;
-        const newLoc = (!ext.location || ext.location === 'Main Store') ? location : ext.location;
+      const existing = await findExistingMaterial({ id: code, itemCode: code, name });
+      if (existing) {
+        const newName = existing.name === 'Accessory Material' || !existing.name ? name : existing.name;
+        const newCategory = existing.category === 'Accessory' || !existing.category ? category : existing.category;
+        const newUnit = !existing.unit ? unit : existing.unit;
+        const newPo = (!existing.poNumber || existing.poNumber === 'N/A') ? poNumber : existing.poNumber;
+        const newInv = (!existing.invoiceNo || existing.invoiceNo === 'N/A') ? invoiceNo : existing.invoiceNo;
+        const newLoc = (!existing.location || existing.location === 'Main Store') ? location : existing.location;
 
         await pool.execute(
           'UPDATE materials SET name = ?, category = ?, unit = ?, poNumber = ?, invoiceNo = ?, location = ? WHERE id = ?',
-          [newName, newCategory, newUnit, newPo, newInv, newLoc, matId]
+          [newName, newCategory, newUnit, newPo, newInv, newLoc, existing.id]
         );
       } else {
         const isApproved = c.approvalStatus === 'Approved' || !c.approvalStatus;
+        const matId = (code && !code.startsWith('ST')) ? code : `M${Math.floor(1000 + Math.random() * 9000)}`;
+        const finalItemCode = (code && code.startsWith('ST')) ? code : (c.itemCode || null);
         await pool.execute(
-          'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [matId, name, category, isApproved ? pieces : 0, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo]
+          'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, itemCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [matId, name, category, isApproved ? pieces : 0, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, finalItemCode]
         );
         console.log(`[DB] Synced weight capture material into DB: ${matId} - ${name} (PO: ${poNumber}, Invoice: ${invoiceNo})`);
       }
@@ -1096,7 +1156,13 @@ export const createMaterialCapture = async (data) => {
   // ONLY sync to stock and warehouse locations if approved!
   if (approvalStatus === 'Approved') {
     try {
-      await addOrUpdateMaterialFromCapture(data);
+      const realMatId = await addOrUpdateMaterialFromCapture(data);
+      if (realMatId && realMatId !== data.materialCode) {
+        await pool.execute(
+          'UPDATE weight_capture SET materialCode = ?, itemCode = COALESCE(NULLIF(itemCode, ""), ?) WHERE id = ?',
+          [realMatId, data.materialCode || data.itemCode || '', captureId]
+        );
+      }
     } catch (syncErr) {
       console.error('[DB] Material stock sync error:', syncErr.message);
     }
@@ -1502,9 +1568,18 @@ export const getMaterialById = async (id) => {
 };
 
 export const upsertMaterial = async (m) => {
-  const [existing] = await pool.execute('SELECT * FROM materials WHERE id = ?', [m.id]);
-  if (existing.length > 0) {
-    const ext = existing[0];
+  const existingMat = await findExistingMaterial({ id: m.id, itemCode: m.itemCode, name: m.name });
+
+  if (existingMat) {
+    const ext = existingMat;
+    const isAccumulation = !!m.accumulateStock || (m.itemCode && m.id !== ext.id);
+    const newStock = isAccumulation
+      ? (Number(ext.stock) || 0) + (Number(m.stock) || 0)
+      : (m.stock !== undefined ? Number(m.stock) : ext.stock);
+    const newPackets = isAccumulation
+      ? (Number(ext.packets) || 0) + (Number(m.packets) || 1)
+      : (m.packets !== undefined ? Number(m.packets) : ext.packets);
+
     await pool.execute(
       `UPDATE materials SET
         name = ?,
@@ -1518,22 +1593,24 @@ export const upsertMaterial = async (m) => {
         packets = ?,
         poNumber = ?,
         invoiceNo = ?,
-        imageUrl = ?
+        imageUrl = ?,
+        itemCode = COALESCE(NULLIF(?, ''), itemCode)
        WHERE id = ?`,
       [
         m.name !== undefined ? m.name : ext.name,
         m.category !== undefined ? m.category : ext.category,
-        m.stock !== undefined ? m.stock : ext.stock,
+        newStock,
         m.unit !== undefined ? m.unit : ext.unit,
         m.cost !== undefined ? m.cost : ext.cost,
         m.threshold !== undefined ? m.threshold : ext.threshold,
         m.color !== undefined ? m.color : ext.color,
         m.location !== undefined ? m.location : ext.location,
-        m.packets !== undefined ? m.packets : ext.packets,
+        newPackets,
         m.poNumber !== undefined ? m.poNumber : ext.poNumber,
         m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
         m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
-        m.id
+        m.itemCode || ext.itemCode || '',
+        ext.id
       ]
     );
 
@@ -1543,32 +1620,37 @@ export const upsertMaterial = async (m) => {
         'UPDATE weight_capture SET storeLocation = ?, packets = ?, imageUrl = COALESCE(NULLIF(?, ""), imageUrl) WHERE materialCode = ?',
         [
           m.location !== undefined ? m.location : (ext.location || 'Main Store'),
-          m.packets !== undefined ? m.packets : ext.packets,
+          newPackets,
           m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
-          m.id
+          ext.id
         ]
       );
     }
+    return { ...ext, stock: newStock, packets: newPackets, isAccumulated: isAccumulation };
   } else {
+    const finalMatId = (m.id && !m.id.startsWith('ST')) ? m.id : `M${Math.floor(1000 + Math.random() * 9000)}`;
+    const finalItemCode = (m.id && m.id.startsWith('ST')) ? m.id : (m.itemCode || null);
     await pool.execute(
-      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        m.id,
+        finalMatId,
         m.name || 'Accessory Material',
         m.category || 'Accessory',
-        m.stock || 0,
+        Number(m.stock) || 0,
         m.unit || 'Pcs',
-        m.cost || 0,
-        m.threshold || 50,
+        Number(m.cost) || 0,
+        Number(m.threshold) || 50,
         m.color || 'Default',
         m.location || 'Main Store',
-        m.packets || 1,
+        Number(m.packets) || 1,
         m.poNumber || 'N/A',
         m.invoiceNo || 'N/A',
-        m.imageUrl || ''
+        m.imageUrl || '',
+        finalItemCode
       ]
     );
+    return { ...m, id: finalMatId, itemCode: finalItemCode, isAccumulated: false };
   }
 };
 
@@ -4267,6 +4349,7 @@ export const accumulateOrInsertMaterialSql = async ({
   invoiceNo = 'N/A',
   location = 'Main Store',
   pieces = 0,
+  packets = 1,
   weightPerPieceG = 0,
   netWeightKg = 0,
   cost = 0,
@@ -4275,86 +4358,75 @@ export const accumulateOrInsertMaterialSql = async ({
 }) => {
   const code = (itemCode || '').trim();
   const matName = (name || '').trim();
+  const qty = Number(pieces) || 0;
+  const numPackets = Number(packets) || 1;
 
-  // 1. Check if material with matching itemCode or exact name exists in materials table
-  let existing = null;
-  if (code) {
-    const [rows] = await pool.execute(
-      `SELECT * FROM materials WHERE itemCode = ? OR name = ? LIMIT 1`,
-      [code, code]
-    );
-    if (rows && rows.length > 0) existing = rows[0];
-  }
-
-  if (!existing && matName) {
-    const [rows] = await pool.execute(
-      `SELECT * FROM materials WHERE name = ? LIMIT 1`,
-      [matName]
-    );
-    if (rows && rows.length > 0) existing = rows[0];
-  }
+  // 1. Check if material with matching itemCode, id, or exact name exists in materials table
+  const existing = await findExistingMaterial({ id: code, itemCode: code, name: matName });
 
   if (existing) {
     // ACCUMULATE stock in existing material record
-    const updatedPieces = (parseInt(existing.pieces, 10) || 0) + (parseInt(pieces, 10) || 0);
-    const updatedNetWt = (parseFloat(existing.netWeightKg) || 0) + (parseFloat(netWeightKg) || 0);
+    const updatedStock = (Number(existing.stock) || 0) + qty;
+    const updatedPackets = (Number(existing.packets) || 0) + numPackets;
 
     await pool.execute(
       `UPDATE materials SET
-         pieces = ?,
-         netWeightKg = ?,
-         location = ?,
-         supplier = COALESCE(NULLIF(?, 'N/A'), supplier),
+         stock = ?,
+         packets = ?,
+         location = COALESCE(NULLIF(?, ''), location),
          poNumber = COALESCE(NULLIF(?, 'N/A'), poNumber),
-         invoiceNo = COALESCE(NULLIF(?, 'N/A'), invoiceNo)
+         invoiceNo = COALESCE(NULLIF(?, 'N/A'), invoiceNo),
+         itemCode = COALESCE(NULLIF(itemCode, ''), ?)
        WHERE id = ?`,
-      [updatedPieces, updatedNetWt, location || existing.location, supplier, poNumber, invoiceNo, existing.id]
+      [updatedStock, updatedPackets, location || existing.location, poNumber, invoiceNo, (code && code.startsWith('ST')) ? code : (existing.itemCode || ''), existing.id]
     );
 
     // Log Inward Transaction to Ledger
-    if (code || existing.itemCode) {
+    const ledgerCode = code || existing.itemCode;
+    if (ledgerCode) {
       await addLedgerEntrySql({
-        item_code: code || existing.itemCode,
+        item_code: ledgerCode,
         transaction_type: 'INWARD',
         po_number: poNumber,
         lot_no: lotNo,
         supplier_name: supplier,
-        qty: pieces,
+        qty: qty,
         net_wt: netWeightKg,
-        uom: uom,
+        uom: uom || existing.unit || 'PCS',
         location: location,
         person_name: personName,
-        remarks: `Accumulated ${pieces} ${uom} into existing stock (Total: ${updatedPieces})`
+        remarks: `Accumulated ${qty} ${uom} into existing stock (Total: ${updatedStock})`
       });
     }
 
-    return { ...existing, pieces: updatedPieces, netWeightKg: updatedNetWt, isAccumulated: true };
+    return { ...existing, stock: updatedStock, packets: updatedPackets, isAccumulated: true };
   } else {
     // INSERT new material record
-    const matId = `MAT-${Date.now()}`;
+    const matId = (code && !code.startsWith('ST')) ? code : `M${Math.floor(1000 + Math.random() * 9000)}`;
+    const finalItemCode = (code && code.startsWith('ST')) ? code : null;
     await pool.execute(
-      `INSERT INTO materials (id, itemCode, name, category, supplier, lotNo, poNumber, invoiceNo, location, pieces, weightPerPieceG, netWeightKg, cost, unit)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [matId, code || null, matName || code, category, supplier, lotNo, poNumber, invoiceNo, location, pieces, weightPerPieceG, netWeightKg, cost, uom]
+      `INSERT INTO materials (id, itemCode, name, category, location, packets, stock, cost, unit, poNumber, invoiceNo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [matId, finalItemCode, matName || code, category, location, numPackets, qty, cost, uom, poNumber, invoiceNo]
     );
 
-    if (code) {
+    if (code || finalItemCode) {
       await addLedgerEntrySql({
-        item_code: code,
+        item_code: code || finalItemCode,
         transaction_type: 'INWARD',
         po_number: poNumber,
         lot_no: lotNo,
         supplier_name: supplier,
-        qty: pieces,
+        qty: qty,
         net_wt: netWeightKg,
         uom: uom,
         location: location,
         person_name: personName,
-        remarks: `Initial inward entry of ${pieces} ${uom}`
+        remarks: `Initial inward entry of ${qty} ${uom}`
       });
     }
 
-    return { id: matId, itemCode: code, name: matName, pieces, netWeightKg, isAccumulated: false };
+    return { id: matId, itemCode: finalItemCode, name: matName, stock: qty, packets: numPackets, isAccumulated: false };
   }
 };
 

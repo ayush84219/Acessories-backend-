@@ -103,6 +103,11 @@ import {
 } from './db.js';
 import pool from './db.js';
 import cloudinary from './config/cloudinary.js';
+import {
+  syncOldPurchaseOrdersFromGoogleSheet,
+  getOldPurchaseOrders,
+  getOldPurchaseOrderByNumber
+} from './sync_old_pos.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2921,9 +2926,9 @@ app.get('/api/materials/:id', async (req, res) => {
 app.post('/api/materials', async (req, res) => {
   try {
     const m = req.body;
-    await upsertMaterial(m);
+    const result = await upsertMaterial(m);
     invalidateCache('materials_');
-    res.status(201).json({ message: 'Material saved successfully.', material: m });
+    res.status(201).json({ message: 'Material saved successfully.', material: result });
   } catch (err) {
     console.error('API POST /api/materials error:', err.message);
     res.status(500).json({ error: 'Failed to save material.' });
@@ -3158,6 +3163,43 @@ app.get('/api/pos/:poNumber', async (req, res) => {
   } catch (err) {
     console.error('API GET /api/pos/:poNumber error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve purchase order.' });
+  }
+});
+
+// ── Old Purchase Orders (Google Sheet -> MySQL -> Frontend) ──────────────────
+app.get('/api/old-pos', async (req, res) => {
+  try {
+    const { search, status, supplier, limit, offset } = req.query;
+    const data = await getOldPurchaseOrders({ search, status, supplier, limit, offset });
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('API GET /api/old-pos error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve old purchase orders.' });
+  }
+});
+
+app.get('/api/old-pos/:poNumber', async (req, res) => {
+  try {
+    const { poNumber } = req.params;
+    const po = await getOldPurchaseOrderByNumber(poNumber);
+    if (!po) {
+      return res.status(404).json({ error: 'Old purchase order not found.' });
+    }
+    res.status(200).json(po);
+  } catch (err) {
+    console.error('API GET /api/old-pos/:poNumber error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve old purchase order details.' });
+  }
+});
+
+app.post('/api/old-pos/sync', async (req, res) => {
+  try {
+    const { apiKey, spreadsheetId } = req.body || {};
+    const result = await syncOldPurchaseOrdersFromGoogleSheet({ apiKey, spreadsheetId });
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('API POST /api/old-pos/sync error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to sync old purchase orders.' });
   }
 });
 
