@@ -992,12 +992,18 @@ export const findExistingMaterial = async ({ id, itemCode, name } = {}) => {
       );
       if (mtRows.length > 0) return mtRows[0];
     }
+
+    // CRITICAL: Item codes are UNIQUE.
+    // If searchCode was specified and no material with that itemCode was found,
+    // do NOT fall back to matching a material with a different itemCode by name.
+    // Return null so a new separate entry is created for this item code.
+    return null;
   }
 
-  // 4. Exact name match (case-insensitive)
+  // 4. Exact name match (case-insensitive) - ONLY IF NO itemCode / searchCode was specified!
   if (cleanName) {
     const [nameRows] = await pool.execute(
-      'SELECT * FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))',
+      'SELECT * FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) AND (itemCode IS NULL OR itemCode = "" OR LOWER(TRIM(itemCode)) = LOWER(TRIM(id)))',
       [cleanName]
     );
     if (nameRows.length > 0) return nameRows[0];
@@ -1016,6 +1022,10 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
   const location = data.storeLocation || data.location || 'Main Store';
   const poNumber = data.poNumber || 'N/A';
   const invoiceNo = data.invoiceNo || 'N/A';
+  const supplier = data.supplier || 'N/A';
+  const lotNo = data.lotNo || 'N/A';
+  const personName = data.storeIncharge || data.personName || 'System';
+  const netWeightKg = Number(data.netWeightKg) || 0;
   const imageUrl = await uploadBase64ToCloudinary(data.imageUrl || '', 'accessories/materials');
 
   if (!name && !code) return null;
@@ -1023,7 +1033,7 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
   const existing = await findExistingMaterial({ id: code, itemCode: code, name });
 
   if (existing) {
-    // Existing material found -> add pieces to stock and accumulate packets
+    // Existing material found with SAME itemCode -> add pieces to stock and accumulate packets
     const updatedStock = (Number(existing.stock) || 0) + pieces;
     const updatedPackets = (Number(existing.packets) || 0) + packets;
     await pool.execute(
@@ -1051,17 +1061,68 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
         existing.id
       ]
     );
+
+    const ledgerCode = (code && code.startsWith('ST')) ? code : (existing.itemCode || code);
+    if (ledgerCode) {
+      await pool.execute(
+        'UPDATE item_codes SET mt_code = ? WHERE LOWER(TRIM(item_code)) = LOWER(TRIM(?)) AND (mt_code IS NULL OR mt_code = "")',
+        [existing.id, ledgerCode]
+      );
+      try {
+        await addLedgerEntrySql({
+          item_code: ledgerCode,
+          transaction_type: 'INWARD',
+          po_number: poNumber,
+          lot_no: lotNo,
+          supplier_name: supplier,
+          qty: pieces,
+          net_wt: netWeightKg,
+          uom: unit,
+          location: location,
+          person_name: personName,
+          remarks: `Inward accumulated ${pieces} ${unit} (Total: ${updatedStock})`
+        });
+      } catch (lErr) {
+        console.error('[DB] Ledger entry error:', lErr.message);
+      }
+    }
+
     console.log(`[DB] Accumulated stock for material ${existing.id} (${existing.name}): +${pieces} (New total: ${updatedStock}, Packets: ${updatedPackets}, PO: ${poNumber}, Invoice: ${invoiceNo})`);
     return existing.id;
   } else {
-    // New material -> insert into materials table
+    // New material / different itemCode -> insert new separate entry into materials table
     const matId = (code && !code.startsWith('ST')) ? code : `M${Math.floor(1000 + Math.random() * 9000)}`;
     const finalItemCode = (code && code.startsWith('ST')) ? code : (data.itemCode || null);
     await pool.execute(
       'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl || '', finalItemCode]
     );
-    console.log(`[DB] Created new material in Stock DB: ${matId} - ${name} (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
+
+    if (finalItemCode) {
+      await pool.execute(
+        'UPDATE item_codes SET mt_code = ? WHERE LOWER(TRIM(item_code)) = LOWER(TRIM(?)) AND (mt_code IS NULL OR mt_code = "")',
+        [matId, finalItemCode]
+      );
+      try {
+        await addLedgerEntrySql({
+          item_code: finalItemCode,
+          transaction_type: 'INWARD',
+          po_number: poNumber,
+          lot_no: lotNo,
+          supplier_name: supplier,
+          qty: pieces,
+          net_wt: netWeightKg,
+          uom: unit,
+          location: location,
+          person_name: personName,
+          remarks: `Initial inward entry of ${pieces} ${unit}`
+        });
+      } catch (lErr) {
+        console.error('[DB] Ledger entry error:', lErr.message);
+      }
+    }
+
+    console.log(`[DB] Created new separate material in Stock DB: ${matId} - ${name} [${finalItemCode || 'No Code'}] (${pieces} ${unit}, ${packets} packets, PO: ${poNumber}, Invoice: ${invoiceNo})`);
     return matId;
   }
 };
