@@ -223,12 +223,14 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     location   VARCHAR(255) DEFAULT 'Main Store',
     packets    INT DEFAULT 1,
     poNumber   VARCHAR(100) DEFAULT 'N/A',
-    invoiceNo  VARCHAR(100) DEFAULT 'N/A'
+    invoiceNo  VARCHAR(100) DEFAULT 'N/A',
+    vendorName VARCHAR(255) DEFAULT ''
   )`);
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN packets INT DEFAULT 1`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN poNumber VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN invoiceNo VARCHAR(100) DEFAULT "N/A"`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN imageUrl LONGTEXT NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN vendorName VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try {
     await pool.execute(`ALTER TABLE materials ADD COLUMN location VARCHAR(255) DEFAULT 'Main Store'`);
     // Copy existing location values (which were stored in 'color' column) into 'location' column if 'location' is at default
@@ -283,6 +285,25 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
       SET wc.itemCode = ic.item_code
       WHERE (wc.itemCode IS NULL OR wc.itemCode = '') AND ic.mt_code IS NOT NULL AND ic.mt_code != ''
     `);
+
+    // Auto-normalize any remaining materials to have official ST itemCode
+    const [legacyMats] = await pool.execute(`
+      SELECT id, itemCode FROM materials 
+      WHERE itemCode IS NULL OR itemCode = '' OR itemCode LIKE 'MT%' OR itemCode LIKE 'M%'
+    `);
+    for (const row of legacyMats) {
+      let code = String(row.itemCode || '').trim();
+      const src = code || row.id;
+      if (src.toUpperCase().startsWith('MT')) {
+        code = src.toUpperCase().replace(/^MT/, 'ST');
+      } else if (/^M\d+/i.test(src)) {
+        const digits = src.replace(/\D/g, '');
+        code = `ST${digits.padStart(5, '0')}`;
+      }
+      if (code && code.startsWith('ST')) {
+        await pool.execute(`UPDATE materials SET itemCode = ? WHERE id = ?`, [code, row.id]);
+      }
+    }
   } catch (_) { }
 
   // Approval Requests
@@ -1608,7 +1629,23 @@ export const getAllMaterials = async (onlyPresent = false) => {
     ORDER BY m.id ASC
   `;
   const [rows] = await pool.execute(sql);
-  return rows;
+  return rows.map(r => {
+    let code = String(r.itemCode || r.stCode || '').trim();
+    if (!code || code.toUpperCase().startsWith('MT') || /^M\d+/i.test(code)) {
+      const src = code || r.id;
+      if (src.toUpperCase().startsWith('MT')) {
+        code = src.toUpperCase().replace(/^MT/, 'ST');
+      } else if (/^M\d+/i.test(src)) {
+        const digits = src.replace(/\D/g, '');
+        code = `ST${digits.padStart(5, '0')}`;
+      }
+    }
+    return {
+      ...r,
+      itemCode: code || r.itemCode,
+      stCode: code || r.stCode
+    };
+  });
 };
 
 export const getMaterialById = async (id) => {
@@ -1655,6 +1692,7 @@ export const upsertMaterial = async (m) => {
         poNumber = ?,
         invoiceNo = ?,
         imageUrl = ?,
+        vendorName = ?,
         itemCode = COALESCE(NULLIF(?, ''), itemCode)
        WHERE id = ?`,
       [
@@ -1670,6 +1708,7 @@ export const upsertMaterial = async (m) => {
         m.poNumber !== undefined ? m.poNumber : ext.poNumber,
         m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
         m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
+        m.vendorName !== undefined ? m.vendorName : (ext.vendorName || ''),
         m.itemCode || ext.itemCode || '',
         ext.id
       ]
@@ -1692,8 +1731,8 @@ export const upsertMaterial = async (m) => {
     const finalMatId = (m.id && !m.id.startsWith('ST')) ? m.id : `M${Math.floor(1000 + Math.random() * 9000)}`;
     const finalItemCode = (m.id && m.id.startsWith('ST')) ? m.id : (m.itemCode || null);
     await pool.execute(
-      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, vendorName, itemCode)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         finalMatId,
         m.name || 'Accessory Material',
@@ -1708,6 +1747,7 @@ export const upsertMaterial = async (m) => {
         m.poNumber || 'N/A',
         m.invoiceNo || 'N/A',
         m.imageUrl || '',
+        m.vendorName || '',
         finalItemCode
       ]
     );
@@ -2282,6 +2322,12 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     garmentType: header.Garment_Type || '',
     brand: header.Brand || '',
     partyName: header.Party_Name || '',
+    cuttingQty: header.Cutting_Qty || 0,
+    shades: header.Shades || '',
+    sizes: header.Sizes || '',
+    dateOfIssue: header.Date_of_Issue || '',
+    jobOrderDate: header.JobOrder_Date || '',
+    header: header,
     zipPayload: header.zip_payload || null,
     doriPayload: dooriPayload,
     rows: parsedRows
@@ -3858,35 +3904,74 @@ export const updateItemCodeSql = async (id, { item_code, item_name, brand, style
     [newCode, newName, newBrand, newStyle, newCategory, newUom, newRate, newMtCode, current.id]
   );
 
-  // Sync references if item_code changed
-  if (oldCode && newCode && oldCode !== newCode) {
-    try {
-      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
-    } catch (_) {}
-    try {
-      await pool.execute('UPDATE materials SET itemCode = ? WHERE itemCode = ?', [newCode, oldCode]);
-    } catch (_) {}
-    try {
-      await pool.execute('UPDATE item_code_ledger SET item_code = ? WHERE item_code = ?', [newCode, oldCode]);
-    } catch (_) {}
+  let updatedMaterials = 0;
+  let updatedWeightCaptures = 0;
+  let updatedTransfers = 0;
+  let updatedLedgers = 0;
+
+  // 1. Cascade update to materials table everywhere
+  try {
+    const [resMat] = await pool.execute(
+      `UPDATE materials 
+       SET itemCode = ?, name = ?, category = ?, unit = ?
+       WHERE itemCode = ? OR itemCode = ? OR (id = ? AND id != '') OR (id = ? AND id != '')`,
+      [newCode, newName, newCategory, newUom, oldCode, newCode, oldMtCode || '', newMtCode || '']
+    );
+    updatedMaterials = resMat.affectedRows || 0;
+  } catch (err) {
+    console.error('[updateItemCodeSql - materials sync error]:', err.message);
   }
 
-  // Sync weight_capture & materials for mt_code
-  if (newMtCode) {
-    try {
-      await pool.execute('UPDATE weight_capture SET itemCode = ? WHERE materialCode = ?', [newCode, newMtCode]);
-    } catch (_) {}
-    try {
-      await pool.execute('UPDATE materials SET itemCode = ? WHERE id = ?', [newCode, newMtCode]);
-    } catch (_) {}
-  } else if (oldMtCode && !newMtCode) {
-    try {
-      await pool.execute('UPDATE weight_capture SET itemCode = NULL WHERE materialCode = ?', [oldMtCode]);
-    } catch (_) {}
-    try {
-      await pool.execute('UPDATE materials SET itemCode = NULL WHERE id = ?', [oldMtCode]);
-    } catch (_) {}
+  // 2. Cascade update to weight_capture table everywhere
+  try {
+    const [resWc] = await pool.execute(
+      `UPDATE weight_capture 
+       SET itemCode = ?, materialName = ?, category = ?, unit = ?
+       WHERE itemCode = ? OR itemCode = ? OR (materialCode = ? AND materialCode != '') OR (materialCode = ? AND materialCode != '')`,
+      [newCode, newName, newCategory, newUom, oldCode, newCode, oldMtCode || '', newMtCode || '']
+    );
+    updatedWeightCaptures = resWc.affectedRows || 0;
+  } catch (err) {
+    console.error('[updateItemCodeSql - weight_capture sync error]:', err.message);
   }
+
+  // 3. Cascade update to material_transfers table everywhere
+  try {
+    const [resTr] = await pool.execute(
+      `UPDATE material_transfers 
+       SET itemCode = ?, materialName = ?
+       WHERE itemCode = ? OR itemCode = ? OR (materialCode = ? AND materialCode != '') OR (materialCode = ? AND materialCode != '')`,
+      [newCode, newName, oldCode, newCode, oldMtCode || '', newMtCode || '']
+    );
+    updatedTransfers = resTr.affectedRows || 0;
+  } catch (err) {
+    // If itemCode column doesn't exist yet in material_transfers, add it and retry
+    try {
+      await pool.execute('ALTER TABLE material_transfers ADD COLUMN itemCode VARCHAR(100) NULL');
+      const [resTr2] = await pool.execute(
+        `UPDATE material_transfers 
+         SET itemCode = ?, materialName = ?
+         WHERE itemCode = ? OR itemCode = ? OR (materialCode = ? AND materialCode != '') OR (materialCode = ? AND materialCode != '')`,
+        [newCode, newName, oldCode, newCode, oldMtCode || '', newMtCode || '']
+      );
+      updatedTransfers = resTr2.affectedRows || 0;
+    } catch (_) { }
+  }
+
+  // 4. Cascade update to item_code_ledger table everywhere
+  try {
+    const [resLg] = await pool.execute(
+      `UPDATE item_code_ledger 
+       SET item_code = ?, item_name = ?, category = ?, uom = ?
+       WHERE item_code = ? OR item_code = ?`,
+      [newCode, newName, newCategory, newUom, oldCode, newCode]
+    );
+    updatedLedgers = resLg.affectedRows || 0;
+  } catch (err) {
+    console.error('[updateItemCodeSql - ledger sync error]:', err.message);
+  }
+
+  const totalSynced = updatedMaterials + updatedWeightCaptures + updatedTransfers + updatedLedgers;
 
   return {
     id: current.id,
@@ -3897,13 +3982,130 @@ export const updateItemCodeSql = async (id, { item_code, item_name, brand, style
     category: newCategory,
     uom: newUom,
     rate: newRate,
-    mt_code: newMtCode
+    mt_code: newMtCode,
+    synced: {
+      materials: updatedMaterials,
+      weightCapture: updatedWeightCaptures,
+      transfers: updatedTransfers,
+      ledger: updatedLedgers,
+      totalSynced
+    }
   };
 };
 
 export const deleteItemCodeSql = async (id) => {
-  await pool.execute('DELETE FROM item_codes WHERE id = ? OR item_code = ?', [String(id), String(id)]);
-  return true;
+  const [existing] = await pool.execute('SELECT * FROM item_codes WHERE id = ? OR item_code = ? LIMIT 1', [String(id), String(id)]);
+  if (!existing || existing.length === 0) {
+    return { success: true, count: 0, deletedCode: String(id) };
+  }
+  const current = existing[0];
+  const code = current.item_code;
+
+  let unlinkedMats = 0;
+  let unlinkedWc = 0;
+
+  // Safely unlink references in materials
+  try {
+    const [r1] = await pool.execute('UPDATE materials SET itemCode = NULL WHERE itemCode = ?', [code]);
+    unlinkedMats = r1.affectedRows || 0;
+  } catch (_) {}
+
+  // Safely unlink references in weight_capture
+  try {
+    const [r2] = await pool.execute('UPDATE weight_capture SET itemCode = NULL WHERE itemCode = ?', [code]);
+    unlinkedWc = r2.affectedRows || 0;
+  } catch (_) {}
+
+  // Safely unlink references in material_transfers
+  try {
+    await pool.execute('UPDATE material_transfers SET itemCode = NULL WHERE itemCode = ?', [code]);
+  } catch (_) {}
+
+  // Delete from item_codes
+  await pool.execute('DELETE FROM item_codes WHERE id = ?', [current.id]);
+
+  return {
+    success: true,
+    deletedId: current.id,
+    deletedCode: code,
+    unlinkedMaterials: unlinkedMats,
+    unlinkedWeightCaptures: unlinkedWc
+  };
+};
+
+export const getItemCodeUsageSql = async (id) => {
+  const [existing] = await pool.execute('SELECT * FROM item_codes WHERE id = ? OR item_code = ? LIMIT 1', [String(id), String(id)]);
+  if (!existing || existing.length === 0) {
+    throw new Error(`Item code ${id} not found`);
+  }
+  const ic = existing[0];
+  const code = ic.item_code;
+  const mtCode = ic.mt_code || '';
+
+  // 1. Materials matching itemCode or mt_code
+  let materialsList = [];
+  try {
+    const [mats] = await pool.execute(
+      `SELECT id, name, category, stock, unit, location, packets 
+       FROM materials 
+       WHERE itemCode = ? OR (id = ? AND id != '')
+       LIMIT 50`,
+      [code, mtCode]
+    );
+    materialsList = mats || [];
+  } catch (_) {}
+
+  // 2. Weight Captures count & samples
+  let weightCaptureCount = 0;
+  let weightCaptureSample = [];
+  try {
+    const [wcs] = await pool.execute(
+      `SELECT COUNT(*) as cnt FROM weight_capture WHERE itemCode = ? OR (materialCode = ? AND materialCode != '')`,
+      [code, mtCode]
+    );
+    weightCaptureCount = wcs[0]?.cnt || 0;
+
+    const [sample] = await pool.execute(
+      `SELECT id, materialCode, materialName, storeLocation, pieces, packets, poNumber, invoiceNo, capturedAt 
+       FROM weight_capture 
+       WHERE itemCode = ? OR (materialCode = ? AND materialCode != '')
+       ORDER BY id DESC LIMIT 5`,
+      [code, mtCode]
+    );
+    weightCaptureSample = sample || [];
+  } catch (_) {}
+
+  // 3. Transfers count
+  let transferCount = 0;
+  try {
+    const [trs] = await pool.execute(
+      `SELECT COUNT(*) as cnt FROM material_transfers WHERE itemCode = ? OR (materialCode = ? AND materialCode != '')`,
+      [code, mtCode]
+    );
+    transferCount = trs[0]?.cnt || 0;
+  } catch (_) {}
+
+  // 4. Ledger entries count
+  let ledgerCount = 0;
+  try {
+    const [lgs] = await pool.execute(
+      `SELECT COUNT(*) as cnt FROM item_code_ledger WHERE item_code = ?`,
+      [code]
+    );
+    ledgerCount = lgs[0]?.cnt || 0;
+  } catch (_) {}
+
+  const totalPlaces = materialsList.length + weightCaptureCount + transferCount + ledgerCount;
+
+  return {
+    itemCode: ic,
+    materials: materialsList,
+    weightCaptureCount,
+    weightCaptureSample,
+    transferCount,
+    ledgerCount,
+    totalPlaces
+  };
 };
 
 export const resequenceItemCodesSql = async () => {

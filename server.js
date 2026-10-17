@@ -99,6 +99,7 @@ import {
   autoMapAllCodesSql,
   addLedgerEntrySql,
   getItemCodeLedgerSql,
+  getItemCodeUsageSql,
   accumulateOrInsertMaterialSql
 } from './db.js';
 import pool from './db.js';
@@ -236,15 +237,27 @@ function getCached(key) {
 
 function setCached(key, data, ttlMs = 30000) {
   if (memoryCache.size >= MAX_CACHE_ENTRIES) {
-    // Evict oldest entry
-    const oldestKey = memoryCache.keys().next().value;
-    if (oldestKey) memoryCache.delete(oldestKey);
+    // Empty cache when full as requested
+    console.log(`[Memory Cache] Cache full (${memoryCache.size}/${MAX_CACHE_ENTRIES} entries). Emptying cache...`);
+    memoryCache.clear();
   }
   memoryCache.set(key, {
     data,
     expiresAt: Date.now() + ttlMs
   });
 }
+
+// ── Periodic 30-Minute Cache Reload & Disk Maintenance ──
+const CACHE_RELOAD_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+setInterval(() => {
+  console.log('[Cache Monitor] 30-minute maintenance cycle triggered: emptying in-memory cache and auto-cleaning disk cache...');
+  memoryCache.clear();
+  try {
+    autoCleanCache();
+  } catch (err) {
+    console.error('[Cache Monitor] autoCleanCache error:', err.message);
+  }
+}, CACHE_RELOAD_INTERVAL_MS);
 
 function invalidateCache(prefix) {
   if (!prefix) {
@@ -4189,10 +4202,20 @@ app.put('/api/item-codes/:id', async (req, res) => {
   }
 });
 
+app.get('/api/item-codes/:id/usage', async (req, res) => {
+  try {
+    const usage = await getItemCodeUsageSql(req.params.id);
+    res.json({ success: true, ...usage });
+  } catch (err) {
+    console.error('[API GET /api/item-codes/:id/usage error]:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.delete('/api/item-codes/:id', async (req, res) => {
   try {
-    await deleteItemCodeSql(req.params.id);
-    res.json({ success: true, message: 'Item Code deleted successfully' });
+    const result = await deleteItemCodeSql(req.params.id);
+    res.json({ success: true, message: 'Item Code deleted successfully', ...result });
   } catch (err) {
     console.error('[API DELETE /api/item-codes error]:', err.message);
     res.status(500).json({ success: false, error: err.message });
