@@ -272,6 +272,9 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
 
   try { await pool.execute(`ALTER TABLE materials ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN itemCode VARCHAR(100) NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE materials ADD COLUMN brand VARCHAR(100) NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN brand VARCHAR(100) NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN rate DOUBLE DEFAULT 0`); } catch (_) { }
   try {
     await pool.execute(`
       UPDATE materials m
@@ -1053,6 +1056,9 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
 
   const existing = await findExistingMaterial({ id: code, itemCode: code, name });
 
+  const itemRate = Number(data.rate || data.price || data.cost) || 0;
+  const brand = data.brand || '';
+
   if (existing) {
     // Existing material found with SAME itemCode -> add pieces to stock and accumulate packets
     const updatedStock = (Number(existing.stock) || 0) + pieces;
@@ -1061,6 +1067,8 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
       `UPDATE materials SET
         stock = ?,
         packets = ?,
+        cost = CASE WHEN ? > 0 THEN ? ELSE cost END,
+        brand = COALESCE(NULLIF(?, ""), brand),
         unit = COALESCE(NULLIF(?, ""), unit),
         location = COALESCE(NULLIF(?, ""), location),
         category = COALESCE(NULLIF(?, ""), category),
@@ -1072,6 +1080,9 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
       [
         updatedStock,
         updatedPackets,
+        itemRate,
+        itemRate,
+        brand,
         data.unit || existing.unit,
         location || existing.location,
         category || existing.category,
@@ -1115,8 +1126,8 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
     const matId = (code && !code.startsWith('ST')) ? code : `M${Math.floor(1000 + Math.random() * 9000)}`;
     const finalItemCode = (code && code.startsWith('ST')) ? code : (data.itemCode || null);
     await pool.execute(
-      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [matId, name || 'Accessory Material', category, pieces, unit, 0, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl || '', finalItemCode]
+      'INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, itemCode, brand) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [matId, name || 'Accessory Material', category, pieces, unit, itemRate, 50, 'Default', location, packets, poNumber, invoiceNo, imageUrl || '', finalItemCode, brand]
     );
 
     if (finalItemCode) {
@@ -1206,6 +1217,7 @@ export const getUserByEmail = async (email) => {
 export const createMaterialCapture = async (data) => {
   const {
     materialCode, materialName, unit = 'Pcs', category = '', supplier = '',
+    brand = '', rate = 0, price = 0,
     lotNo = '', poNumber = '', invoiceNo = '', storeLocation = '', storeIncharge = '',
     grossWeightKg = 0, tareWeightKg = 0, netWeightKg = 0, weightPerPieceG = 0,
     sampleQty = 0, sampleWeightKg = 0,
@@ -1217,15 +1229,16 @@ export const createMaterialCapture = async (data) => {
     imageUrl = ''
   } = data;
 
+  const itemRate = Number(rate || price) || 0;
   const finalImageUrl = await uploadBase64ToCloudinary(imageUrl, 'accessories/weight_capture');
 
   const [result] = await pool.execute(
     `INSERT INTO weight_capture
-     (materialCode,materialName,unit,category,supplier,lotNo,poNumber,invoiceNo,
+     (materialCode,materialName,brand,rate,unit,category,supplier,lotNo,poNumber,invoiceNo,
       storeLocation,storeIncharge,grossWeightKg,tareWeightKg,netWeightKg,
       weightPerPieceG,sampleQty,sampleWeightKg,pieces,packets,barcodeId,status,approvalStatus,entryMode,remarks,imageUrl)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [materialCode, materialName, brand, itemRate, unit, category, supplier, lotNo, poNumber, invoiceNo,
       storeLocation, storeIncharge,
       Number(grossWeightKg), Number(tareWeightKg), Number(netWeightKg),
       Number(weightPerPieceG), Number(sampleQty), Number(sampleWeightKg),
@@ -1520,7 +1533,7 @@ export const clearAllWarehouseLocations = async () => {
 export const getAllMaterialCaptures = async (summaryOnly = false) => {
   if (summaryOnly) {
     const [rows] = await pool.execute(
-      'SELECT id, materialCode, materialName, unit, category, supplier, lotNo, poNumber, invoiceNo, storeLocation, storeIncharge, grossWeightKg, tareWeightKg, netWeightKg, pieces, packets, barcodeId, status, approvalStatus, capturedAt, remarks, itemCode FROM weight_capture ORDER BY capturedAt DESC'
+      'SELECT id, materialCode, materialName, brand, rate, unit, category, supplier, lotNo, poNumber, invoiceNo, storeLocation, storeIncharge, grossWeightKg, tareWeightKg, netWeightKg, pieces, packets, barcodeId, status, approvalStatus, capturedAt, remarks, itemCode FROM weight_capture ORDER BY capturedAt DESC'
     );
     return rows;
   }
