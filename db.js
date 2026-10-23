@@ -788,6 +788,37 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     capacity    INT DEFAULT 20
   )`);
 
+  // Transaction Cancellations Audit Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS transaction_cancellations (
+    id               INT PRIMARY KEY AUTO_INCREMENT,
+    transactionType  VARCHAR(50)   NOT NULL,
+    transactionRef   VARCHAR(100)  NOT NULL,
+    reason           VARCHAR(255)  NOT NULL,
+    remarks          TEXT,
+    cancelledBy      VARCHAR(255)  NOT NULL,
+    cancelledAt      DATETIME      DEFAULT CURRENT_TIMESTAMP,
+    status           VARCHAR(50)   DEFAULT 'Cancelled',
+    meta             LONGTEXT
+  )`);
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN status VARCHAR(50) DEFAULT 'Active'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE zip ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN status VARCHAR(50) DEFAULT 'Active'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE doori ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE scans ADD COLUMN status VARCHAR(50) DEFAULT 'Active'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE scans ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE scans ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE scans ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+
   // Dedicated Lot Operations Summary Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS lot_operations_summary (
     id                      INT AUTO_INCREMENT PRIMARY KEY,
@@ -4704,6 +4735,512 @@ export const accumulateOrInsertMaterialSql = async ({
 
     return { id: matId, itemCode: finalItemCode, name: matName, stock: qty, packets: numPackets, isAccumulated: false };
   }
+};
+
+// ── Transaction Cancellations & Combined Transactions ─────────────────────────
+export const cancelTransactionInDb = async ({
+  transactionType,
+  transactionRef,
+  reason,
+  remarks = '',
+  cancelledBy = 'Admin',
+  meta = null
+}) => {
+  const metaStr = meta ? (typeof meta === 'string' ? meta : JSON.stringify(meta)) : null;
+  const now = new Date();
+
+  // 1. Record in audit cancellations table
+  const [res] = await pool.execute(
+    `INSERT INTO transaction_cancellations 
+     (transactionType, transactionRef, reason, remarks, cancelledBy, cancelledAt, status, meta)
+     VALUES (?, ?, ?, ?, ?, ?, 'Cancelled', ?)`,
+    [transactionType, String(transactionRef).trim(), reason, remarks, cancelledBy, now, metaStr]
+  );
+
+  const cleanRef = String(transactionRef).trim();
+  const cleanRefLower = cleanRef.toLowerCase();
+
+  // 2. Update status in respective table
+  if (transactionType === 'po') {
+    await pool.execute(
+      `UPDATE purchase_orders 
+       SET status = 'Cancelled', cancellation_reason = ?, cancelled_by = ?, cancelled_at = ?
+       WHERE LOWER(poNumber) = ? OR id = ?`,
+      [reason, cancelledBy, now, cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'rgp') {
+    await pool.execute(
+      `UPDATE rgp 
+       SET status = 'Cancelled', cancellation_reason = ?, cancelled_by = ?, cancelled_at = ?
+       WHERE LOWER(rgpNo) = ? OR id = ?`,
+      [reason, cancelledBy, now, cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'dori') {
+    await pool.execute(
+      `UPDATE doori 
+       SET status = 'Cancelled', cancellation_reason = ?, cancelled_by = ?, cancelled_at = ?
+       WHERE LOWER(Lot_Number) = ? OR LOWER(po_number) = ? OR id = ?`,
+      [reason, cancelledBy, now, cleanRefLower, cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'zip') {
+    await pool.execute(
+      `UPDATE zip 
+       SET status = 'Cancelled', cancellation_reason = ?, cancelled_by = ?, cancelled_at = ?
+       WHERE LOWER(Lot_Number) = ? OR LOWER(po_number) = ? OR id = ?`,
+      [reason, cancelledBy, now, cleanRefLower, cleanRefLower, cleanRef]
+    );
+    try {
+      await pool.execute(
+        `UPDATE cutting_header 
+         SET WIP_Status = 'Cancelled', Completed_Status = 'Cancelled'
+         WHERE LOWER(Lot_Number) = ?`,
+        [cleanRefLower]
+      );
+    } catch (_) { }
+  } else if (transactionType === 'scan') {
+    await pool.execute(
+      `UPDATE scans 
+       SET status = 'Cancelled', cancellation_reason = ?, cancelled_by = ?, cancelled_at = ?
+       WHERE id = ?`,
+      [reason, cancelledBy, now, cleanRef]
+    );
+  }
+
+  return {
+    id: res.insertId,
+    transactionType,
+    transactionRef,
+    reason,
+    remarks,
+    cancelledBy,
+    cancelledAt: now.toISOString(),
+    status: 'Cancelled'
+  };
+};
+
+export const getAllCancellationsInDb = async () => {
+  const [rows] = await pool.execute('SELECT * FROM transaction_cancellations ORDER BY id DESC');
+  return rows;
+};
+
+export const restoreTransactionInDb = async ({ transactionType, transactionRef }) => {
+  const cleanRef = String(transactionRef).trim();
+  const cleanRefLower = cleanRef.toLowerCase();
+
+  await pool.execute(
+    `DELETE FROM transaction_cancellations WHERE transactionType = ? AND LOWER(transactionRef) = ?`,
+    [transactionType, cleanRefLower]
+  );
+
+  if (transactionType === 'po') {
+    await pool.execute(
+      `UPDATE purchase_orders SET status = 'Approved', cancellation_reason = '', cancelled_by = '', cancelled_at = NULL WHERE LOWER(poNumber) = ? OR id = ?`,
+      [cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'rgp') {
+    await pool.execute(
+      `UPDATE rgp SET status = 'Dispatched', cancellation_reason = '', cancelled_by = '', cancelled_at = NULL WHERE LOWER(rgpNo) = ? OR id = ?`,
+      [cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'dori') {
+    await pool.execute(
+      `UPDATE doori SET status = 'Active', cancellation_reason = '', cancelled_by = '', cancelled_at = NULL WHERE LOWER(Lot_Number) = ? OR LOWER(po_number) = ? OR id = ?`,
+      [cleanRefLower, cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'zip') {
+    await pool.execute(
+      `UPDATE zip SET status = 'Active', cancellation_reason = '', cancelled_by = '', cancelled_at = NULL WHERE LOWER(Lot_Number) = ? OR LOWER(po_number) = ? OR id = ?`,
+      [cleanRefLower, cleanRefLower, cleanRef]
+    );
+  } else if (transactionType === 'scan') {
+    await pool.execute(
+      `UPDATE scans SET status = 'Active', cancellation_reason = '', cancelled_by = '', cancelled_at = NULL WHERE id = ?`,
+      [cleanRef]
+    );
+  }
+
+  return { success: true, transactionRef };
+};
+
+// ── Admin Panel Lot Costing & Valuation Services ─────────────────────────────
+
+export const getRecentCostingLots = async (limit = 100) => {
+  const [rows] = await pool.execute(`
+    SELECT ch.Lot_Number AS lotNo, MAX(ch.Cutting_Qty) AS cuttingQty, MAX(ch.Style) AS style, MAX(ch.Fabric) AS fabric, MAX(ch.Brand) AS brand, MAX(ch.Party_Name) AS partyName
+    FROM cutting_header ch
+    WHERE ch.Lot_Number IS NOT NULL AND ch.Lot_Number != ''
+    GROUP BY ch.Lot_Number
+    ORDER BY MAX(ch.id) DESC
+    LIMIT ?
+  `, [String(limit)]);
+  return rows;
+};
+
+export const updateMaterialRate = async ({ materialId, materialName, itemCode, rate }) => {
+  const numericRate = parseFloat(rate) || 0;
+  if (materialId) {
+    await pool.execute('UPDATE materials SET cost = ? WHERE id = ?', [numericRate, materialId]).catch(() => null);
+  }
+  if (itemCode) {
+    await pool.execute('UPDATE materials SET cost = ? WHERE itemCode = ?', [numericRate, itemCode]).catch(() => null);
+    await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [numericRate, itemCode]).catch(() => null);
+  }
+  if (materialName) {
+    await pool.execute('UPDATE materials SET cost = ? WHERE LOWER(name) = LOWER(?)', [numericRate, materialName.trim()]).catch(() => null);
+  }
+  return { success: true, rate: numericRate };
+};
+
+export const getLotCostingData = async (lotNo) => {
+  const cleanLot = String(lotNo || '').trim();
+  if (!cleanLot) return null;
+
+  // 1. Fetch cutting header or design
+  const [cuttingRows] = await pool.execute(
+    'SELECT * FROM cutting_header WHERE LOWER(TRIM(Lot_Number)) = LOWER(TRIM(?)) ORDER BY id DESC LIMIT 1',
+    [cleanLot]
+  );
+  const header = cuttingRows[0] || null;
+
+  let design = null;
+  if (!header) {
+    const [desRows] = await pool.execute(
+      'SELECT * FROM designs WHERE LOWER(TRIM(id)) = LOWER(TRIM(?)) OR LOWER(TRIM(lotNo2)) = LOWER(TRIM(?)) LIMIT 1',
+      [cleanLot, cleanLot]
+    );
+    design = desRows[0] || null;
+  }
+
+  const cuttingQty = header ? Number(header.Cutting_Qty || header.Stitching_Issue_Qty || 0) : (design ? Number(design.quantity || 100) : 0);
+
+  const lotInfo = {
+    lotNo: cleanLot,
+    cuttingQty: cuttingQty,
+    style: header?.Style || design?.style || design?.name || 'N/A',
+    fabric: header?.Fabric || design?.fabricType || 'N/A',
+    garmentType: header?.Garment_Type || design?.category || 'N/A',
+    brand: header?.Brand || design?.brand || 'N/A',
+    partyName: header?.Party_Name || 'N/A',
+    supervisor: header?.Supervisor || 'N/A',
+    date: header?.Date_of_Issue || header?.JobOrder_Date || design?.date || header?.Saved_At || 'N/A',
+    imageUrl: header?.Image_Url || design?.imageUrl || ''
+  };
+
+  // 2. Fetch master materials and item codes for rate matching
+  const [allMaterials] = await pool.execute('SELECT id, name, category, stock, unit, cost, itemCode, location, brand, imageUrl FROM materials');
+  const [allItemCodes] = await pool.execute('SELECT item_code, item_name, rate, uom, category FROM item_codes');
+
+  const matById = new Map();
+  const matByName = new Map();
+  const matByCode = new Map();
+
+  allMaterials.forEach(m => {
+    if (m.id) matById.set(String(m.id).trim().toLowerCase(), m);
+    if (m.name) matByName.set(String(m.name).trim().toLowerCase(), m);
+    if (m.itemCode) matByCode.set(String(m.itemCode).trim().toLowerCase(), m);
+  });
+
+  const itemCodeMap = new Map();
+  allItemCodes.forEach(ic => {
+    if (ic.item_code) itemCodeMap.set(String(ic.item_code).trim().toLowerCase(), ic);
+  });
+
+  const resolveRate = (item) => {
+    if (item.rate && Number(item.rate) > 0) return Number(item.rate);
+    if (item.cost && Number(item.cost) > 0) return Number(item.cost);
+    if (item.price && Number(item.price) > 0) return Number(item.price);
+
+    const idKey = String(item.materialId || item.id || '').trim().toLowerCase();
+    if (idKey && matById.has(idKey)) {
+      const m = matById.get(idKey);
+      if (m.cost && Number(m.cost) > 0) return Number(m.cost);
+    }
+
+    const codeKey = String(item.itemCode || item.code || '').trim().toLowerCase();
+    if (codeKey) {
+      if (matByCode.has(codeKey)) {
+        const m = matByCode.get(codeKey);
+        if (m.cost && Number(m.cost) > 0) return Number(m.cost);
+      }
+      if (itemCodeMap.has(codeKey)) {
+        const ic = itemCodeMap.get(codeKey);
+        if (ic.rate && Number(ic.rate) > 0) return Number(ic.rate);
+      }
+    }
+
+    const nameKey = String(item.materialName || item.name || '').trim().toLowerCase();
+    if (nameKey && matByName.has(nameKey)) {
+      const m = matByName.get(nameKey);
+      if (m.cost && Number(m.cost) > 0) return Number(m.cost);
+    }
+
+    return 0;
+  };
+
+  const resolveMaterialMeta = (item) => {
+    const idKey = String(item.materialId || item.id || '').trim().toLowerCase();
+    const codeKey = String(item.itemCode || item.code || '').trim().toLowerCase();
+    const nameKey = String(item.materialName || item.name || '').trim().toLowerCase();
+
+    let matched = null;
+    if (idKey && matById.has(idKey)) matched = matById.get(idKey);
+    else if (codeKey && matByCode.has(codeKey)) matched = matByCode.get(codeKey);
+    else if (nameKey && matByName.has(nameKey)) matched = matByName.get(nameKey);
+
+    let icMatched = null;
+    if (codeKey && itemCodeMap.has(codeKey)) icMatched = itemCodeMap.get(codeKey);
+
+    return {
+      materialId: matched?.id || item.materialId || item.id || '',
+      itemCode: matched?.itemCode || icMatched?.item_code || item.itemCode || item.code || '',
+      category: matched?.category || icMatched?.category || item.category || item.bomItemName || 'Accessory',
+      location: matched?.location || item.location || 'Store Floor',
+      imageUrl: matched?.imageUrl || item.photo || item.imageUrl || '',
+      unit: item.unit || matched?.unit || icMatched?.uom || 'PCS'
+    };
+  };
+
+  // 3. Fetch issue tables for lot
+  const [issueLogs] = await pool.execute(
+    'SELECT * FROM issue_logs WHERE LOWER(TRIM(lotId)) = LOWER(TRIM(?)) ORDER BY id ASC',
+    [cleanLot]
+  );
+  const [extraIssues] = await pool.execute(
+    'SELECT * FROM extra_material_issues WHERE LOWER(TRIM(lot_id)) = LOWER(TRIM(?)) ORDER BY id ASC',
+    [cleanLot]
+  );
+  const [elasticIssues] = await pool.execute(
+    'SELECT * FROM elastic_issue WHERE LOWER(TRIM(lot_no)) = LOWER(TRIM(?)) ORDER BY id ASC',
+    [cleanLot]
+  );
+  const [boneIssues] = await pool.execute(
+    'SELECT * FROM bone_issue WHERE LOWER(TRIM(lot_no)) = LOWER(TRIM(?)) ORDER BY id ASC',
+    [cleanLot]
+  );
+  const [zipRows] = await pool.execute(
+    'SELECT * FROM zip WHERE LOWER(TRIM(Lot_Number)) = LOWER(TRIM(?))',
+    [cleanLot]
+  );
+
+  // Deduplicate REAL-MI vs demand slips
+  const realMiParentBills = new Set();
+  issueLogs.forEach(l => {
+    const id = String(l.id || '').toUpperCase();
+    if (id.startsWith('REAL-MI-')) {
+      let mats = [];
+      try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) {}
+      const billNo = mats[0]?.billNo;
+      if (billNo) realMiParentBills.add(String(billNo).toLowerCase());
+    }
+  });
+
+  const itemsMap = new Map();
+
+  const addItemToCosting = (rawItem, slipMeta) => {
+    const rawName = String(rawItem.materialName || rawItem.name || '').trim();
+    if (!rawName) return;
+
+    const meta = resolveMaterialMeta(rawItem);
+    const rate = resolveRate(rawItem);
+    const qty = Number(rawItem.qty || rawItem.quantity || rawItem.extra_qty || rawItem.extraQty || rawItem.rolls || 0);
+
+    const normKey = (meta.itemCode ? meta.itemCode.toLowerCase() : rawName.toLowerCase());
+
+    if (!itemsMap.has(normKey)) {
+      itemsMap.set(normKey, {
+        key: normKey,
+        materialId: meta.materialId,
+        itemCode: meta.itemCode || 'ST-MISC',
+        materialName: rawName,
+        category: meta.category,
+        unit: meta.unit,
+        location: meta.location,
+        imageUrl: meta.imageUrl,
+        quantity: 0,
+        rate: rate,
+        totalCost: 0,
+        costPerPiece: 0,
+        slips: []
+      });
+    }
+
+    const entry = itemsMap.get(normKey);
+    entry.quantity += qty;
+    if (rate > 0 && entry.rate === 0) {
+      entry.rate = rate;
+    }
+    entry.slips.push({
+      voucherId: slipMeta.voucherId,
+      source: slipMeta.source,
+      date: slipMeta.date,
+      issuer: slipMeta.issuer,
+      receiver: slipMeta.receiver,
+      receiverDept: slipMeta.receiverDept,
+      qty: qty,
+      unit: meta.unit,
+      remarks: slipMeta.remarks || ''
+    });
+  };
+
+  // Process issue_logs
+  issueLogs.forEach(l => {
+    const slipId = String(l.id || '');
+    if (realMiParentBills.has(slipId.toLowerCase())) {
+      return;
+    }
+
+    let mats = [];
+    try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) {}
+    if (!Array.isArray(mats)) mats = [mats];
+
+    mats.forEach(m => {
+      addItemToCosting(m, {
+        voucherId: slipId,
+        source: l.isReissue ? 'Re-Issue' : (l.isReturn ? 'Return' : (l.category || 'Store Issue')),
+        date: l.date || '—',
+        issuer: l.personName || 'Store Admin',
+        receiver: l.receiverName || '—',
+        receiverDept: l.receiverDept || 'Production',
+        remarks: ''
+      });
+    });
+  });
+
+  // Process extra_material_issues
+  extraIssues.forEach(ex => {
+    let items = [];
+    if (typeof ex.items_payload === 'string') {
+      try { items = JSON.parse(ex.items_payload); } catch (_) {}
+    }
+    if (Array.isArray(items) && items.length > 0) {
+      items.forEach(it => {
+        addItemToCosting(it, {
+          voucherId: ex.voucher_id || `EMI-${ex.id}`,
+          source: 'Extra Material Issue',
+          date: ex.issue_date || ex.created_at || '—',
+          issuer: ex.issuer_name || 'Store Admin',
+          receiver: ex.receiver_name || '—',
+          receiverDept: ex.receiver_dept || 'Production',
+          remarks: ex.reason || ex.remarks || ''
+        });
+      });
+    } else {
+      addItemToCosting({
+        materialId: ex.material_id,
+        materialName: ex.material_name || ex.bom_item_name,
+        qty: Number(ex.extra_qty || ex.base_qty || 0),
+        unit: ex.unit || 'PCS',
+        category: ex.category || 'Extra Accessory'
+      }, {
+        voucherId: ex.voucher_id || `EMI-${ex.id}`,
+        source: 'Extra Material Issue',
+        date: ex.issue_date || ex.created_at || '—',
+        issuer: ex.issuer_name || 'Store Admin',
+        receiver: ex.receiver_name || '—',
+        receiverDept: ex.receiver_dept || 'Production',
+        remarks: ex.reason || ex.remarks || ''
+      });
+    }
+  });
+
+  // Process elastic_issue
+  elasticIssues.forEach(el => {
+    const isOther = String(el.slip_no || '').toLowerCase().startsWith('other');
+    const isTape = String(el.slip_no || '').toLowerCase().startsWith('tape');
+    const matName = isOther ? (el.otherMaterialName || 'Other Accessory') : (isTape ? 'Drawcord Tape' : (el.elasticWidth ? `Elastic ${el.elasticWidth}` : 'Elastic Waistband'));
+    const qty = Number(el.total_elastic_mtr || el.total_tape_mtr || el.rolls || el.quantity || 1);
+    const unit = (el.total_elastic_mtr || el.total_tape_mtr) ? 'Mtr' : 'Roll';
+
+    addItemToCosting({
+      materialName: matName,
+      qty: qty,
+      unit: unit,
+      category: isOther ? 'Other Accessory' : (isTape ? 'Tape' : 'Elastic')
+    }, {
+      voucherId: el.slip_no || `ELASTIC-${el.id}`,
+      source: isTape ? 'Tape Issue' : (isOther ? 'Other Issue' : 'Elastic Issue'),
+      date: el.issue_date || el.created_at || '—',
+      issuer: el.issuer_name || 'Store Admin',
+      receiver: el.receiver_name || '—',
+      receiverDept: 'Cutting / Stitching Floor',
+      remarks: el.remarks || ''
+    });
+  });
+
+  // Process bone_issue
+  boneIssues.forEach(b => {
+    const isTape = String(b.style || '').toLowerCase().includes('tape');
+    const matName = isTape ? 'Drawcord Tape Roll' : (b.style ? `Bone Pocketing (${b.style})` : 'Bone Pocketing Roll');
+    const qty = Number(b.quantity || b.rolls || 1);
+
+    addItemToCosting({
+      materialName: matName,
+      qty: qty,
+      unit: 'Roll',
+      category: isTape ? 'Tape' : 'Bone'
+    }, {
+      voucherId: b.slip_no || `BONE-${b.id}`,
+      source: isTape ? 'Tape Issue' : 'Bone Issue',
+      date: b.issue_date || b.created_at || '—',
+      issuer: b.issuer_name || 'Store Admin',
+      receiver: b.receiver_name || '—',
+      receiverDept: 'Cutting Floor',
+      remarks: b.remarks || ''
+    });
+  });
+
+  // Process zip orders
+  zipRows.forEach(z => {
+    if (z.Total_Cost && Number(z.Total_Cost) > 0) {
+      const zipCost = Number(z.Total_Cost);
+      const zipQty = Number(z.Total_Pieces || cuttingQty || 1);
+      const zipRate = zipQty > 0 ? (zipCost / zipQty) : zipCost;
+      addItemToCosting({
+        materialName: `Zipper (${z.Garment_Type || 'PO Order'})`,
+        qty: zipQty,
+        unit: 'Pcs',
+        rate: zipRate,
+        category: 'Zipper'
+      }, {
+        voucherId: `ZIP-PO-${z.id}`,
+        source: 'Zip PO Order',
+        date: z.Issue_Date || z.Saved_At || '—',
+        issuer: z.Supervisor || 'Store Admin',
+        receiver: 'Production',
+        receiverDept: 'Stitching',
+        remarks: `Zip PO Cost: ₹${zipCost}`
+      });
+    }
+  });
+
+  // Compute totals and per garment piece cost
+  const items = Array.from(itemsMap.values());
+  let totalAccessoryCost = 0;
+  let totalIssuedUnits = 0;
+
+  items.forEach(item => {
+    item.quantity = Math.round(item.quantity * 100) / 100;
+    item.totalCost = Math.round((item.quantity * item.rate) * 100) / 100;
+    item.costPerPiece = cuttingQty > 0 ? Math.round((item.totalCost / cuttingQty) * 1000) / 1000 : 0;
+    totalAccessoryCost += item.totalCost;
+    totalIssuedUnits += item.quantity;
+  });
+
+  totalAccessoryCost = Math.round(totalAccessoryCost * 100) / 100;
+  const costPerGarmentPiece = cuttingQty > 0 ? Math.round((totalAccessoryCost / cuttingQty) * 1000) / 1000 : 0;
+
+  return {
+    lot: lotInfo,
+    items: items,
+    summary: {
+      lotNo: cleanLot,
+      cuttingQty: cuttingQty,
+      totalItemsCount: items.length,
+      totalIssuedUnits: Math.round(totalIssuedUnits * 100) / 100,
+      totalAccessoryCost: totalAccessoryCost,
+      costPerGarmentPiece: costPerGarmentPiece
+    }
+  };
 };
 
 // ── Export pool as default ────────────────────────────────────────────────────

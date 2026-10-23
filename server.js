@@ -100,7 +100,13 @@ import {
   addLedgerEntrySql,
   getItemCodeLedgerSql,
   getItemCodeUsageSql,
-  accumulateOrInsertMaterialSql
+  accumulateOrInsertMaterialSql,
+  cancelTransactionInDb,
+  getAllCancellationsInDb,
+  restoreTransactionInDb,
+  getLotCostingData,
+  getRecentCostingLots,
+  updateMaterialRate
 } from './db.js';
 import pool from './db.js';
 import cloudinary from './config/cloudinary.js';
@@ -2786,12 +2792,24 @@ app.post('/api/designs', async (req, res) => {
     delete design.isEdit;
 
 
+    // Check if BOM is already created and approved
+    if (design.id) {
+      const existing = await getDesignById(design.id);
+      if (existing && String(existing.status).trim().toLowerCase() === 'approved') {
+        return res.status(400).json({
+          error: `BOM is already created and approved for Lot #${design.id}. It cannot be created again.`,
+          alreadyCreated: true,
+          status: existing.status
+        });
+      }
+    }
+
     const serialized = {
       ...design,
       bom: typeof design.bom === 'object' ? JSON.stringify(design.bom) : design.bom
     };
     await createDesign(serialized);
-    await createHistoryEntry(design.id, 'created', actorName, `Lot created with category ${design.category || 'N/A'}, style ${design.style || 'N/A'}`);
+    await createHistoryEntry(design.id, isEdit ? 'updated' : 'created', actorName, `Lot ${isEdit ? 'updated' : 'created'} with category ${design.category || 'N/A'}, style ${design.style || 'N/A'}`);
 
     // Automatically create a pending design_verification approval request
     if (design.status === 'In Verification') {
@@ -4334,6 +4352,132 @@ app.post('/api/materials/accumulate', async (req, res) => {
   } catch (err) {
     console.error('[API POST /api/materials/accumulate error]:', err.message);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Combined Transactions Hub & Cancellation APIs ───────────────────────────
+app.get('/api/transactions/all-combined', async (req, res) => {
+  try {
+    const [pos, rgps, dooriOrders, zipOrders, scans, cancellations] = await Promise.all([
+      getAllPOs().catch(() => []),
+      getAllRgps().catch(() => []),
+      getAllDooriOrders().catch(() => []),
+      getAllCuttingHeaders().catch(() => []),
+      pool.execute('SELECT * FROM scans ORDER BY id DESC').then(r => r[0]).catch(() => []),
+      getAllCancellationsInDb().catch(() => [])
+    ]);
+
+    res.status(200).json({
+      pos: pos || [],
+      rgps: rgps || [],
+      dooriOrders: dooriOrders || [],
+      zipOrders: zipOrders || [],
+      scans: scans || [],
+      cancellations: cancellations || [],
+      summary: {
+        totalPo: (pos || []).length,
+        totalRgp: (rgps || []).length,
+        totalDoori: (dooriOrders || []).length,
+        totalZip: (zipOrders || []).length,
+        totalScans: (scans || []).length,
+        totalCancellations: (cancellations || []).length
+      }
+    });
+  } catch (err) {
+    console.error('API GET /api/transactions/all-combined error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve combined transactions.' });
+  }
+});
+
+app.post('/api/transactions/cancel', async (req, res) => {
+  try {
+    const { transactionType, transactionRef, reason, remarks, cancelledBy, meta } = req.body;
+    if (!transactionType || !transactionRef || !reason) {
+      return res.status(400).json({ error: 'Transaction Type, Reference Number, and Reason are required.' });
+    }
+    const result = await cancelTransactionInDb({
+      transactionType,
+      transactionRef,
+      reason,
+      remarks: remarks || '',
+      cancelledBy: cancelledBy || 'Admin',
+      meta: meta || null
+    });
+    res.status(200).json({ success: true, message: 'Transaction cancelled successfully.', cancellation: result });
+  } catch (err) {
+    console.error('API POST /api/transactions/cancel error:', err.message);
+    res.status(500).json({ error: 'Failed to cancel transaction: ' + err.message });
+  }
+});
+
+app.post('/api/transactions/restore', async (req, res) => {
+  try {
+    const { transactionType, transactionRef } = req.body;
+    if (!transactionType || !transactionRef) {
+      return res.status(400).json({ error: 'Transaction Type and Reference Number are required.' });
+    }
+    const result = await restoreTransactionInDb({ transactionType, transactionRef });
+    res.status(200).json({ success: true, message: 'Transaction restored successfully.', result });
+  } catch (err) {
+    console.error('API POST /api/transactions/restore error:', err.message);
+    res.status(500).json({ error: 'Failed to restore transaction: ' + err.message });
+  }
+});
+
+app.get('/api/transactions/cancellations', async (req, res) => {
+  try {
+    const rows = await getAllCancellationsInDb();
+    res.status(200).json(rows);
+  } catch (err) {
+    console.error('API GET /api/transactions/cancellations error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve cancellations.' });
+  }
+});
+
+// ── Admin Panel Lot Costing API Endpoints ────────────────────────────────────
+
+// GET lot costing summary & all issued material items (Quantity * Rate = Total Cost)
+app.get('/api/costing/lot/:lotNo', async (req, res) => {
+  try {
+    const lotNo = req.params.lotNo.trim();
+    if (!lotNo) {
+      return res.status(400).json({ error: 'Lot number is required.' });
+    }
+    const result = await getLotCostingData(lotNo);
+    if (!result) {
+      return res.status(404).json({ error: `Lot "${lotNo}" not found.` });
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('API GET /api/costing/lot/:lotNo error:', err.message);
+    res.status(500).json({ error: 'Failed to calculate lot costing: ' + err.message });
+  }
+});
+
+// GET recent lots list for quick costing search & autocomplete
+app.get('/api/costing/recent-lots', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 100;
+    const lots = await getRecentCostingLots(limit);
+    res.status(200).json(lots);
+  } catch (err) {
+    console.error('API GET /api/costing/recent-lots error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve recent lots for costing.' });
+  }
+});
+
+// PUT update material unit rate/cost in database directly from costing dashboard
+app.put('/api/costing/material-rate', async (req, res) => {
+  try {
+    const { materialId, materialName, itemCode, rate } = req.body;
+    if (rate === undefined || rate === null || isNaN(parseFloat(rate))) {
+      return res.status(400).json({ error: 'Valid numeric rate is required.' });
+    }
+    const result = await updateMaterialRate({ materialId, materialName, itemCode, rate: parseFloat(rate) });
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('API PUT /api/costing/material-rate error:', err.message);
+    res.status(500).json({ error: 'Failed to update material rate: ' + err.message });
   }
 });
 
