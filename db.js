@@ -590,6 +590,22 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN entryMode VARCHAR(50) DEFAULT 'Weight Machine'`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE weight_capture ADD COLUMN imageUrl LONGTEXT NULL`); } catch (_) { }
 
+  // Material Price Change History Table
+  await pool.execute(`CREATE TABLE IF NOT EXISTS material_price_history (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    materialId    VARCHAR(100),
+    itemCode      VARCHAR(100),
+    materialName  VARCHAR(255),
+    oldRate       DOUBLE DEFAULT 0,
+    newRate       DOUBLE DEFAULT 0,
+    policy        VARCHAR(50) DEFAULT 'fcfs',
+    changedBy     VARCHAR(100) DEFAULT 'System',
+    reason        VARCHAR(255) DEFAULT 'Inward / Price Update',
+    changedAt     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+  try { await pool.execute(`CREATE INDEX idx_mph_mat ON material_price_history (materialId)`); } catch (_) { }
+  try { await pool.execute(`CREATE INDEX idx_mph_item ON material_price_history (itemCode)`); } catch (_) { }
+
   // Dedicated Accepted Orders Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS order_accepted (
     id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -782,8 +798,8 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
 
   // Warehouse Locations Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS warehouse_locations (
-    id          VARCHAR(100) PRIMARY KEY,
-    code        VARCHAR(255) NOT NULL,
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    code        VARCHAR(255) NOT NULL UNIQUE,
     warehouse   VARCHAR(255) NOT NULL,
     capacity    INT DEFAULT 20
   )`);
@@ -867,12 +883,11 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
         const rawCode = (r.code !== undefined && r.code !== null) ? String(r.code).trim() : (r.name || '');
         const cleanDisplay = canonicalizeLocationCode(rawCode, r.warehouse || 'Main Store');
         if (!cleanDisplay) return;
-        const slug = cleanDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
         const wh = cleanDisplay.includes(' - ') ? cleanDisplay.split(' - ')[0].trim() : (r.warehouse || 'Main Store');
         const shortRack = cleanDisplay.includes(' - ') ? cleanDisplay.split(' - ').slice(1).join(' - ') : cleanDisplay;
-        if (!cleanedMap.has(slug)) {
-          cleanedMap.set(slug, {
-            id: slug,
+        if (!cleanedMap.has(cleanDisplay)) {
+          cleanedMap.set(cleanDisplay, {
+            id: r.id,
             name: shortRack,
             code: cleanDisplay,
             warehouse: wh,
@@ -883,18 +898,6 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
       const cleanedRacks = Array.from(cleanedMap.values());
       await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(cleanedRacks)]);
       await bulkSaveWarehouseLocations(cleanedRacks);
-      console.log(`[DB] Synced and cleaned ${cleanedRacks.length} custom locations to warehouse_locations table.`);
-    }
-
-    // Auto-clean any legacy corrupted rack names (e.g. "Main Store - Rack Main Store - RACK 1")
-    const [existingLocRows] = await pool.execute("SELECT id, code, warehouse, capacity FROM warehouse_locations");
-    for (const row of existingLocRows) {
-      const clean = canonicalizeLocationCode(row.code, row.warehouse);
-      const cleanSlug = clean.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-      if (clean && (clean !== row.code || row.id !== cleanSlug)) {
-        await pool.execute("DELETE FROM warehouse_locations WHERE id = ?", [row.id]);
-        await pool.execute("INSERT INTO warehouse_locations (id, code, warehouse, capacity) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)", [cleanSlug, clean, row.warehouse || 'Main Store', row.capacity || 20]);
-      }
     }
   } catch (syncErr) {
     console.warn('[DB] Could not initialize/sync warehouse_locations on startup:', syncErr.message);
@@ -1094,11 +1097,50 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
     // Existing material found with SAME itemCode -> add pieces to stock and accumulate packets
     const updatedStock = (Number(existing.stock) || 0) + pieces;
     const updatedPackets = (Number(existing.packets) || 0) + packets;
+
+    let pricingPolicy = 'fcfs';
+    try {
+      const p = await getSetting('material_pricing_policy');
+      if (p) pricingPolicy = p;
+    } catch (_) { }
+
+    const existingStock = Number(existing.stock) || 0;
+    let costToSet = existing.cost;
+
+    if (pricingPolicy === 'update_all') {
+      costToSet = itemRate > 0 ? itemRate : existing.cost;
+      if (itemRate > 0) {
+        await pool.execute(
+          'UPDATE weight_capture SET rate = ? WHERE (LOWER(TRIM(materialCode)) = LOWER(TRIM(?)) OR LOWER(TRIM(itemCode)) = LOWER(TRIM(?))) AND approvalStatus = "Approved"',
+          [itemRate, existing.id, existing.itemCode || code]
+        ).catch(() => null);
+      }
+    } else {
+      // FCFS: If existing stock > 0 and had a valid cost, retain old cost for current issue.
+      // If existing stock was 0 or cost was 0, new incoming cost applies.
+      costToSet = (existingStock <= 0 || !existing.cost || Number(existing.cost) === 0)
+        ? (itemRate > 0 ? itemRate : existing.cost)
+        : existing.cost;
+    }
+
+    if (Number(existing.cost) > 0 && itemRate > 0 && Number(existing.cost) !== itemRate) {
+      await logMaterialPriceChange({
+        materialId: existing.id,
+        itemCode: existing.itemCode || code,
+        materialName: existing.name || name,
+        oldRate: existing.cost,
+        newRate: itemRate,
+        policy: pricingPolicy,
+        changedBy: personName || 'Inward',
+        reason: `Inward PO ${poNumber} / Inv ${invoiceNo} (+${pieces} ${unit})`
+      });
+    }
+
     await pool.execute(
       `UPDATE materials SET
         stock = ?,
         packets = ?,
-        cost = CASE WHEN ? > 0 THEN ? ELSE cost END,
+        cost = ?,
         brand = COALESCE(NULLIF(?, ""), brand),
         unit = COALESCE(NULLIF(?, ""), unit),
         location = COALESCE(NULLIF(?, ""), location),
@@ -1111,8 +1153,7 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
       [
         updatedStock,
         updatedPackets,
-        itemRate,
-        itemRate,
+        costToSet,
         brand,
         data.unit || existing.unit,
         location || existing.location,
@@ -1127,6 +1168,12 @@ export const addOrUpdateMaterialFromCapture = async (data) => {
 
     const ledgerCode = (code && code.startsWith('ST')) ? code : (existing.itemCode || code);
     if (ledgerCode) {
+      if (itemRate > 0) {
+        await pool.execute(
+          'UPDATE item_codes SET rate = ? WHERE LOWER(TRIM(item_code)) = LOWER(TRIM(?))',
+          [itemRate, ledgerCode]
+        ).catch(() => null);
+      }
       await pool.execute(
         'UPDATE item_codes SET mt_code = ? WHERE LOWER(TRIM(item_code)) = LOWER(TRIM(?)) AND (mt_code IS NULL OR mt_code = "")',
         [existing.id, ledgerCode]
@@ -1388,12 +1435,12 @@ export const saveWarehouseLocationsFromCapture = async (locationStr, packets = 1
 
     try {
       await pool.execute(
-        `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
-         VALUES (?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE code = VALUES(code)`,
-        [slug, cleanName, warehouseName, 20]
+        `INSERT INTO warehouse_locations (code, warehouse, capacity)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
+        [cleanDisplay, warehouseName, 20]
       );
-      console.log(`[DB] Auto-saved location to warehouse_locations table: ${cleanName} (ID: ${slug})`);
+      console.log(`[DB] Auto-saved location to warehouse_locations table: ${cleanDisplay}`);
     } catch (locErr) {
       console.warn('[DB] Could not sync warehouse_locations:', locErr.message);
     }
@@ -1401,7 +1448,7 @@ export const saveWarehouseLocationsFromCapture = async (locationStr, packets = 1
 };
 
 export const getAllWarehouseLocations = async () => {
-  const [rows] = await pool.execute('SELECT * FROM warehouse_locations ORDER BY warehouse ASC, code ASC');
+  const [rows] = await pool.execute('SELECT id, code, warehouse, capacity FROM warehouse_locations ORDER BY warehouse ASC, code ASC');
   return rows;
 };
 
@@ -1410,26 +1457,36 @@ export const canonicalizeLocationCode = (rawStr, defaultWarehouse = 'Main Store'
   let str = String(rawStr).trim().replace(/\(\d+\s*pkts?\)/gi, '').trim();
   if (!str || str.toLowerCase() === 'n/a' || str.toLowerCase() === 'null') return '';
 
-  // Extract rack number or alphanumeric identifier if present
-  const rackNumMatch = str.match(/rack\s*(\d+[a-z]?)/i) || str.match(/(\d+[a-z]?)$/i);
-  const rackNum = rackNumMatch ? rackNumMatch[1] : '';
-
   // Extract warehouse / hall
   let warehouse = 'Main Store';
-  if (/\bhall\s*(\d+)/i.test(str)) {
-    const h = str.match(/\bhall\s*(\d+)/i);
-    warehouse = `Hall ${h[1]}`;
+  const hallMatch = str.match(/\b(hall\s*\d+)\b/i);
+  if (hallMatch) {
+    warehouse = hallMatch[1].replace(/(\w)(\w*)/g, (g0, g1, g2) => g1.toUpperCase() + g2.toLowerCase());
   } else if (/\bmain\s*store\b/i.test(str)) {
     warehouse = 'Main Store';
   } else if (defaultWarehouse) {
     warehouse = defaultWarehouse.replace(/^rack\s+/i, '').trim() || 'Main Store';
   }
 
-  if (rackNum) {
-    return `${warehouse} - RACK ${rackNum}`;
+  // Strip repeated warehouse/hall prefixes
+  const sClean = str.replace(/^(?:(?:main\s*store|warehouse\s*\d+|hall\s*\d+)\s*[-–—:]\s*)+/gi, '').trim();
+
+  // Extract rack number or identifier if present
+  const rackNumMatch = sClean.match(/rack\s*([0-9a-zA-Z\-_/]+)/i);
+  if (rackNumMatch) {
+    return `${warehouse} - RACK ${rackNumMatch[1].toUpperCase()}`;
   }
 
-  return `${warehouse} - ${str}`;
+  if (/floor/i.test(sClean)) {
+    return `${warehouse} - RACK FLOOR`;
+  }
+
+  const trailingNum = sClean.match(/(\d+[a-zA-Z]?)$/i);
+  if (trailingNum) {
+    return `${warehouse} - RACK ${trailingNum[1].toUpperCase()}`;
+  }
+
+  return `${warehouse} - ${sClean.toUpperCase()}`;
 };
 
 export const bulkSaveWarehouseLocations = async (locationsArray) => {
@@ -1450,17 +1507,16 @@ export const bulkSaveWarehouseLocations = async (locationsArray) => {
       if (!fullDisplay) continue;
 
       const warehouse = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : defaultWh;
-      const slug = r.id && !r.id.includes('rack-main-store') ? r.id : fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const capacity = Number(r.capacity) > 0 ? Number(r.capacity) : 20;
 
-      valuePlaceholders.push('(?, ?, ?, ?)');
-      params.push(slug, fullDisplay, warehouse, capacity);
+      valuePlaceholders.push('(?, ?, ?)');
+      params.push(fullDisplay, warehouse, capacity);
     }
 
     if (valuePlaceholders.length > 0) {
-      const sql = `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
+      const sql = `INSERT INTO warehouse_locations (code, warehouse, capacity)
                    VALUES ${valuePlaceholders.join(', ')}
-                   ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`;
+                   ON DUPLICATE KEY UPDATE warehouse = VALUES(warehouse), capacity = VALUES(capacity)`;
       await pool.execute(sql, params);
       totalSaved += valuePlaceholders.length;
     }
@@ -1469,18 +1525,17 @@ export const bulkSaveWarehouseLocations = async (locationsArray) => {
   return totalSaved;
 };
 
-export const createWarehouseLocation = async ({ id, code, warehouse = 'Main Store', capacity = 20 }) => {
+export const createWarehouseLocation = async ({ code, warehouse = 'Main Store', capacity = 20 }) => {
   const fullDisplay = canonicalizeLocationCode(code, warehouse) || `${warehouse} - Rack 1`;
   const wh = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : warehouse;
-  const slug = id || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const cap = Number(capacity) > 0 ? Number(capacity) : 20;
-  await pool.execute(
-    `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
-     VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
-    [slug, fullDisplay, wh, cap]
+  const [res] = await pool.execute(
+    `INSERT INTO warehouse_locations (code, warehouse, capacity)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
+    [fullDisplay, wh, cap]
   );
-  return { id: slug, code: fullDisplay, warehouse: wh, capacity: cap };
+  return { id: res.insertId, code: fullDisplay, warehouse: wh, capacity: cap };
 };
 
 export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Main Store', capacity = 20 }) => {
@@ -1489,21 +1544,28 @@ export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Mai
   const wh = fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[0].trim() : warehouse;
   const cap = Number(capacity) > 0 ? Number(capacity) : 20;
 
-  // Try updating by id or code
-  const [result] = await pool.execute(
-    `UPDATE warehouse_locations SET code = ?, warehouse = ?, capacity = ? WHERE id = ? OR code = ?`,
-    [fullDisplay, wh, cap, idOrCode, idOrCode]
-  );
-
-  // If no existing record matched, insert it
-  if (result.affectedRows === 0) {
-    const slug = idOrCode || fullDisplay.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    await pool.execute(
-      `INSERT INTO warehouse_locations (id, code, warehouse, capacity)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE code = VALUES(code), warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
-      [slug, fullDisplay, wh, cap]
+  let result;
+  if (!isNaN(Number(idOrCode))) {
+    [result] = await pool.execute(
+      `UPDATE warehouse_locations SET code = ?, warehouse = ?, capacity = ? WHERE id = ? OR code = ?`,
+      [fullDisplay, wh, cap, Number(idOrCode), idOrCode]
     );
+  } else {
+    [result] = await pool.execute(
+      `UPDATE warehouse_locations SET code = ?, warehouse = ?, capacity = ? WHERE code = ?`,
+      [fullDisplay, wh, cap, idOrCode]
+    );
+  }
+
+  let finalId = idOrCode;
+  if (result.affectedRows === 0) {
+    const [insRes] = await pool.execute(
+      `INSERT INTO warehouse_locations (code, warehouse, capacity)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE warehouse = VALUES(warehouse), capacity = VALUES(capacity)`,
+      [fullDisplay, wh, cap]
+    );
+    finalId = insRes.insertId;
   }
 
   // Also sync in settings.warehouse_racks if present
@@ -1514,32 +1576,36 @@ export const updateWarehouseLocation = async (idOrCode, { code, warehouse = 'Mai
       if (Array.isArray(parsed)) {
         let found = false;
         parsed = parsed.map(r => {
-          if (r.id === idOrCode || r.code === idOrCode || `${r.warehouse} - ${r.code}` === idOrCode || `${r.warehouse} - ${r.name}` === idOrCode) {
+          if (String(r.id) === String(idOrCode) || r.code === idOrCode || `${r.warehouse} - ${r.code}` === idOrCode || `${r.warehouse} - ${r.name}` === idOrCode) {
             found = true;
             return {
               ...r,
-              warehouse,
+              warehouse: wh,
               code: fullDisplay,
-              name: fullDisplay,
+              name: fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[1] : fullDisplay,
               capacity: cap
             };
           }
           return r;
         });
         if (!found) {
-          parsed.push({ id: idOrCode, warehouse, code: fullDisplay, name: fullDisplay, capacity: cap });
+          parsed.push({ id: finalId, warehouse: wh, code: fullDisplay, name: fullDisplay.includes(' - ') ? fullDisplay.split(' - ')[1] : fullDisplay, capacity: cap });
         }
         await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
       }
     }
   } catch (_) { }
 
-  return { id: idOrCode, code: fullDisplay, warehouse, capacity: cap };
+  return { id: finalId, code: fullDisplay, warehouse: wh, capacity: cap };
 };
 
 export const deleteWarehouseLocation = async (idOrCode) => {
   if (!idOrCode) return false;
-  await pool.execute('DELETE FROM warehouse_locations WHERE id = ? OR code = ?', [idOrCode, idOrCode]);
+  if (!isNaN(Number(idOrCode))) {
+    await pool.execute('DELETE FROM warehouse_locations WHERE id = ? OR code = ?', [Number(idOrCode), idOrCode]);
+  } else {
+    await pool.execute('DELETE FROM warehouse_locations WHERE code = ?', [idOrCode]);
+  }
 
   // Also clean up from warehouse_racks in settings
   try {
@@ -1547,7 +1613,7 @@ export const deleteWarehouseLocation = async (idOrCode) => {
     if (rackSetting && rackSetting[0] && rackSetting[0].setting_value) {
       let parsed = JSON.parse(rackSetting[0].setting_value);
       if (Array.isArray(parsed)) {
-        parsed = parsed.filter(r => r.id !== idOrCode && r.code !== idOrCode && `${r.warehouse} - ${r.name || `Rack ${r.code}`}` !== idOrCode);
+        parsed = parsed.filter(r => String(r.id) !== String(idOrCode) && r.code !== idOrCode && `${r.warehouse} - ${r.name || `Rack ${r.code}`}` !== idOrCode);
         await pool.execute("REPLACE INTO settings (setting_key, setting_value) VALUES ('warehouse_racks', ?)", [JSON.stringify(parsed)]);
       }
     }
@@ -1757,6 +1823,16 @@ export const upsertMaterial = async (m) => {
         ext.id
       ]
     );
+
+    const policy = m.updatePolicy || m.policy || (await getSetting('material_pricing_policy')) || 'fcfs';
+    if (m.cost !== undefined && Number(m.cost) > 0) {
+      if (policy === 'update_all') {
+        await pool.execute('UPDATE weight_capture SET rate = ? WHERE materialCode = ? OR itemCode = ?', [Number(m.cost), ext.id, ext.itemCode || m.itemCode]).catch(() => null);
+        await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [Number(m.cost), ext.itemCode || m.itemCode]).catch(() => null);
+      } else {
+        await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [Number(m.cost), ext.itemCode || m.itemCode]).catch(() => null);
+      }
+    }
 
     // Sync updated location, packets count and imageUrl back to weight_capture table so they match
     if (m.location !== undefined || m.imageUrl !== undefined) {
@@ -2180,7 +2256,7 @@ export const setSetting = async (key, value) => {
       // Setting value is already identical; skip redundant DB writes and sync logs
       return;
     }
-  } catch (_) {}
+  } catch (_) { }
 
   await pool.execute(
     'REPLACE INTO settings (setting_key,setting_value) VALUES (?,?)',
@@ -2402,7 +2478,7 @@ export const getNextPoNumber = async (type) => {
       let [rows2] = [[]];
       try {
         [rows2] = await conn.execute("SELECT slip_no as id FROM elastic_issue WHERE LOWER(slip_no) LIKE 'elastic-w/o-%'");
-      } catch (_) {}
+      } catch (_) { }
       let max = 0;
       for (const r of [...rows1, ...rows2]) {
         const s = String(r.id || '').toLowerCase();
@@ -2414,7 +2490,7 @@ export const getNextPoNumber = async (type) => {
       const next = max + 1;
       try {
         await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('elastic_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
-      } catch (_) {}
+      } catch (_) { }
       return `${prefix}${next}`;
     } finally {
       conn.release();
@@ -2429,7 +2505,7 @@ export const getNextPoNumber = async (type) => {
       let [rows2] = [[]];
       try {
         [rows2] = await conn.execute("SELECT slip_no as id FROM bone_issue WHERE LOWER(slip_no) LIKE 'bone-w/o-%'");
-      } catch (_) {}
+      } catch (_) { }
       let max = 0;
       for (const r of [...rows1, ...rows2]) {
         const s = String(r.id || '').toLowerCase();
@@ -2441,7 +2517,7 @@ export const getNextPoNumber = async (type) => {
       const next = max + 1;
       try {
         await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('bone_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
-      } catch (_) {}
+      } catch (_) { }
       return `${prefix}${next}`;
     } finally {
       conn.release();
@@ -2464,7 +2540,7 @@ export const getNextPoNumber = async (type) => {
       const next = max + 1;
       try {
         await conn.execute("INSERT INTO settings (setting_key, setting_value) VALUES ('tape_wo_counter', ?) ON DUPLICATE KEY UPDATE setting_value = ?", [String(max), String(max)]);
-      } catch (_) {}
+      } catch (_) { }
       return `${prefix}${next}`;
     } finally {
       conn.release();
@@ -2660,7 +2736,12 @@ export const getAllScans = async () => {
 };
 
 export const getAllCuttingHeaders = async () => {
-  const [rows] = await pool.execute('SELECT * FROM cutting_header ORDER BY Saved_At DESC');
+  const [rows] = await pool.execute('SELECT * FROM cutting_header ORDER BY id DESC');
+  rows.sort((a, b) => {
+    const tB = (b.Saved_At ? new Date(b.Saved_At).getTime() : 0) || (b.Date_of_Issue ? new Date(b.Date_of_Issue).getTime() : 0) || Number(b.id) || 0;
+    const tA = (a.Saved_At ? new Date(a.Saved_At).getTime() : 0) || (a.Date_of_Issue ? new Date(a.Date_of_Issue).getTime() : 0) || Number(a.id) || 0;
+    return (tB - tA) || (Number(b.id) - Number(a.id));
+  });
   return rows;
 };
 
@@ -3074,12 +3155,25 @@ export const getUndesignedCuttingLots = async () => {
              OR LOWER(TRIM(COALESCE(d.lotNo2, ''))) = LOWER(TRIM(ch.Lot_Number))
              OR LOWER(TRIM(COALESCE(d.name, ''))) = LOWER(TRIM(ch.Lot_Number))
         )
-      ORDER BY ch.Saved_At DESC, ch.Date_of_Issue DESC, ch.id DESC
+      ORDER BY ch.id DESC
     `);
 
     // Strict Cutoff: Only return lots on or after 1 June 2026
     const CUTOFF_DATE = new Date('2026-06-01T00:00:00.000Z');
-    return rows.filter(row => {
+
+    const parseTimestamp = (val) => {
+      if (!val) return 0;
+      const t = new Date(val).getTime();
+      if (!isNaN(t) && t > 0) return t;
+      const dmy = String(val).match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+      if (dmy) {
+        const d = new Date(parseInt(dmy[3], 10), parseInt(dmy[2], 10) - 1, parseInt(dmy[1], 10)).getTime();
+        if (!isNaN(d)) return d;
+      }
+      return 0;
+    };
+
+    const filtered = rows.filter(row => {
       const dateCandidates = [row.Saved_At, row.Date_of_Issue, row.JobOrder_Date, row.Zip_Order_Date];
       for (const raw of dateCandidates) {
         if (!raw || typeof raw !== 'string') continue;
@@ -3100,6 +3194,15 @@ export const getUndesignedCuttingLots = async () => {
       }
       return true;
     });
+
+    // Sort strictly by Saved_At timestamp DESC, falling back to Date_of_Issue and id
+    filtered.sort((a, b) => {
+      const tB = parseTimestamp(b.Saved_At) || parseTimestamp(b.Date_of_Issue) || (Number(b.id) || 0);
+      const tA = parseTimestamp(a.Saved_At) || parseTimestamp(a.Date_of_Issue) || (Number(a.id) || 0);
+      return (tB - tA) || (Number(b.id) - Number(a.id));
+    });
+
+    return filtered;
   } catch (err) {
     if (err.code === 'ER_NO_SUCH_TABLE') {
       await ensureCuttingSchema();
@@ -4052,18 +4155,18 @@ export const deleteItemCodeSql = async (id) => {
   try {
     const [r1] = await pool.execute('UPDATE materials SET itemCode = NULL WHERE itemCode = ?', [code]);
     unlinkedMats = r1.affectedRows || 0;
-  } catch (_) {}
+  } catch (_) { }
 
   // Safely unlink references in weight_capture
   try {
     const [r2] = await pool.execute('UPDATE weight_capture SET itemCode = NULL WHERE itemCode = ?', [code]);
     unlinkedWc = r2.affectedRows || 0;
-  } catch (_) {}
+  } catch (_) { }
 
   // Safely unlink references in material_transfers
   try {
     await pool.execute('UPDATE material_transfers SET itemCode = NULL WHERE itemCode = ?', [code]);
-  } catch (_) {}
+  } catch (_) { }
 
   // Delete from item_codes
   await pool.execute('DELETE FROM item_codes WHERE id = ?', [current.id]);
@@ -4097,7 +4200,7 @@ export const getItemCodeUsageSql = async (id) => {
       [code, mtCode]
     );
     materialsList = mats || [];
-  } catch (_) {}
+  } catch (_) { }
 
   // 2. Weight Captures count & samples
   let weightCaptureCount = 0;
@@ -4117,7 +4220,7 @@ export const getItemCodeUsageSql = async (id) => {
       [code, mtCode]
     );
     weightCaptureSample = sample || [];
-  } catch (_) {}
+  } catch (_) { }
 
   // 3. Transfers count
   let transferCount = 0;
@@ -4127,7 +4230,7 @@ export const getItemCodeUsageSql = async (id) => {
       [code, mtCode]
     );
     transferCount = trs[0]?.cnt || 0;
-  } catch (_) {}
+  } catch (_) { }
 
   // 4. Ledger entries count
   let ledgerCount = 0;
@@ -4137,7 +4240,7 @@ export const getItemCodeUsageSql = async (id) => {
       [code]
     );
     ledgerCount = lgs[0]?.cnt || 0;
-  } catch (_) {}
+  } catch (_) { }
 
   const totalPlaces = materialsList.length + weightCaptureCount + transferCount + ledgerCount;
 
@@ -4876,19 +4979,435 @@ export const getRecentCostingLots = async (limit = 100) => {
   return rows;
 };
 
-export const updateMaterialRate = async ({ materialId, materialName, itemCode, rate }) => {
+export const getMaterialFcfsBatches = async (materialKey) => {
+  if (!materialKey) return null;
+  const cleanKey = String(materialKey).trim();
+
+  // 1. Fetch material record to get current available stock and itemCode
+  const [matRows] = await pool.execute(
+    'SELECT * FROM materials WHERE LOWER(TRIM(id)) = LOWER(TRIM(?)) OR LOWER(TRIM(itemCode)) = LOWER(TRIM(?)) OR LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+    [cleanKey, cleanKey, cleanKey]
+  );
+  const mat = matRows[0] || null;
+  const currentStock = mat ? Math.max(0, Number(mat.stock) || 0) : 0;
+  const itemCode = mat?.itemCode || cleanKey;
+  const matName = mat?.name || cleanKey;
+  const matId = mat?.id || cleanKey;
+
+  // 2. Fetch all approved inward batches from weight_capture in chronological order (FCFS: id ASC)
+  const [batches] = await pool.execute(
+    `SELECT id, materialCode, itemCode, materialName, pieces, rate, capturedAt, storeLocation, poNumber, invoiceNo, approvalStatus
+     FROM weight_capture 
+     WHERE approvalStatus = 'Approved' 
+       AND (
+         LOWER(TRIM(itemCode)) = LOWER(TRIM(?)) 
+         OR LOWER(TRIM(materialCode)) = LOWER(TRIM(?)) 
+         OR LOWER(TRIM(materialCode)) = LOWER(TRIM(?))
+         OR LOWER(TRIM(materialName)) = LOWER(TRIM(?))
+       )
+     ORDER BY id ASC`,
+    [itemCode, matId, itemCode, matName]
+  );
+
+  const totalInwardPieces = batches.reduce((sum, b) => sum + (Number(b.pieces) || 0), 0);
+  const totalIssuedPieces = Math.max(0, totalInwardPieces - currentStock);
+
+  let issuedToDeduct = totalIssuedPieces;
+  const processedBatches = batches.map(b => {
+    const batchQty = Number(b.pieces) || 0;
+    const batchRate = Number(b.rate) > 0 ? Number(b.rate) : (Number(mat?.cost) || 0);
+
+    let consumed = 0;
+    let remaining = 0;
+
+    if (issuedToDeduct >= batchQty) {
+      consumed = batchQty;
+      remaining = 0;
+      issuedToDeduct -= batchQty;
+    } else if (issuedToDeduct > 0) {
+      consumed = issuedToDeduct;
+      remaining = batchQty - issuedToDeduct;
+      issuedToDeduct = 0;
+    } else {
+      consumed = 0;
+      remaining = batchQty;
+    }
+
+    return {
+      id: b.id,
+      poNumber: b.poNumber || 'N/A',
+      invoiceNo: b.invoiceNo || 'N/A',
+      location: b.storeLocation || 'Main Store',
+      date: b.capturedAt ? new Date(b.capturedAt).toLocaleDateString('en-IN') : '',
+      time: b.capturedAt ? new Date(b.capturedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '',
+      rate: batchRate,
+      initialPieces: batchQty,
+      consumedPieces: consumed,
+      remainingPieces: remaining,
+      isExhausted: remaining <= 0
+    };
+  });
+
+  const activeBatches = processedBatches.filter(b => b.remainingPieces > 0);
+  const currentBatch = activeBatches[0] || null;
+  const currentRate = currentBatch ? currentBatch.rate : (Number(mat?.cost) || 0);
+
+  const subsequentBatch = activeBatches.find(b => b.rate !== currentRate);
+  const nextRate = subsequentBatch ? subsequentBatch.rate : currentRate;
+
+  const totalValuation = activeBatches.reduce((sum, b) => sum + (b.remainingPieces * b.rate), 0);
+  const averageRate = currentStock > 0 ? (totalValuation / currentStock) : currentRate;
+
+  return {
+    materialId: matId,
+    itemCode: itemCode,
+    materialName: matName,
+    unit: mat?.unit || 'Pcs',
+    currentStock: currentStock,
+    totalInwardPieces: totalInwardPieces,
+    totalIssuedPieces: totalIssuedPieces,
+    currentRate: currentRate,
+    nextRate: nextRate,
+    hasMultipleRates: activeBatches.some(b => b.rate !== currentRate),
+    currentBatchRemaining: currentBatch ? currentBatch.remainingPieces : 0,
+    totalValuation: Math.round(totalValuation * 100) / 100,
+    averageRate: Math.round(averageRate * 100) / 100,
+    activeBatchesCount: activeBatches.length,
+    batches: processedBatches,
+    activeBatches: activeBatches
+  };
+};
+
+export const calculateFcfsCostForIssue = async (materialKey, issueQty) => {
+  const reqQty = Math.max(0, Number(issueQty) || 0);
+  if (reqQty <= 0) return { totalCost: 0, effectiveRate: 0, breakdown: '', tiers: [], hasMultipleTiers: false };
+
+  const fcfsData = await getMaterialFcfsBatches(materialKey);
+  if (!fcfsData || !fcfsData.activeBatches || fcfsData.activeBatches.length === 0) {
+    const defaultRate = fcfsData?.currentRate || 0;
+    return {
+      totalCost: Math.round((reqQty * defaultRate) * 100) / 100,
+      effectiveRate: defaultRate,
+      breakdown: `${reqQty.toLocaleString()} @ ₹${defaultRate}`,
+      tiers: [{ qty: reqQty, rate: defaultRate, cost: reqQty * defaultRate }],
+      hasMultipleTiers: false
+    };
+  }
+
+  let qtyLeft = reqQty;
+  let totalCost = 0;
+  const tiers = [];
+
+  for (const b of fcfsData.activeBatches) {
+    if (qtyLeft <= 0) break;
+    const take = Math.min(qtyLeft, b.remainingPieces);
+    const subtotal = take * b.rate;
+    totalCost += subtotal;
+    tiers.push({
+      batchId: b.id,
+      poNumber: b.poNumber,
+      qty: take,
+      rate: b.rate,
+      subtotal: Math.round(subtotal * 100) / 100
+    });
+    qtyLeft -= take;
+  }
+
+  if (qtyLeft > 0) {
+    const fallbackRate = fcfsData.nextRate || fcfsData.currentRate || 0;
+    const subtotal = qtyLeft * fallbackRate;
+    totalCost += subtotal;
+    tiers.push({
+      batchId: 'overflow',
+      poNumber: 'New Stock',
+      qty: qtyLeft,
+      rate: fallbackRate,
+      subtotal: Math.round(subtotal * 100) / 100
+    });
+  }
+
+  const effectiveRate = reqQty > 0 ? (totalCost / reqQty) : 0;
+  const breakdown = tiers.map(t => `${t.qty.toLocaleString()} @ ₹${t.rate}`).join(' + ');
+
+  return {
+    totalCost: Math.round(totalCost * 100) / 100,
+    effectiveRate: Math.round(effectiveRate * 1000) / 1000,
+    breakdown,
+    tiers,
+    hasMultipleTiers: tiers.length > 1
+  };
+};
+
+export const syncMaterialFcfsCost = async (materialKey) => {
+  try {
+    const policy = (await getSetting('material_pricing_policy')) || 'fcfs';
+    if (policy !== 'fcfs') return null;
+
+    const fcfsData = await getMaterialFcfsBatches(materialKey);
+    if (!fcfsData) return null;
+
+    const activeRate = fcfsData.currentRate;
+    if (activeRate > 0) {
+      await pool.execute(
+        'UPDATE materials SET cost = ? WHERE id = ? OR itemCode = ?',
+        [activeRate, fcfsData.materialId, fcfsData.itemCode]
+      );
+    }
+    return activeRate;
+  } catch (err) {
+    console.error('[syncMaterialFcfsCost error]:', err.message);
+    return null;
+  }
+};
+
+export const revalueAllMaterialsToLatestSql = async () => {
+  const [itemCodes] = await pool.execute('SELECT item_code, rate, mt_code, item_name FROM item_codes WHERE rate > 0');
+  let updatedCount = 0;
+
+  for (const ic of itemCodes) {
+    const rate = Number(ic.rate);
+    if (rate <= 0) continue;
+
+    await pool.execute(
+      'UPDATE materials SET cost = ? WHERE itemCode = ? OR id = ? OR LOWER(name) = LOWER(?)',
+      [rate, ic.item_code, ic.mt_code || ic.item_code, ic.item_name]
+    ).catch(() => null);
+
+    const [res] = await pool.execute(
+      'UPDATE weight_capture SET rate = ? WHERE itemCode = ? OR materialCode = ? OR LOWER(materialName) = LOWER(?)',
+      [rate, ic.item_code, ic.mt_code || ic.item_code, ic.item_name]
+    ).catch(() => [{ affectedRows: 0 }]);
+
+    updatedCount += (res?.affectedRows || 0);
+  }
+
+  return { success: true, updatedItemCodes: itemCodes.length, updatedBatches: updatedCount };
+};
+
+export const logMaterialPriceChange = async ({ materialId, itemCode, materialName, oldRate, newRate, policy = 'fcfs', changedBy = 'Admin', reason = 'Price Update' }) => {
+  const oRate = parseFloat(oldRate) || 0;
+  const nRate = parseFloat(newRate) || 0;
+  if (oRate === nRate || nRate <= 0) return null;
+  try {
+    const [res] = await pool.execute(
+      `INSERT INTO material_price_history (materialId, itemCode, materialName, oldRate, newRate, policy, changedBy, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [materialId || '', itemCode || '', materialName || '', oRate, nRate, policy, changedBy, reason]
+    );
+    return res.insertId;
+  } catch (err) {
+    console.warn('[DB] Failed to log material price change:', err.message);
+    return null;
+  }
+};
+
+export const updateMaterialRate = async ({ materialId, materialName, itemCode, rate, policy = null, changedBy = 'Admin' }) => {
   const numericRate = parseFloat(rate) || 0;
-  if (materialId) {
-    await pool.execute('UPDATE materials SET cost = ? WHERE id = ?', [numericRate, materialId]).catch(() => null);
+  const effectivePolicy = policy || (await getSetting('material_pricing_policy')) || 'fcfs';
+
+  const fcfsInfo = await getMaterialFcfsBatches(materialId || itemCode || materialName);
+  const oldRate = fcfsInfo?.currentRate || 0;
+  if (oldRate > 0 && numericRate > 0 && oldRate !== numericRate) {
+    await logMaterialPriceChange({
+      materialId: materialId || fcfsInfo?.materialId,
+      itemCode: itemCode || fcfsInfo?.itemCode,
+      materialName: materialName || fcfsInfo?.materialName,
+      oldRate,
+      newRate: numericRate,
+      policy: effectivePolicy,
+      changedBy: changedBy || 'Admin',
+      reason: 'Manual Rate Update'
+    });
   }
-  if (itemCode) {
-    await pool.execute('UPDATE materials SET cost = ? WHERE itemCode = ?', [numericRate, itemCode]).catch(() => null);
-    await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [numericRate, itemCode]).catch(() => null);
+
+  if (effectivePolicy === 'update_all') {
+    // Revalue both old and new stock to updated rate
+    if (materialId) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE id = ?', [numericRate, materialId]).catch(() => null);
+    }
+    if (itemCode) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE itemCode = ?', [numericRate, itemCode]).catch(() => null);
+      await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [numericRate, itemCode]).catch(() => null);
+      await pool.execute('UPDATE weight_capture SET rate = ? WHERE itemCode = ? OR materialCode = ?', [numericRate, itemCode, itemCode]).catch(() => null);
+    }
+    if (materialName) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE LOWER(name) = LOWER(?)', [numericRate, materialName.trim()]).catch(() => null);
+      await pool.execute('UPDATE weight_capture SET rate = ? WHERE LOWER(materialName) = LOWER(?)', [numericRate, materialName.trim()]).catch(() => null);
+    }
+  } else {
+    // FCFS: Update future item_code rate, preserve historical inward batch rates
+    if (itemCode) {
+      await pool.execute('UPDATE item_codes SET rate = ? WHERE item_code = ?', [numericRate, itemCode]).catch(() => null);
+    }
+    const activeRate = (fcfsInfo && fcfsInfo.currentStock > 0 && fcfsInfo.currentRate > 0)
+      ? fcfsInfo.currentRate
+      : numericRate;
+
+    if (materialId) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE id = ?', [activeRate, materialId]).catch(() => null);
+    }
+    if (itemCode) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE itemCode = ?', [activeRate, itemCode]).catch(() => null);
+    }
+    if (materialName) {
+      await pool.execute('UPDATE materials SET cost = ? WHERE LOWER(name) = LOWER(?)', [activeRate, materialName.trim()]).catch(() => null);
+    }
   }
-  if (materialName) {
-    await pool.execute('UPDATE materials SET cost = ? WHERE LOWER(name) = LOWER(?)', [numericRate, materialName.trim()]).catch(() => null);
+  return { success: true, rate: numericRate, policy: effectivePolicy };
+};
+
+export const getMaterialsWithUpdatedPrices = async () => {
+  // 1. Candidate lookup from weight_capture (grouping in JS for 100% SQL-mode compatibility)
+  const candidateKeys = new Set();
+  try {
+    const [wcRows] = await pool.execute(`
+      SELECT COALESCE(NULLIF(itemCode, ''), materialCode) as codeKey, rate
+      FROM weight_capture
+      WHERE (approvalStatus = 'Approved' OR approvalStatus IS NULL) AND rate > 0
+    `);
+    const rateMap = new Map();
+    for (const r of (wcRows || [])) {
+      const k = String(r.codeKey || '').trim();
+      if (!k) continue;
+      if (!rateMap.has(k)) rateMap.set(k, new Set());
+      rateMap.get(k).add(Number(r.rate));
+    }
+    for (const [k, rates] of rateMap.entries()) {
+      if (rates.size > 1) candidateKeys.add(k);
+    }
+  } catch (err) {
+    console.warn('[DB] weight_capture candidate lookup error:', err.message);
   }
-  return { success: true, rate: numericRate };
+
+  // 2. Candidates from material_price_history
+  let historyRows = [];
+  try {
+    const [h] = await pool.execute('SELECT * FROM material_price_history ORDER BY changedAt DESC');
+    historyRows = h || [];
+    for (const row of historyRows) {
+      if (row.itemCode) candidateKeys.add(String(row.itemCode).trim());
+      if (row.materialId) candidateKeys.add(String(row.materialId).trim());
+    }
+  } catch (_) { }
+
+  // 3. Candidates where material current cost differs from latest inward rate
+  try {
+    const [matRates] = await pool.execute('SELECT id, itemCode, cost FROM materials WHERE cost > 0');
+    const [latestCaptureRates] = await pool.execute(`
+      SELECT COALESCE(NULLIF(itemCode, ''), materialCode) as codeKey, rate
+      FROM weight_capture
+      WHERE (approvalStatus = 'Approved' OR approvalStatus IS NULL) AND rate > 0
+      ORDER BY id DESC
+    `);
+    const latestRateMap = new Map();
+    for (const c of (latestCaptureRates || [])) {
+      const k = String(c.codeKey || '').trim().toLowerCase();
+      if (k && !latestRateMap.has(k)) {
+        latestRateMap.set(k, Number(c.rate));
+      }
+    }
+    for (const m of (matRates || [])) {
+      const k1 = String(m.itemCode || '').trim().toLowerCase();
+      const k2 = String(m.id || '').trim().toLowerCase();
+      const capRate = latestRateMap.get(k1) || latestRateMap.get(k2);
+      if (capRate && Math.abs(capRate - Number(m.cost)) > 0.001) {
+        candidateKeys.add(m.itemCode || m.id);
+      }
+    }
+  } catch (_) { }
+
+  const historyByMat = new Map();
+  for (const h of historyRows) {
+    const k1 = (h.materialId || '').toLowerCase().trim();
+    const k2 = (h.itemCode || '').toLowerCase().trim();
+    if (k1) {
+      if (!historyByMat.has(k1)) historyByMat.set(k1, []);
+      historyByMat.get(k1).push(h);
+    }
+    if (k2 && k2 !== k1) {
+      if (!historyByMat.has(k2)) historyByMat.set(k2, []);
+      historyByMat.get(k2).push(h);
+    }
+  }
+
+  // If no candidates have multiple rates or history, return empty array immediately
+  if (candidateKeys.size === 0) {
+    return [];
+  }
+
+  const updatedList = [];
+  for (const key of candidateKeys) {
+    const fcfsInfo = await getMaterialFcfsBatches(key);
+    if (!fcfsInfo) continue;
+
+    const hist = historyByMat.get(String(fcfsInfo.materialId).toLowerCase()) ||
+      historyByMat.get(String(fcfsInfo.itemCode || '').toLowerCase()) || [];
+
+    const allBatchRates = (fcfsInfo.batches || [])
+      .map(b => Number(b.rate) || 0)
+      .filter(r => r > 0);
+    const uniqueRates = [...new Set(allBatchRates)];
+
+    const hasMultipleRates = uniqueRates.length > 1 || fcfsInfo.hasMultipleRates;
+    const hasPriceHistory = hist.length > 0;
+
+    if (!hasMultipleRates && !hasPriceHistory) continue;
+
+    let beforePrice = uniqueRates[0] || (hist.length > 0 ? hist[hist.length - 1].oldRate : fcfsInfo.currentRate);
+    let newPrice = uniqueRates.length > 1 ? uniqueRates[uniqueRates.length - 1] : (hist.length > 0 ? hist[0].newRate : fcfsInfo.currentRate);
+
+    if (beforePrice === newPrice && hist.length > 0) {
+      beforePrice = hist[0].oldRate;
+      newPrice = hist[0].newRate;
+    }
+
+    const priceDiff = Math.round((newPrice - beforePrice) * 100) / 100;
+    const percentChange = beforePrice > 0 ? Math.round(((newPrice - beforePrice) / beforePrice) * 100) : 0;
+
+    const oldTierBatches = (fcfsInfo.batches || []).filter(b => b.rate === beforePrice);
+    const newTierBatches = (fcfsInfo.batches || []).filter(b => b.rate === newPrice);
+
+    const oldStockRemaining = oldTierBatches.reduce((s, b) => s + (b.remainingPieces || 0), 0);
+    const newStockRemaining = newTierBatches.reduce((s, b) => s + (b.remainingPieces || 0), 0);
+
+    const activeTiers = (fcfsInfo.activeBatches || []).map(b => `${b.remainingPieces.toLocaleString()} @ ₹${b.rate.toFixed(2)}`);
+    const breakdownText = activeTiers.length > 0 ? activeTiers.join(' + ') : `${fcfsInfo.currentStock.toLocaleString()} @ ₹${newPrice.toFixed(2)}`;
+
+    const lastLog = hist[0] || null;
+    const latestBatch = (fcfsInfo.batches && fcfsInfo.batches.length > 0) ? fcfsInfo.batches[fcfsInfo.batches.length - 1] : null;
+
+    updatedList.push({
+      materialId: fcfsInfo.materialId,
+      itemCode: fcfsInfo.itemCode || fcfsInfo.materialId,
+      materialName: fcfsInfo.materialName,
+      unit: fcfsInfo.unit || 'Pcs',
+      currentStock: fcfsInfo.currentStock,
+      beforePrice,
+      newPrice,
+      priceDiff,
+      percentChange,
+      oldStockRemaining,
+      newStockRemaining,
+      breakdownText,
+      totalValuation: fcfsInfo.totalValuation,
+      pricingPolicy: (lastLog?.policy) || 'fcfs',
+      lastUpdatedAt: lastLog?.changedAt ? new Date(lastLog.changedAt).toLocaleString('en-IN') : (latestBatch ? `${latestBatch.date} ${latestBatch.time}` : 'Recent'),
+      updateReason: lastLog?.reason || 'Purchase Rate Inward Update',
+      historyCount: hist.length,
+      history: hist.map(h => ({
+        id: h.id,
+        oldRate: h.oldRate,
+        newRate: h.newRate,
+        policy: h.policy,
+        changedBy: h.changedBy,
+        reason: h.reason,
+        date: new Date(h.changedAt).toLocaleString('en-IN')
+      })),
+      batches: fcfsInfo.batches || []
+    });
+  }
+
+  return updatedList;
 };
 
 export const getLotCostingData = async (lotNo) => {
@@ -5028,7 +5547,7 @@ export const getLotCostingData = async (lotNo) => {
     const id = String(l.id || '').toUpperCase();
     if (id.startsWith('REAL-MI-')) {
       let mats = [];
-      try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) {}
+      try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) { }
       const billNo = mats[0]?.billNo;
       if (billNo) realMiParentBills.add(String(billNo).toLowerCase());
     }
@@ -5090,7 +5609,7 @@ export const getLotCostingData = async (lotNo) => {
     }
 
     let mats = [];
-    try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) {}
+    try { mats = typeof l.materials === 'string' ? JSON.parse(l.materials) : (l.materials || []); } catch (_) { }
     if (!Array.isArray(mats)) mats = [mats];
 
     mats.forEach(m => {
@@ -5110,7 +5629,7 @@ export const getLotCostingData = async (lotNo) => {
   extraIssues.forEach(ex => {
     let items = [];
     if (typeof ex.items_payload === 'string') {
-      try { items = JSON.parse(ex.items_payload); } catch (_) {}
+      try { items = JSON.parse(ex.items_payload); } catch (_) { }
     }
     if (Array.isArray(items) && items.length > 0) {
       items.forEach(it => {
@@ -5218,13 +5737,31 @@ export const getLotCostingData = async (lotNo) => {
   let totalAccessoryCost = 0;
   let totalIssuedUnits = 0;
 
-  items.forEach(item => {
+  for (const item of items) {
     item.quantity = Math.round(item.quantity * 100) / 100;
-    item.totalCost = Math.round((item.quantity * item.rate) * 100) / 100;
+    try {
+      const fcfs = await calculateFcfsCostForIssue(item.itemCode || item.materialId || item.materialName, item.quantity);
+      if (fcfs && fcfs.totalCost > 0) {
+        item.totalCost = fcfs.totalCost;
+        item.rate = fcfs.effectiveRate || item.rate;
+        item.fcfsBreakdown = fcfs.breakdown;
+        item.hasMultipleTiers = fcfs.hasMultipleTiers;
+        item.fcfsTiers = fcfs.tiers;
+      } else {
+        item.totalCost = Math.round((item.quantity * item.rate) * 100) / 100;
+        item.fcfsBreakdown = `${item.quantity.toLocaleString()} @ ₹${item.rate}`;
+        item.hasMultipleTiers = false;
+      }
+    } catch (_) {
+      item.totalCost = Math.round((item.quantity * item.rate) * 100) / 100;
+      item.fcfsBreakdown = `${item.quantity.toLocaleString()} @ ₹${item.rate}`;
+      item.hasMultipleTiers = false;
+    }
+
     item.costPerPiece = cuttingQty > 0 ? Math.round((item.totalCost / cuttingQty) * 1000) / 1000 : 0;
     totalAccessoryCost += item.totalCost;
     totalIssuedUnits += item.quantity;
-  });
+  }
 
   totalAccessoryCost = Math.round(totalAccessoryCost * 100) / 100;
   const costPerGarmentPiece = cuttingQty > 0 ? Math.round((totalAccessoryCost / cuttingQty) * 1000) / 1000 : 0;

@@ -106,7 +106,13 @@ import {
   restoreTransactionInDb,
   getLotCostingData,
   getRecentCostingLots,
-  updateMaterialRate
+  updateMaterialRate,
+  getMaterialFcfsBatches,
+  calculateFcfsCostForIssue,
+  syncMaterialFcfsCost,
+  revalueAllMaterialsToLatestSql,
+  getMaterialsWithUpdatedPrices,
+  logMaterialPriceChange
 } from './db.js';
 import pool from './db.js';
 import cloudinary from './config/cloudinary.js';
@@ -2939,6 +2945,17 @@ app.get('/api/materials', async (req, res) => {
   }
 });
 
+// GET all materials that have updated prices / multiple price tiers
+app.get('/api/materials/price-updates', async (req, res) => {
+  try {
+    const list = await getMaterialsWithUpdatedPrices();
+    res.status(200).json({ success: true, count: list.length, materials: list });
+  } catch (err) {
+    console.error('API GET /api/materials/price-updates error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET single material by ID
 app.get('/api/materials/:id', async (req, res) => {
   try {
@@ -3369,13 +3386,15 @@ app.get('/api/settings', async (req, res) => {
     const warehouseRacks = await getSetting('warehouse_racks');
     const allowMaterialPhotoEdit = await getSetting('allow_material_photo_edit');
     const allowWarehouseAddRack = await getSetting('allow_warehouse_add_rack');
+    const materialPricingPolicy = await getSetting('material_pricing_policy');
     const payload = {
       accessoriesList: accessoriesList || [],
       designersList: designersList || [],
       warehouseHalls: warehouseHalls || [],
       warehouseRacks: warehouseRacks || [],
       allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true,
-      allowWarehouseAddRack: (allowWarehouseAddRack !== null && allowWarehouseAddRack !== undefined) ? Boolean(allowWarehouseAddRack) : false
+      allowWarehouseAddRack: (allowWarehouseAddRack !== null && allowWarehouseAddRack !== undefined) ? Boolean(allowWarehouseAddRack) : false,
+      materialPricingPolicy: materialPricingPolicy || 'fcfs'
     };
     setCached(cacheKey, payload, 60000);
     res.setHeader('X-Cache', 'MISS');
@@ -3383,6 +3402,32 @@ app.get('/api/settings', async (req, res) => {
   } catch (err) {
     console.error('API GET /api/settings error:', err.message);
     res.status(500).json({ error: 'Failed to retrieve settings.' });
+  }
+});
+
+// GET material pricing policy
+app.get('/api/settings/material-pricing-policy', async (req, res) => {
+  try {
+    const policy = (await getSetting('material_pricing_policy')) || 'fcfs';
+    res.status(200).json({ success: true, policy });
+  } catch (err) {
+    console.error('API GET /api/settings/material-pricing-policy error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PUT update material pricing policy
+app.put('/api/settings/material-pricing-policy', async (req, res) => {
+  try {
+    const policy = req.body.policy || req.body.value;
+    const cleanPolicy = policy === 'update_all' ? 'update_all' : 'fcfs';
+    await setSetting('material_pricing_policy', cleanPolicy);
+    invalidateCache('settings');
+    invalidateCache('materials_');
+    res.status(200).json({ success: true, policy: cleanPolicy, message: `Material pricing policy set to ${cleanPolicy.toUpperCase()}.` });
+  } catch (err) {
+    console.error('API PUT /api/settings/material-pricing-policy error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -4469,15 +4514,57 @@ app.get('/api/costing/recent-lots', async (req, res) => {
 // PUT update material unit rate/cost in database directly from costing dashboard
 app.put('/api/costing/material-rate', async (req, res) => {
   try {
-    const { materialId, materialName, itemCode, rate } = req.body;
+    const { materialId, materialName, itemCode, rate, policy } = req.body;
     if (rate === undefined || rate === null || isNaN(parseFloat(rate))) {
       return res.status(400).json({ error: 'Valid numeric rate is required.' });
     }
-    const result = await updateMaterialRate({ materialId, materialName, itemCode, rate: parseFloat(rate) });
+    const result = await updateMaterialRate({ materialId, materialName, itemCode, rate: parseFloat(rate), policy });
+    invalidateCache('materials_');
     res.status(200).json(result);
   } catch (err) {
     console.error('API PUT /api/costing/material-rate error:', err.message);
     res.status(500).json({ error: 'Failed to update material rate: ' + err.message });
+  }
+});
+
+// GET FCFS batch breakdown and valuation for any material
+app.get('/api/materials/:id/fcfs-batches', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const data = await getMaterialFcfsBatches(id);
+    if (!data) return res.status(404).json({ success: false, error: 'Material not found.' });
+    res.status(200).json({ success: true, ...data });
+  } catch (err) {
+    console.error('API GET /api/materials/:id/fcfs-batches error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST update material price with policy (fcfs vs update_all)
+app.post('/api/materials/update-rate', async (req, res) => {
+  try {
+    const { materialId, materialName, itemCode, rate, policy } = req.body;
+    if (rate === undefined || rate === null || isNaN(parseFloat(rate))) {
+      return res.status(400).json({ success: false, error: 'Valid numeric rate is required.' });
+    }
+    const result = await updateMaterialRate({ materialId, materialName, itemCode, rate: parseFloat(rate), policy });
+    invalidateCache('materials_');
+    res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    console.error('API POST /api/materials/update-rate error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST revalue all inventory stock to latest registered item code rates
+app.post('/api/materials/revalue-all-to-latest', async (req, res) => {
+  try {
+    const result = await revalueAllMaterialsToLatestSql();
+    invalidateCache('materials_');
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('API POST /api/materials/revalue-all-to-latest error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
