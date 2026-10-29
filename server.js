@@ -33,6 +33,7 @@ import {
   getAllPOs,
   createPO,
   updatePOStatus,
+  updatePOSignatures,
   getPOByNumberOrId,
   getAllVendors,
   createVendor,
@@ -3272,6 +3273,18 @@ app.put('/api/pos/:id/status', async (req, res) => {
   } catch (err) {
     console.error('API PUT /api/pos/:id/status error:', err.message);
     res.status(500).json({ error: 'Failed to update PO status.' });
+  }
+});
+
+// PUT update PO signatures (Requisition Raised By, Prepared By, Approved By)
+app.put('/api/pos/:id/signatures', async (req, res) => {
+  try {
+    const { requisitionRaisedBy, preparedBy, approvedBy } = req.body;
+    await updatePOSignatures(req.params.id, { requisitionRaisedBy, preparedBy, approvedBy });
+    res.status(200).json({ success: true, message: 'PO signatures updated.' });
+  } catch (err) {
+    console.error('API PUT /api/pos/:id/signatures error:', err.message);
+    res.status(500).json({ error: 'Failed to update PO signatures.' });
   }
 });
 

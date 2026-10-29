@@ -819,6 +819,9 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN requisitionRaisedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN preparedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN approvedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
@@ -2155,12 +2158,14 @@ export const createPO = async (po) => {
   await pool.execute(
     `REPLACE INTO purchase_orders
       (id,poNumber,vendorName,designName,designCategory,
-       items,subtotal,taxRate,tax,total,date,deliveryDate,status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       items,subtotal,taxRate,tax,total,date,deliveryDate,status,
+       requisitionRaisedBy,preparedBy,approvedBy)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [finalId, cleanPo, po.vendorName || '',
       po.designName || '', po.designCategory || '', itemsJson,
       po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
-      po.date || '', po.deliveryDate || '', po.status || 'Draft']
+      po.date || '', po.deliveryDate || '', po.status || 'Draft',
+      po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '']
   );
 
   return { ...po, id: finalId, poNumber: cleanPo };
@@ -2168,6 +2173,27 @@ export const createPO = async (po) => {
 
 export const updatePOStatus = async (id, status) => {
   await pool.execute('UPDATE purchase_orders SET status=? WHERE id=?', [status, id]);
+};
+
+export const updatePOSignatures = async (idOrPo, { requisitionRaisedBy, preparedBy, approvedBy }) => {
+  const cleanStr = String(idOrPo || '').trim();
+  const lowerStr = cleanStr.toLowerCase();
+  const digitsOnly = cleanStr.replace(/\D/g, '');
+  await pool.execute(
+    `UPDATE purchase_orders 
+     SET requisitionRaisedBy=?, preparedBy=?, approvedBy=? 
+     WHERE id=? OR LOWER(poNumber)=? OR poNumber LIKE ? OR poNumber LIKE ?`,
+    [
+      requisitionRaisedBy || '',
+      preparedBy || '',
+      approvedBy || '',
+      cleanStr,
+      lowerStr,
+      `%${lowerStr}%`,
+      digitsOnly ? `%${digitsOnly}%` : lowerStr
+    ]
+  );
+  return { success: true };
 };
 
 export const getPOByNumberOrId = async (poIdentifier) => {
