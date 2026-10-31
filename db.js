@@ -822,6 +822,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN requisitionRaisedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN preparedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN approvedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN remarks TEXT`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
@@ -2155,18 +2156,34 @@ export const createPO = async (po) => {
     }
   }
 
-  await pool.execute(
-    `REPLACE INTO purchase_orders
-      (id,poNumber,vendorName,designName,designCategory,
-       items,subtotal,taxRate,tax,total,date,deliveryDate,status,
-       requisitionRaisedBy,preparedBy,approvedBy)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [finalId, cleanPo, po.vendorName || '',
-      po.designName || '', po.designCategory || '', itemsJson,
-      po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
-      po.date || '', po.deliveryDate || '', po.status || 'Draft',
-      po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '']
-  );
+  try {
+    await pool.execute(
+      `REPLACE INTO purchase_orders
+        (id,poNumber,vendorName,designName,designCategory,
+         items,subtotal,taxRate,tax,total,date,deliveryDate,status,
+         requisitionRaisedBy,preparedBy,approvedBy,remarks)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [finalId, cleanPo, po.vendorName || '',
+        po.designName || '', po.designCategory || '', itemsJson,
+        po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
+        po.date || '', po.deliveryDate || '', po.status || 'Draft',
+        po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '',
+        po.remarks || '']
+    );
+  } catch (repErr) {
+    await pool.execute(
+      `REPLACE INTO purchase_orders
+        (id,poNumber,vendorName,designName,designCategory,
+         items,subtotal,taxRate,tax,total,date,deliveryDate,status,
+         requisitionRaisedBy,preparedBy,approvedBy)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [finalId, cleanPo, po.vendorName || '',
+        po.designName || '', po.designCategory || '', itemsJson,
+        po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
+        po.date || '', po.deliveryDate || '', po.status || 'Draft',
+        po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '']
+    );
+  }
 
   return { ...po, id: finalId, poNumber: cleanPo };
 };
