@@ -1735,6 +1735,7 @@ export const getAllMaterials = async (onlyPresent = false) => {
   const sql = `
     SELECT 
       m.*, 
+      COALESCE(NULLIF(m.brand, ''), ic.brand, '') AS brand,
       COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS itemCode, 
       COALESCE(NULLIF(m.itemCode, ''), ic.item_code, '') AS stCode 
     FROM materials m 
@@ -1807,6 +1808,7 @@ export const upsertMaterial = async (m) => {
         invoiceNo = ?,
         imageUrl = ?,
         vendorName = ?,
+        brand = COALESCE(NULLIF(?, ''), brand),
         itemCode = COALESCE(NULLIF(?, ''), itemCode)
        WHERE id = ?`,
       [
@@ -1823,6 +1825,7 @@ export const upsertMaterial = async (m) => {
         m.invoiceNo !== undefined ? m.invoiceNo : ext.invoiceNo,
         m.imageUrl !== undefined ? m.imageUrl : (ext.imageUrl || ''),
         m.vendorName !== undefined ? m.vendorName : (ext.vendorName || ''),
+        m.brand || ext.brand || '',
         m.itemCode || ext.itemCode || '',
         ext.id
       ]
@@ -1855,8 +1858,8 @@ export const upsertMaterial = async (m) => {
     const finalMatId = (m.id && !m.id.startsWith('ST')) ? m.id : `M${Math.floor(1000 + Math.random() * 9000)}`;
     const finalItemCode = (m.id && m.id.startsWith('ST')) ? m.id : (m.itemCode || null);
     await pool.execute(
-      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, vendorName, itemCode)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO materials (id, name, category, stock, unit, cost, threshold, color, location, packets, poNumber, invoiceNo, imageUrl, vendorName, brand, itemCode)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         finalMatId,
         m.name || 'Accessory Material',
@@ -1872,6 +1875,7 @@ export const upsertMaterial = async (m) => {
         m.invoiceNo || 'N/A',
         m.imageUrl || '',
         m.vendorName || '',
+        m.brand || null,
         finalItemCode
       ]
     );
