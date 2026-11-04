@@ -113,7 +113,8 @@ import {
   syncMaterialFcfsCost,
   revalueAllMaterialsToLatestSql,
   getMaterialsWithUpdatedPrices,
-  logMaterialPriceChange
+  logMaterialPriceChange,
+  withRetry
 } from './db.js';
 import pool from './db.js';
 import cloudinary from './config/cloudinary.js';
@@ -889,6 +890,34 @@ export async function getMainLotsCSV(force = false) {
   return '';
 }
 
+// Resilient CSV fetch with retry and realistic timeout (25s) for Google Sheets exports
+async function fetchCsvWithRetry(url, timeoutMs = 25000, retries = 2) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        return await response.text();
+      }
+      if (response.status === 429 && attempt < retries) {
+        await new Promise(r => setTimeout(r, 1200 * attempt));
+        continue;
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 800 * attempt));
+      }
+    }
+  }
+  if (lastErr) throw lastErr;
+  return '';
+}
+
 // 2. Fetch Cutting Google Sheet (Used exclusively for Only Cutting / Cutting Matrix)
 export async function getCuttingLotsCSV(force = false) {
   const url = getCuttingSheetUrl();
@@ -900,19 +929,14 @@ export async function getCuttingLotsCSV(force = false) {
   }
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const csvText = await response.text();
+    const csvText = await fetchCsvWithRetry(url, 25000, 2);
+    if (csvText) {
       fs.writeFileSync(CUTTING_SHEET_CSV_CACHE_PATH, csvText, 'utf8');
       lastCuttingFetchTime = now;
       return csvText;
     }
   } catch (err) {
-    console.warn('[Cutting Sheet Loader] Fetch error:', err.message);
+    console.warn('[Cutting Sheet Loader] Warning fetching cutting sheet (using cache):', err.message);
   }
 
   if (cacheExists) {
@@ -938,18 +962,13 @@ async function getCuttingMatrixBlocksCSV(force = false) {
   }
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const csvText = await response.text();
+    const csvText = await fetchCsvWithRetry(url, 25000, 2);
+    if (csvText) {
       fs.writeFileSync(CUTTING_MATRIX_CSV_CACHE_PATH, csvText, 'utf8');
       return csvText;
     }
   } catch (err) {
-    console.warn('[Matrix Loader] Warning fetching gid=0 matrix sheet:', err.message);
+    console.warn('[Matrix Loader] Warning fetching gid=0 matrix sheet (using cache):', err.message);
   }
 
   if (cacheExists) {
@@ -993,16 +1012,20 @@ function parseCuttingMatrixBlocks(csvText) {
       }
       if (idx >= lines.length) continue;
 
-      const colHeader = lines[idx].split(',').map(c => c.trim().toUpperCase());
-      const colIdx = {
-        color: colHeader.indexOf('COLOR'),
-        table: colHeader.indexOf('CUTTING TABLE'),
-        m: colHeader.indexOf('M'),
-        l: colHeader.indexOf('L'),
-        xl: colHeader.indexOf('XL'),
-        xxl: colHeader.indexOf('XXL'),
-        total: colHeader.indexOf('TOTAL PCS')
-      };
+      const rawHeaderParts = lines[idx].split(',').map(c => c.trim());
+      const upperHeader = rawHeaderParts.map(c => c.toUpperCase());
+
+      const colorIdx = upperHeader.findIndex(c => c === 'COLOR' || c === 'SHADE');
+      const tableIdx = upperHeader.findIndex(c => c.includes('TABLE'));
+      const totalIdx = upperHeader.findIndex(c => c.includes('TOTAL'));
+
+      const nonSizeNames = ['COLOR', 'SHADE', 'CUTTING TABLE', 'TABLE', 'TABLE #', 'TOTAL', 'TOTAL PCS', 'TOTAL_PCS', ''];
+      const sizeCols = [];
+      upperHeader.forEach((colName, cIdx) => {
+        if (!nonSizeNames.includes(colName) && (totalIdx === -1 || cIdx < totalIdx) && (tableIdx === -1 || cIdx > tableIdx)) {
+          sizeCols.push({ name: rawHeaderParts[cIdx], index: cIdx });
+        }
+      });
       idx++;
 
       const matrixRows = [];
@@ -1010,21 +1033,39 @@ function parseCuttingMatrixBlocks(csvText) {
         const rowLine = lines[idx].trim();
         if (!rowLine || rowLine.startsWith('Cutting Matrix')) break;
         const cols = lines[idx].split(',').map(c => c.trim());
-        const colorVal = cols[colIdx.color >= 0 ? colIdx.color : 0] || '';
+        const colorVal = cols[colorIdx >= 0 ? colorIdx : 0] || '';
         if (colorVal.toLowerCase() === 'total' || !colorVal) {
           break;
         }
-        const tableVal = parseInt(cols[colIdx.table >= 0 ? colIdx.table : 1], 10) || 1;
-        const mVal = colIdx.m >= 0 ? parseInt(cols[colIdx.m], 10) || 0 : 0;
-        const lVal = colIdx.l >= 0 ? parseInt(cols[colIdx.l], 10) || 0 : 0;
-        const xlVal = colIdx.xl >= 0 ? parseInt(cols[colIdx.xl], 10) || 0 : 0;
-        const xxlVal = colIdx.xxl >= 0 ? parseInt(cols[colIdx.xxl], 10) || 0 : 0;
-        const totalVal = colIdx.total >= 0 ? parseInt(cols[colIdx.total], 10) || (mVal + lVal + xlVal + xxlVal) : (mVal + lVal + xlVal + xxlVal);
+        const tableVal = parseInt(cols[tableIdx >= 0 ? tableIdx : 1], 10) || 1;
+        const sizesMap = {};
+        let sumSizes = 0;
+        sizeCols.forEach(sc => {
+          const val = parseInt(cols[sc.index], 10) || 0;
+          sizesMap[sc.name] = val;
+          sumSizes += val;
+        });
+
+        // Backward compatibility for standard sizes
+        if (sizesMap['M'] === undefined && sizeCols.some(s => s.name.toUpperCase() === 'M')) {
+          sizesMap['M'] = sizesMap[sizeCols.find(s => s.name.toUpperCase() === 'M').name];
+        }
+        if (sizesMap['L'] === undefined && sizeCols.some(s => s.name.toUpperCase() === 'L')) {
+          sizesMap['L'] = sizesMap[sizeCols.find(s => s.name.toUpperCase() === 'L').name];
+        }
+        if (sizesMap['XL'] === undefined && sizeCols.some(s => s.name.toUpperCase() === 'XL')) {
+          sizesMap['XL'] = sizesMap[sizeCols.find(s => s.name.toUpperCase() === 'XL').name];
+        }
+        if (sizesMap['XXL'] === undefined && sizeCols.some(s => s.name.toUpperCase() === 'XXL')) {
+          sizesMap['XXL'] = sizesMap[sizeCols.find(s => s.name.toUpperCase() === 'XXL').name];
+        }
+
+        const totalVal = totalIdx >= 0 ? (parseInt(cols[totalIdx], 10) || sumSizes) : sumSizes;
 
         matrixRows.push({
           color: colorVal,
           cuttingTable: tableVal,
-          sizes: { M: mVal, L: lVal, XL: xlVal, XXL: xxlVal },
+          sizes: sizesMap,
           totalPcs: totalVal
         });
         idx++;
@@ -1128,11 +1169,12 @@ async function batchEnsureCuttingsMatrix(items, lotMatrixMap = null) {
           lotNo || '',
           mRow.color,
           mRow.cuttingTable || 6,
-          mRow.sizes?.M || 0,
-          mRow.sizes?.L || 0,
-          mRow.sizes?.XL || 0,
-          mRow.sizes?.XXL || 0,
-          mRow.totalPcs || 0
+          mRow.sizes?.M || mRow.sizes?.['38'] || 0,
+          mRow.sizes?.L || mRow.sizes?.['40'] || 0,
+          mRow.sizes?.XL || mRow.sizes?.['42'] || 0,
+          mRow.sizes?.XXL || mRow.sizes?.['44'] || 0,
+          mRow.totalPcs || 0,
+          JSON.stringify(mRow.sizes || {})
         ]);
       }
       continue;
@@ -1236,7 +1278,8 @@ async function batchEnsureCuttingsMatrix(items, lotMatrixMap = null) {
         sizeMap['L'] || 0,
         sizeMap['XL'] || 0,
         sizeMap['XXL'] || 0,
-        itemQty
+        itemQty,
+        JSON.stringify(sizeMap || {})
       ]);
     }
   }
@@ -1255,13 +1298,24 @@ async function batchEnsureCuttingsMatrix(items, lotMatrixMap = null) {
   // Multi-row INSERT in chunks of 100 for high database throughput
   for (let i = 0; i < matrixValues.length; i += 100) {
     const chunk = matrixValues.slice(i, i + 100);
-    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+    const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
     const flatParams = chunk.flat();
-    await pool.execute(
-      `INSERT INTO cuttings_matrix (header_id, Lot_No, Color, Cutting_Table, M, L, XL, XXL, Total_Pcs)
-       VALUES ${placeholders}`,
-      flatParams
-    );
+    try {
+      await pool.execute(
+        `INSERT INTO cuttings_matrix (header_id, Lot_No, Color, Cutting_Table, M, L, XL, XXL, Total_Pcs, size_payload)
+         VALUES ${placeholders}`,
+        flatParams
+      );
+    } catch (e) {
+      // Fallback if size_payload column does not exist
+      const oldPlaceholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+      const oldFlat = chunk.map(r => r.slice(0, 9)).flat();
+      await pool.execute(
+        `INSERT INTO cuttings_matrix (header_id, Lot_No, Color, Cutting_Table, M, L, XL, XXL, Total_Pcs)
+         VALUES ${oldPlaceholders}`,
+        oldFlat
+      );
+    }
   }
 }
 
@@ -1314,6 +1368,10 @@ export async function ensureCuttingTablesExist() {
       XXL INT,
       Total_Pcs INT
     )`);
+
+    try {
+      await pool.execute('ALTER TABLE cuttings_matrix ADD COLUMN size_payload TEXT');
+    } catch (_) {}
   } catch (err) {
     console.warn('[DB] Warning ensuring cutting tables:', err.message);
   }
@@ -1324,10 +1382,10 @@ export async function syncGoogleSheetsToDb(force = false) {
   const syncStartTime = Date.now();
   try {
     await ensureCuttingTablesExist();
-    const [csvText, matrixCsvText] = await Promise.all([
-      getCuttingLotsCSV(force),
-      getCuttingMatrixBlocksCSV(force).catch(() => '')
-    ]);
+    // Stagger Google Sheets downloads sequentially to prevent connection reset / rate-limiting
+    const csvText = await getCuttingLotsCSV(force);
+    await new Promise(r => setTimeout(r, 400));
+    const matrixCsvText = await getCuttingMatrixBlocksCSV(force).catch(() => '');
 
     if (!csvText) {
       console.warn('[Sync] No CSV text retrieved from Google Sheets.');
@@ -1420,7 +1478,7 @@ export async function syncGoogleSheetsToDb(force = false) {
     }
 
     // Step 1: Fetch all existing Lot Numbers from DB in a single fast query
-    const [existingRows] = await pool.execute('SELECT id, LOWER(TRIM(Lot_Number)) AS lot_key FROM cutting_header WHERE Lot_Number IS NOT NULL');
+    const [existingRows] = await withRetry(p => p.execute('SELECT id, LOWER(TRIM(Lot_Number)) AS lot_key FROM cutting_header WHERE Lot_Number IS NOT NULL'));
     const existingMap = new Map();
     for (const row of existingRows) {
       if (row.lot_key) existingMap.set(row.lot_key, row.id);
@@ -1438,8 +1496,8 @@ export async function syncGoogleSheetsToDb(force = false) {
       for (let i = 0; i < obsoleteLots.length; i += 100) {
         const chunk = obsoleteLots.slice(i, i + 100);
         const placeholders = chunk.map(() => '?').join(', ');
-        await pool.execute(`DELETE FROM cuttings_matrix WHERE LOWER(TRIM(Lot_No)) IN (${placeholders})`, chunk).catch(() => null);
-        await pool.execute(`DELETE FROM cutting_header WHERE LOWER(TRIM(Lot_Number)) IN (${placeholders})`, chunk).catch(() => null);
+        await withRetry(p => p.execute(`DELETE FROM cuttings_matrix WHERE LOWER(TRIM(Lot_No)) IN (${placeholders})`, chunk)).catch(() => null);
+        await withRetry(p => p.execute(`DELETE FROM cutting_header WHERE LOWER(TRIM(Lot_Number)) IN (${placeholders})`, chunk)).catch(() => null);
       }
       console.log(`[Sync] Automatically pruned ${obsoleteLots.length} obsolete / non-cutting lots from DB.`);
     }
@@ -1495,7 +1553,11 @@ export async function syncGoogleSheetsToDb(force = false) {
             (r['M/W/K'] || r['MWK'] || '').substring(0, 255),
             (r['JobOrder Date'] || r['JobOrder_Date'] || '').substring(0, 100),
             parseInt(r['Manpower'], 10) || 0,
-            parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10),
+            (() => {
+              const blk = lotMatrixMap ? lotMatrixMap.get(r._cleanLot.toLowerCase()) : null;
+              const mTotal = blk?.matrix?.reduce((sum, m) => sum + (Number(m.totalPcs) || 0), 0) || 0;
+              return mTotal > 0 ? mTotal : (parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10));
+            })(),
             parseInt(r['Stitching Issue Qty'] || 0, 10),
             (r['Prioirty'] || r['Priority'] || 'Normal').substring(0, 50),
             (r['Sticker'] || '').substring(0, 100),
@@ -1504,7 +1566,7 @@ export async function syncGoogleSheetsToDb(force = false) {
           );
         });
 
-        await pool.execute(
+        await withRetry(p => p.execute(
           `INSERT INTO cutting_header (
             Lot_Number, StartRow, NumRows, HeaderCols, Fabric, Garment_Type, Style, Sizes, Shades, Saved_At,
             Date_of_Issue, Supervisor, Party_Name, Brand, Season, Direct_Stitching, Challan_History,
@@ -1512,7 +1574,7 @@ export async function syncGoogleSheetsToDb(force = false) {
             Manpower, Cutting_Qty, Stitching_Issue_Qty, Priority, Sticker, Image_Url, zip_payload
           ) VALUES ${placeholders}`,
           flatParams
-        );
+        ));
         inserted += chunk.length;
       }
 
@@ -1521,10 +1583,10 @@ export async function syncGoogleSheetsToDb(force = false) {
       for (let i = 0; i < insertedLots.length; i += 100) {
         const lotChunk = insertedLots.slice(i, i + 100);
         const qPlaceholders = lotChunk.map(() => '?').join(', ');
-        const [insertedHeaderRows] = await pool.execute(
+        const [insertedHeaderRows] = await withRetry(p => p.execute(
           `SELECT id, Lot_Number FROM cutting_header WHERE Lot_Number IN (${qPlaceholders})`,
           lotChunk
-        );
+        ));
 
         const headerIdMap = new Map();
         insertedHeaderRows.forEach(h => headerIdMap.set(h.Lot_Number.toLowerCase(), h.id));
@@ -1550,15 +1612,15 @@ export async function syncGoogleSheetsToDb(force = false) {
       }
     }
 
-    // Step 3: Batch Update existing rows in chunks of 20
+    // Step 3: Batch Update existing rows in chunks of 5 (matches connectionLimit)
     if (toUpdate.length > 0) {
-      const updateConcurrency = 20;
+      const updateConcurrency = 5;
       for (let i = 0; i < toUpdate.length; i += updateConcurrency) {
         const chunk = toUpdate.slice(i, i + updateConcurrency);
         await Promise.all(
           chunk.map(async ({ id, row: r }) => {
             const rowImg = extractRowImageUrl(r);
-            await pool.execute(
+            await withRetry(p => p.execute(
               `UPDATE cutting_header SET
                 StartRow = COALESCE(NULLIF(?, 0), StartRow),
                 NumRows = COALESCE(NULLIF(?, 0), NumRows),
@@ -1595,12 +1657,16 @@ export async function syncGoogleSheetsToDb(force = false) {
                 r['CHALLAN HISTORY'] || r['Challan History'] || '',
                 (r['Date of Issue'] || r['Date_of_Issue'] || r['JobOrder Date'] || r['Date'] || '').substring(0, 100),
                 (r['Supervisor'] || r['Submitted By'] || '').substring(0, 255),
-                parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10),
+                (() => {
+                  const blk = lotMatrixMap ? lotMatrixMap.get(r._cleanLot.toLowerCase()) : null;
+                  const mTotal = blk?.matrix?.reduce((sum, m) => sum + (Number(m.totalPcs) || 0), 0) || 0;
+                  return mTotal > 0 ? mTotal : (parseInt(r['Cutting Qty'] || r['Cutting_Qty'] || r['Quantity'] || 0, 10));
+                })(),
                 (r['Prioirty'] || r['Priority'] || 'Normal').substring(0, 50),
                 rowImg.substring(0, 1000),
                 id
               ]
-            );
+            ));
           })
         );
 
@@ -3811,6 +3877,40 @@ app.get('/api/cutting/:lotNo', async (req, res) => {
       if (baseResult) {
         await duplicateCuttingHeader(baseLot, lotNo);
         result = await getCuttingMatrixByLot(lotNo);
+      }
+    }
+
+    // Authoritative check against detailed matrix sheet (gid=0)
+    try {
+      const matrixCsv = await getCuttingMatrixBlocksCSV(false);
+      if (matrixCsv) {
+        const lotMatrixMap = parseCuttingMatrixBlocks(matrixCsv);
+        const block = lotMatrixMap.get(lotNo.toLowerCase());
+        if (block && block.matrix && block.matrix.length > 0) {
+          const matrixTotal = block.matrix.reduce((sum, r) => sum + (Number(r.totalPcs) || 0), 0);
+          result = {
+            header: {
+              ...(result?.header || {}),
+              Lot_Number: lotNo,
+              Style: block.style || result?.header?.Style,
+              Fabric: block.fabric || result?.header?.Fabric,
+              Garment_Type: block.garmentType || result?.header?.Garment_Type,
+              Cutting_Qty: matrixTotal > 0 ? matrixTotal : result?.header?.Cutting_Qty
+            },
+            rows: block.matrix,
+            cuttingQty: matrixTotal > 0 ? matrixTotal : result?.header?.Cutting_Qty
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('[API Cutting Matrix] Cache resolve warning:', e.message);
+    }
+
+    if (result && Array.isArray(result.rows) && result.rows.length > 0) {
+      const matrixSum = result.rows.reduce((sum, r) => sum + (Number(r.totalPcs) || 0), 0);
+      if (matrixSum > 0) {
+        if (result.header) result.header.Cutting_Qty = matrixSum;
+        result.cuttingQty = matrixSum;
       }
     }
 

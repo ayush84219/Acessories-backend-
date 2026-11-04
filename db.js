@@ -40,13 +40,13 @@ const getPoolConfig = () => {
         database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
         ssl: { rejectUnauthorized: false },
         waitForConnections: true,
-        connectionLimit: 8,
-        maxIdle: 4,
-        idleTimeout: 60000,
+        connectionLimit: 10,
+        maxIdle: 10,
+        idleTimeout: 30000,
         queueLimit: 0,
         enableKeepAlive: true,
-        keepAliveInitialDelay: 10000,
-        connectTimeout: 20000,
+        keepAliveInitialDelay: 5000,
+        connectTimeout: 30000,
       };
     } catch (e) {
       console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
@@ -63,13 +63,13 @@ const getPoolConfig = () => {
     password: process.env.MYSQL_PASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
     database: (process.env.MYSQL_DATABASE || process.env.DB_NAME || 'accessories2').trim(),
     waitForConnections: true,
-    connectionLimit: 8,
-    maxIdle: 4,
-    idleTimeout: 60000,
+    connectionLimit: 10,
+    maxIdle: 10,
+    idleTimeout: 30000,
     queueLimit: 0,
     enableKeepAlive: true,
-    keepAliveInitialDelay: 10000,
-    connectTimeout: 20000,
+    keepAliveInitialDelay: 5000,
+    connectTimeout: 30000,
   };
 
   if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
@@ -82,23 +82,29 @@ const getPoolConfig = () => {
 export const pool = mysql.createPool(getPoolConfig());
 
 // Resilient query execution with automatic exponential-backoff retry on transient connection drops
-export async function withRetry(operation, retries = 2, delayMs = 300) {
+export async function withRetry(operation, retries = 3, delayMs = 400) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await operation(pool);
     } catch (err) {
       lastError = err;
+      const msg = (err.message || '').toLowerCase();
       const isTransient = [
         'PROTOCOL_CONNECTION_LOST',
         'ECONNRESET',
         'ETIMEDOUT',
         'ER_LOCK_DEADLOCK',
-        'EAI_AGAIN'
-      ].includes(err.code);
+        'EAI_AGAIN',
+        'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR'
+      ].includes(err.code) ||
+        msg.includes('econnreset') ||
+        msg.includes('connection lost') ||
+        msg.includes('closed') ||
+        msg.includes('socket');
 
       if (attempt < retries && isTransient) {
-        console.warn(`[DB Retry] Transient error (${err.code}). Retrying in ${delayMs}ms (Attempt ${attempt + 1}/${retries})...`);
+        console.warn(`[DB Retry] Transient error (${err.code || err.message}). Retrying in ${delayMs * Math.pow(2, attempt)}ms (Attempt ${attempt + 1}/${retries})...`);
         await new Promise(r => setTimeout(r, delayMs * Math.pow(2, attempt)));
       } else {
         break;
@@ -110,22 +116,22 @@ export async function withRetry(operation, retries = 2, delayMs = 300) {
 
 export function getPoolStats() {
   return {
-    connectionLimit: 25,
+    connectionLimit: 10,
     status: 'healthy',
-    keepAliveDelayMs: 10000
+    keepAliveDelayMs: 5000
   };
 }
 
-// Periodic connection pool keepalive (runs every 180s to keep connection pool warm & healthy with minimal load)
+// Periodic connection pool keepalive (runs every 25s to keep remote proxy connection warm & prevent idle drops)
 setInterval(async () => {
   try {
     const conn = await pool.getConnection();
     await conn.query('SELECT 1');
     conn.release();
   } catch (err) {
-    console.warn('[DB Heartbeat] Connection check warning:', err.message);
+    // Quietly ignore transient heartbeat check warnings
   }
-}, 180000).unref();
+}, 25000).unref();
 
 // ── Initial Configuration ─────────────────────────────────────────────────────
 
@@ -380,6 +386,7 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   )`);
   try { await pool.execute(`ALTER TABLE issue_logs ADD COLUMN receiverName VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE issue_logs ADD COLUMN receiverDept VARCHAR(100) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE issue_logs ADD COLUMN remarks TEXT`); } catch (_) { }
 
   // Design History Logs
   await pool.execute(`CREATE TABLE IF NOT EXISTS design_history (
@@ -2331,19 +2338,30 @@ export const getAllIssueLogs = async () => {
     ...r,
     materials: r.materials ? JSON.parse(r.materials) : [],
     isReissue: !!r.isReissue,
-    isReturn: !!r.isReturn
+    isReturn: !!r.isReturn,
+    remarks: r.remarks || ''
   }));
 };
 
 export const createIssueLog = async (log) => {
   const materialsJson = log.materials ? JSON.stringify(log.materials) : '[]';
-  await pool.execute(
-    `INSERT INTO issue_logs (id,lotId,isReissue,isReturn,category,volume,personName,receiverName,receiverDept,date,materials)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE lotId=VALUES(lotId), date=VALUES(date), personName=VALUES(personName), receiverName=VALUES(receiverName), receiverDept=VALUES(receiverDept), materials=VALUES(materials)`,
-    [log.id, log.lotId || '', log.isReissue ? 1 : 0, log.isReturn ? 1 : 0,
-    log.category || '', log.volume || 0, log.personName || '', log.receiverName || '', log.receiverDept || '', log.date || '', materialsJson]
-  );
+  try {
+    await pool.execute(
+      `INSERT INTO issue_logs (id,lotId,isReissue,isReturn,category,volume,personName,receiverName,receiverDept,date,materials,remarks)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE lotId=VALUES(lotId), date=VALUES(date), personName=VALUES(personName), receiverName=VALUES(receiverName), receiverDept=VALUES(receiverDept), materials=VALUES(materials), remarks=VALUES(remarks)`,
+      [log.id, log.lotId || '', log.isReissue ? 1 : 0, log.isReturn ? 1 : 0,
+      log.category || '', log.volume || 0, log.personName || '', log.receiverName || '', log.receiverDept || '', log.date || '', materialsJson, log.remarks || '']
+    );
+  } catch (err) {
+    await pool.execute(
+      `INSERT INTO issue_logs (id,lotId,isReissue,isReturn,category,volume,personName,receiverName,receiverDept,date,materials)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE lotId=VALUES(lotId), date=VALUES(date), personName=VALUES(personName), receiverName=VALUES(receiverName), receiverDept=VALUES(receiverDept), materials=VALUES(materials)`,
+      [log.id, log.lotId || '', log.isReissue ? 1 : 0, log.isReturn ? 1 : 0,
+      log.category || '', log.volume || 0, log.personName || '', log.receiverName || '', log.receiverDept || '', log.date || '', materialsJson]
+    );
+  }
 };
 
 export const getCuttingMatrixByLot = async (lotNo) => {
@@ -2354,11 +2372,18 @@ export const getCuttingMatrixByLot = async (lotNo) => {
   const [matrixRows] = await pool.execute('SELECT * FROM cuttings_matrix WHERE header_id = ?', [header.id]);
 
   let parsedRows = matrixRows.map(row => {
-    const sizes = {};
-    if (row.M !== null) sizes['M'] = row.M;
-    if (row.L !== null) sizes['L'] = row.L;
-    if (row.XL !== null) sizes['XL'] = row.XL;
-    if (row.XXL !== null) sizes['XXL'] = row.XXL;
+    let sizes = {};
+    if (row.size_payload) {
+      try {
+        sizes = typeof row.size_payload === 'string' ? JSON.parse(row.size_payload) : row.size_payload;
+      } catch (_) {}
+    }
+    if (!sizes || Object.keys(sizes).length === 0) {
+      if (row.M !== null && row.M !== undefined) sizes['M'] = row.M;
+      if (row.L !== null && row.L !== undefined) sizes['L'] = row.L;
+      if (row.XL !== null && row.XL !== undefined) sizes['XL'] = row.XL;
+      if (row.XXL !== null && row.XXL !== undefined) sizes['XXL'] = row.XXL;
+    }
 
     return {
       color: row.Color || '',
@@ -2455,9 +2480,11 @@ export const getCuttingMatrixByLot = async (lotNo) => {
         });
       }
 
-      standardSizes.forEach(sz => {
-        if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
-      });
+      if (activeSizes.every(sz => standardSizes.includes(sz))) {
+        standardSizes.forEach(sz => {
+          if (sizeMap[sz] === undefined) sizeMap[sz] = 0;
+        });
+      }
 
       return {
         color: bItem.color,
