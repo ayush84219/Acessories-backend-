@@ -3466,6 +3466,7 @@ app.get('/api/settings', async (req, res) => {
     const allowMaterialPhotoEdit = await getSetting('allow_material_photo_edit');
     const allowWarehouseAddRack = await getSetting('allow_warehouse_add_rack');
     const materialPricingPolicy = await getSetting('material_pricing_policy');
+    const varianceExcludedMaterials = await getSetting('variance_excluded_materials');
     const payload = {
       accessoriesList: accessoriesList || [],
       designersList: designersList || [],
@@ -3473,7 +3474,10 @@ app.get('/api/settings', async (req, res) => {
       warehouseRacks: warehouseRacks || [],
       allowMaterialPhotoEdit: (allowMaterialPhotoEdit !== null && allowMaterialPhotoEdit !== undefined) ? Boolean(allowMaterialPhotoEdit) : true,
       allowWarehouseAddRack: (allowWarehouseAddRack !== null && allowWarehouseAddRack !== undefined) ? Boolean(allowWarehouseAddRack) : false,
-      materialPricingPolicy: materialPricingPolicy || 'fcfs'
+      materialPricingPolicy: materialPricingPolicy || 'fcfs',
+      varianceExcludedMaterials: Array.isArray(varianceExcludedMaterials) && varianceExcludedMaterials.length > 0 
+        ? varianceExcludedMaterials 
+        : ['oil', 'tape', 'magic pen', 'chalk', 'marker', 'cello tape', 'spray']
     };
     setCached(cacheKey, payload, 60000);
     res.setHeader('X-Cache', 'MISS');
