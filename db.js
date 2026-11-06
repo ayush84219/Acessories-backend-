@@ -349,7 +349,8 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
     total           DOUBLE DEFAULT 0,
     date            VARCHAR(100),
     deliveryDate    VARCHAR(100),
-    status          VARCHAR(100)
+    status          VARCHAR(100),
+    supervisorName  VARCHAR(255) DEFAULT ''
   )`);
   try {
     await pool.execute(`CREATE UNIQUE INDEX idx_po_number ON purchase_orders (poNumber)`);
@@ -731,6 +732,9 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS tape_per_pc_mtr DECIMAL(10,4) DEFAULT 0`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS total_tape_mtr DECIMAL(12,4) DEFAULT 0`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS supervisor_name VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS multiplier VARCHAR(100) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS multiplier_op VARCHAR(50) DEFAULT 'multiply'`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE elastic_issue ADD COLUMN IF NOT EXISTS other_items LONGTEXT`); } catch (_) { }
   try { await pool.execute(`INSERT IGNORE INTO settings (setting_key, setting_value) VALUES ('elastic_issue_counter', '0')`); } catch (_) { }
 
   // High-performance database query indexes
@@ -830,6 +834,8 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN preparedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN approvedBy VARCHAR(100) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN remarks TEXT`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN supervisorName VARCHAR(255) DEFAULT ''`); } catch (_) { }
+  try { await pool.execute(`ALTER TABLE purchase_orders ADD COLUMN supervisor_name VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancellation_reason VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_by VARCHAR(255) DEFAULT ''`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN cancelled_at DATETIME NULL`); } catch (_) { }
@@ -2092,8 +2098,12 @@ export const getAllPOs = async () => {
       computedStatus = 'Completed';
     }
 
+    const sup = r.supervisorName || r.Supervisor || r.supervisor || r.supervisor_name || '';
+
     return {
       ...r,
+      supervisorName: sup,
+      supervisor: sup,
       items,
       totalOrdered,
       totalReceived,
@@ -2167,60 +2177,97 @@ export const createPO = async (po) => {
     }
   }
 
+  const supName = (po.supervisorName || po.supervisor || po.Supervisor || po.supervisor_name || '').trim();
+
   try {
     await pool.execute(
       `REPLACE INTO purchase_orders
         (id,poNumber,vendorName,designName,designCategory,
          items,subtotal,taxRate,tax,total,date,deliveryDate,status,
-         requisitionRaisedBy,preparedBy,approvedBy,remarks)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         requisitionRaisedBy,preparedBy,approvedBy,remarks,supervisorName)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [finalId, cleanPo, po.vendorName || '',
         po.designName || '', po.designCategory || '', itemsJson,
         po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
         po.date || '', po.deliveryDate || '', po.status || 'Draft',
         po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '',
-        po.remarks || '']
+        po.remarks || '', supName]
     );
   } catch (repErr) {
-    await pool.execute(
-      `REPLACE INTO purchase_orders
-        (id,poNumber,vendorName,designName,designCategory,
-         items,subtotal,taxRate,tax,total,date,deliveryDate,status,
-         requisitionRaisedBy,preparedBy,approvedBy)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [finalId, cleanPo, po.vendorName || '',
-        po.designName || '', po.designCategory || '', itemsJson,
-        po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
-        po.date || '', po.deliveryDate || '', po.status || 'Draft',
-        po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '']
-    );
+    try {
+      await pool.execute(
+        `REPLACE INTO purchase_orders
+          (id,poNumber,vendorName,designName,designCategory,
+           items,subtotal,taxRate,tax,total,date,deliveryDate,status,
+           requisitionRaisedBy,preparedBy,approvedBy,remarks)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [finalId, cleanPo, po.vendorName || '',
+          po.designName || '', po.designCategory || '', itemsJson,
+          po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
+          po.date || '', po.deliveryDate || '', po.status || 'Draft',
+          po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '',
+          po.remarks || '']
+      );
+    } catch (_) {
+      await pool.execute(
+        `REPLACE INTO purchase_orders
+          (id,poNumber,vendorName,designName,designCategory,
+           items,subtotal,taxRate,tax,total,date,deliveryDate,status,
+           requisitionRaisedBy,preparedBy,approvedBy)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [finalId, cleanPo, po.vendorName || '',
+          po.designName || '', po.designCategory || '', itemsJson,
+          po.subtotal || 0, po.taxRate || 18, po.tax || 0, po.total || 0,
+          po.date || '', po.deliveryDate || '', po.status || 'Draft',
+          po.requisitionRaisedBy || '', po.preparedBy || '', po.approvedBy || '']
+      );
+    }
   }
 
-  return { ...po, id: finalId, poNumber: cleanPo };
+  return { ...po, id: finalId, poNumber: cleanPo, supervisorName: supName, supervisor: supName };
 };
 
 export const updatePOStatus = async (id, status) => {
   await pool.execute('UPDATE purchase_orders SET status=? WHERE id=?', [status, id]);
 };
 
-export const updatePOSignatures = async (idOrPo, { requisitionRaisedBy, preparedBy, approvedBy }) => {
+export const updatePOSignatures = async (idOrPo, { requisitionRaisedBy, preparedBy, approvedBy, supervisorName }) => {
   const cleanStr = String(idOrPo || '').trim();
   const lowerStr = cleanStr.toLowerCase();
   const digitsOnly = cleanStr.replace(/\D/g, '');
-  await pool.execute(
-    `UPDATE purchase_orders 
-     SET requisitionRaisedBy=?, preparedBy=?, approvedBy=? 
-     WHERE id=? OR LOWER(poNumber)=? OR poNumber LIKE ? OR poNumber LIKE ?`,
-    [
-      requisitionRaisedBy || '',
-      preparedBy || '',
-      approvedBy || '',
-      cleanStr,
-      lowerStr,
-      `%${lowerStr}%`,
-      digitsOnly ? `%${digitsOnly}%` : lowerStr
-    ]
-  );
+  const sup = (supervisorName || '').trim();
+  try {
+    await pool.execute(
+      `UPDATE purchase_orders 
+       SET requisitionRaisedBy=?, preparedBy=?, approvedBy=?, supervisorName=? 
+       WHERE id=? OR LOWER(poNumber)=? OR poNumber LIKE ? OR poNumber LIKE ?`,
+      [
+        requisitionRaisedBy || '',
+        preparedBy || '',
+        approvedBy || '',
+        sup,
+        cleanStr,
+        lowerStr,
+        `%${lowerStr}%`,
+        digitsOnly ? `%${digitsOnly}%` : lowerStr
+      ]
+    );
+  } catch (_) {
+    await pool.execute(
+      `UPDATE purchase_orders 
+       SET requisitionRaisedBy=?, preparedBy=?, approvedBy=? 
+       WHERE id=? OR LOWER(poNumber)=? OR poNumber LIKE ? OR poNumber LIKE ?`,
+      [
+        requisitionRaisedBy || '',
+        preparedBy || '',
+        approvedBy || '',
+        cleanStr,
+        lowerStr,
+        `%${lowerStr}%`,
+        digitsOnly ? `%${digitsOnly}%` : lowerStr
+      ]
+    );
+  }
   return { success: true };
 };
 
@@ -2259,12 +2306,16 @@ export const getPOByNumberOrId = async (poIdentifier) => {
       computedStatus = 'Completed';
     }
 
+    const sup = po.supervisorName || po.Supervisor || po.supervisor || po.supervisor_name || '';
+
     return {
       ...po,
       items,
       totalOrdered,
       totalReceived,
-      status: computedStatus
+      status: computedStatus,
+      supervisorName: sup,
+      supervisor: sup
     };
   }
   return null;
@@ -3773,7 +3824,7 @@ export const deleteBoneIssue = async (idOrSlipNo) => {
     await pool.execute('DELETE FROM bone_issue WHERE slip_no = ?', [String(idOrSlipNo)]);
   }
   return true;
-};
+}; 
 
 // ── Elastic Issue DB Operations ─────────────────────────────────────────────
 export const createElasticIssue = async (data) => {
@@ -3795,6 +3846,13 @@ export const createElasticIssue = async (data) => {
   const unitType = String(data.unitType || data.unit_type || data.unit || 'inch').toLowerCase().includes('cm') ? 'cm' : 'inch';
   const elasticSizeInput = parseFloat(data.elasticSizeInput ?? data.elastic_size_input ?? data.sizeInput ?? 0) || 0;
   const tapeSizeInput = parseFloat(data.tapeSizeInput ?? data.tape_size_input ?? data.tapeSize ?? 0) || 0;
+
+  // Multiplier / Divide support for Other Accessories & Trims
+  const multiplier = data.multiplier !== undefined && data.multiplier !== null ? String(data.multiplier).trim() : '';
+  const multiplierOp = data.multiplierOp || data.multiplier_op || 'multiply';
+  const otherItems = Array.isArray(data.otherItems)
+    ? JSON.stringify(data.otherItems)
+    : (typeof data.other_items === 'string' ? data.other_items : (Array.isArray(data.other_items) ? JSON.stringify(data.other_items) : (typeof data.otherItems === 'string' ? data.otherItems : '[]')));
 
   // Backend Formula:
   // Inches: E1 * 0.0254
@@ -3821,7 +3879,9 @@ export const createElasticIssue = async (data) => {
     totalElasticMtr,
     tapePerPcMtr,
     totalTapeMtr,
-    supervisorName
+    supervisorName,
+    multiplier,
+    multiplierOp
   });
 
   if (!slipNo || !lotNo) {
@@ -3833,8 +3893,8 @@ export const createElasticIssue = async (data) => {
       slip_no, lot_no, rolls, issuer_name, receiver_name, supervisor_name, issue_date,
       style, brand, garment_type, fabric, quantity, shade, size, elastic_width,
       unit_type, elastic_size_input, elastic_per_pc_mtr, total_elastic_mtr, tape_per_pc_mtr, total_tape_mtr,
-      remarks, payload
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      remarks, multiplier, multiplier_op, other_items, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
       lot_no = VALUES(lot_no),
       rolls = VALUES(rolls),
@@ -3857,12 +3917,15 @@ export const createElasticIssue = async (data) => {
       tape_per_pc_mtr = VALUES(tape_per_pc_mtr),
       total_tape_mtr = VALUES(total_tape_mtr),
       remarks = VALUES(remarks),
+      multiplier = VALUES(multiplier),
+      multiplier_op = VALUES(multiplier_op),
+      other_items = VALUES(other_items),
       payload = VALUES(payload)`,
     [
       slipNo, lotNo, rolls, issuerName, receiverName, supervisorName, issueDate,
       style, brand, garmentType, fabric, quantity, shade, size, elasticWidth,
       unitType, elasticSizeInput, elasticPerPcMtr, totalElasticMtr, tapePerPcMtr, totalTapeMtr,
-      remarks, payload
+      remarks, multiplier, multiplierOp, otherItems, payload
     ]
   );
 
@@ -3889,7 +3952,11 @@ export const createElasticIssue = async (data) => {
     totalElasticMtr,
     tapePerPcMtr,
     totalTapeMtr,
-    remarks
+    remarks,
+    multiplier,
+    multiplierOp,
+    multiplier_op: multiplierOp,
+    otherItems: data.otherItems || []
   };
 };
 
@@ -3905,49 +3972,74 @@ export const getAllElasticIssues = async (lotNo = null) => {
   query += ' ORDER BY id DESC';
   const [rows] = await pool.execute(query, params);
 
-  return rows.map(r => ({
-    id: r.id,
-    slipNo: r.slip_no,
-    slip_no: r.slip_no,
-    lotNo: r.lot_no,
-    lot_no: r.lot_no,
-    rolls: r.rolls,
-    issuerName: r.issuer_name,
-    issuer_name: r.issuer_name,
-    receiverName: r.receiver_name,
-    receiver_name: r.receiver_name,
-    supervisorName: r.supervisor_name || '',
-    supervisor_name: r.supervisor_name || '',
-    issueDate: r.issue_date,
-    issue_date: r.issue_date,
-    date: r.issue_date,
-    style: r.style,
-    brand: r.brand,
-    garmentType: r.garment_type,
-    garment_type: r.garment_type,
-    fabric: r.fabric,
-    quantity: r.quantity,
-    shade: r.shade,
-    size: r.size,
-    width: r.elastic_width,
-    elasticWidth: r.elastic_width,
-    unitType: r.unit_type || 'inch',
-    unit_type: r.unit_type || 'inch',
-    elasticSizeInput: parseFloat(r.elastic_size_input || 0),
-    elastic_size_input: parseFloat(r.elastic_size_input || 0),
-    elasticPerPcMtr: parseFloat(r.elastic_per_pc_mtr || 0),
-    elastic_per_pc_mtr: parseFloat(r.elastic_per_pc_mtr || 0),
-    totalElasticMtr: parseFloat(r.total_elastic_mtr || 0),
-    total_elastic_mtr: parseFloat(r.total_elastic_mtr || 0),
-    tapePerPcMtr: parseFloat(r.tape_per_pc_mtr || 0),
-    tape_per_pc_mtr: parseFloat(r.tape_per_pc_mtr || 0),
-    totalTapeMtr: parseFloat(r.total_tape_mtr || 0),
-    total_tape_mtr: parseFloat(r.total_tape_mtr || 0),
-    remarks: r.remarks,
-    payload: r.payload,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at
-  }));
+  return rows.map(r => {
+    let payloadObj = {};
+    try {
+      if (r.payload) payloadObj = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload;
+    } catch (_) {}
+
+    let parsedOtherItems = [];
+    try {
+      if (r.other_items) {
+        parsedOtherItems = typeof r.other_items === 'string' ? JSON.parse(r.other_items) : r.other_items;
+      } else if (payloadObj.otherItems) {
+        parsedOtherItems = payloadObj.otherItems;
+      }
+    } catch (_) {}
+
+    const effMultiplier = r.multiplier || payloadObj.multiplier || (parsedOtherItems[0]?.multiplier) || '';
+    const effMultiplierOp = r.multiplier_op || payloadObj.multiplierOp || (parsedOtherItems[0]?.multiplierOp) || 'multiply';
+
+    return {
+      ...payloadObj,
+      id: r.id,
+      slipNo: r.slip_no,
+      slip_no: r.slip_no,
+      lotNo: r.lot_no,
+      lot_no: r.lot_no,
+      rolls: r.rolls,
+      issuerName: r.issuer_name,
+      issuer_name: r.issuer_name,
+      receiverName: r.receiver_name,
+      receiver_name: r.receiver_name,
+      supervisorName: r.supervisor_name || payloadObj.supervisorName || '',
+      supervisor_name: r.supervisor_name || payloadObj.supervisorName || '',
+      issueDate: r.issue_date,
+      issue_date: r.issue_date,
+      date: r.issue_date,
+      style: r.style,
+      brand: r.brand,
+      garmentType: r.garment_type,
+      garment_type: r.garment_type,
+      fabric: r.fabric,
+      quantity: r.quantity,
+      shade: r.shade,
+      size: r.size,
+      width: r.elastic_width,
+      elasticWidth: r.elastic_width,
+      unitType: r.unit_type || 'inch',
+      unit_type: r.unit_type || 'inch',
+      elasticSizeInput: parseFloat(r.elastic_size_input || 0),
+      elastic_size_input: parseFloat(r.elastic_size_input || 0),
+      elasticPerPcMtr: parseFloat(r.elastic_per_pc_mtr || 0),
+      elastic_per_pc_mtr: parseFloat(r.elastic_per_pc_mtr || 0),
+      totalElasticMtr: parseFloat(r.total_elastic_mtr || 0),
+      total_elastic_mtr: parseFloat(r.total_elastic_mtr || 0),
+      tapePerPcMtr: parseFloat(r.tape_per_pc_mtr || 0),
+      tape_per_pc_mtr: parseFloat(r.tape_per_pc_mtr || 0),
+      totalTapeMtr: parseFloat(r.total_tape_mtr || 0),
+      total_tape_mtr: parseFloat(r.total_tape_mtr || 0),
+      remarks: r.remarks,
+      multiplier: effMultiplier,
+      multiplierOp: effMultiplierOp,
+      multiplier_op: effMultiplierOp,
+      otherItems: parsedOtherItems,
+      other_items: parsedOtherItems,
+      payload: r.payload,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at
+    };
+  });
 };
 
 export const deleteElasticIssue = async (idOrSlipNo) => {

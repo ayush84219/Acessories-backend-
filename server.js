@@ -3342,15 +3342,38 @@ app.put('/api/pos/:id/status', async (req, res) => {
   }
 });
 
-// PUT update PO signatures (Requisition Raised By, Prepared By, Approved By)
+// PUT update PO signatures (Requisition Raised By, Prepared By, Approved By, Supervisor)
 app.put('/api/pos/:id/signatures', async (req, res) => {
   try {
-    const { requisitionRaisedBy, preparedBy, approvedBy } = req.body;
-    await updatePOSignatures(req.params.id, { requisitionRaisedBy, preparedBy, approvedBy });
+    const { requisitionRaisedBy, preparedBy, approvedBy, supervisorName } = req.body;
+    await updatePOSignatures(req.params.id, { requisitionRaisedBy, preparedBy, approvedBy, supervisorName });
     res.status(200).json({ success: true, message: 'PO signatures updated.' });
   } catch (err) {
     console.error('API PUT /api/pos/:id/signatures error:', err.message);
     res.status(500).json({ error: 'Failed to update PO signatures.' });
+  }
+});
+
+// GET distinct supervisor names for PO auto-complete
+app.get('/api/supervisors', async (req, res) => {
+  try {
+    const defaultSupervisors = ['ROHIT / MONU', 'MOHIT SIR', 'MANISH', 'FLOOR SUPERVISOR', 'STORE INCHARGE', 'RAMESH', 'SURESH', 'SANDEEP'];
+    const supervisorSet = new Set(defaultSupervisors);
+    try {
+      const [cutRows] = await pool.execute('SELECT DISTINCT Supervisor FROM cutting_header WHERE Supervisor IS NOT NULL AND TRIM(Supervisor) != "" LIMIT 100');
+      cutRows.forEach(r => {
+        if (r.Supervisor && r.Supervisor.trim()) supervisorSet.add(r.Supervisor.trim());
+      });
+    } catch (_) {}
+    try {
+      const [poRows] = await pool.execute('SELECT DISTINCT supervisorName FROM purchase_orders WHERE supervisorName IS NOT NULL AND TRIM(supervisorName) != "" LIMIT 100');
+      poRows.forEach(r => {
+        if (r.supervisorName && r.supervisorName.trim()) supervisorSet.add(r.supervisorName.trim());
+      });
+    } catch (_) {}
+    res.status(200).json({ success: true, supervisors: Array.from(supervisorSet) });
+  } catch (err) {
+    res.status(200).json({ success: true, supervisors: ['ROHIT / MONU', 'MOHIT SIR', 'MANISH', 'FLOOR SUPERVISOR', 'STORE INCHARGE'] });
   }
 });
 
