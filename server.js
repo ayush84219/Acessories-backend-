@@ -2925,6 +2925,40 @@ app.put('/api/designs/:id/status', async (req, res) => {
   }
 });
 
+// PUT update full design (edit existing BOM)
+app.put('/api/designs/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const design = { ...req.body };
+    const actorName = design.actorName || 'Designer';
+    delete design.actorName;
+    delete design.isEdit;
+
+    // Prevent overwriting an already-approved BOM's status back to pending/draft unless explicitly allowed
+    const existing = await getDesignById(id);
+    if (existing && String(existing.status).trim().toLowerCase() === 'approved') {
+      return res.status(400).json({
+        error: `BOM is already approved for Lot #${id}. It cannot be modified.`,
+        alreadyCreated: true,
+        status: existing.status
+      });
+    }
+
+    const serialized = {
+      ...design,
+      id,
+      bom: typeof design.bom === 'object' ? JSON.stringify(design.bom) : (design.bom || '[]')
+    };
+    await createDesign(serialized);
+    await createHistoryEntry(id, 'updated', actorName, `Lot updated with category ${design.category || 'N/A'}, style ${design.style || 'N/A'}`);
+
+    res.status(200).json({ message: 'Design updated successfully.', design: serialized });
+  } catch (err) {
+    console.error('API PUT /api/designs/:id error:', err.message);
+    res.status(500).json({ error: 'Failed to update design.' });
+  }
+});
+
 // GET all design history logs
 app.get('/api/design-history', async (req, res) => {
   try {
