@@ -123,6 +123,12 @@ import {
   getOldPurchaseOrders,
   getOldPurchaseOrderByNumber
 } from './sync_old_pos.js';
+import {
+  ensureOldRgpTable,
+  syncOldRgpFromGoogleSheet,
+  getOldRgps,
+  getOldRgpByNumber
+} from './sync_old_rgp.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1851,6 +1857,67 @@ app.get('/api/lot/:lotNo', async (req, res) => {
       const primaryLot = getCol(matchedRow, 'Lot Number', 'Lot No', 'Job Order No', 'lot') || lotNo;
       const jobOrderNo = getCol(matchedRow, 'Job Order No', 'Order No.');
 
+      // Check Cutting Sheet / cutting_header so Design order quantity reflects the actual Cutting Sheet quantity
+      let cuttingQuantity = 0;
+      let cuttingHeaderData = null;
+      try {
+        const cutResult = await getCuttingMatrixByLot(primaryLot || lotNo);
+        if (cutResult && cutResult.header) {
+          cuttingHeaderData = cutResult.header;
+          cuttingQuantity = Number(cutResult.cuttingQty || cutResult.header.Cutting_Qty) || 0;
+        }
+      } catch (cErr) {
+        console.warn(`[Lot Fetch] getCuttingMatrixByLot warning for ${primaryLot}:`, cErr.message);
+      }
+
+      if (!cuttingQuantity) {
+        try {
+          const [cutRows] = await pool.execute(
+            'SELECT Cutting_Qty, Sizes, Shades, Party_Name, Brand, Fabric, Style, Garment_Type FROM cutting_header WHERE LOWER(TRIM(Lot_Number)) = LOWER(TRIM(?)) OR LOWER(TRIM(Lot_Number)) = LOWER(TRIM(?)) LIMIT 1',
+            [primaryLot, lotNo]
+          );
+          if (cutRows.length > 0 && Number(cutRows[0].Cutting_Qty) > 0) {
+            cuttingHeaderData = cutRows[0];
+            cuttingQuantity = Number(cutRows[0].Cutting_Qty) || 0;
+          }
+        } catch (_) {}
+      }
+
+      if (!cuttingQuantity) {
+        try {
+          const [matSum] = await pool.execute(
+            'SELECT SUM(Total_Pcs) AS total FROM cuttings_matrix WHERE LOWER(TRIM(Lot_No)) = LOWER(TRIM(?)) OR LOWER(TRIM(Lot_No)) = LOWER(TRIM(?))',
+            [primaryLot, lotNo]
+          );
+          if (matSum.length > 0 && Number(matSum[0].total) > 0) {
+            cuttingQuantity = Number(matSum[0].total);
+          }
+        } catch (_) {}
+      }
+
+      if (!cuttingQuantity) {
+        try {
+          const cuttingCsvText = await getCuttingLotsCSV(false);
+          if (cuttingCsvText) {
+            const cuttingRows = parseCSV(cuttingCsvText);
+            const targetLotKey = (primaryLot || lotNo).toLowerCase().trim();
+            const cutMatch = cuttingRows.find(r => {
+              const rLot = (r['Lot Number'] || r['Lot No'] || r['lot'] || '').toLowerCase().trim();
+              return rLot && rLot === targetLotKey;
+            });
+            if (cutMatch) {
+              const parsedCutQty = parseInt(cutMatch['Cutting Qty'] || cutMatch['Cutting_Qty'] || cutMatch['Quantity'] || 0, 10);
+              if (parsedCutQty > 0) {
+                cuttingQuantity = parsedCutQty;
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      const defaultSheetQty = parseInt(getCol(matchedRow, 'Challan Total Qty', 'Quantity', 'Cutting_Qty')) || 100;
+      const finalDesignQty = cuttingQuantity > 0 ? cuttingQuantity : defaultSheetQty;
+
       return res.status(200).json({
         lotNo: primaryLot,
         lotNo2: jobOrderNo || primaryLot,
@@ -1879,7 +1946,8 @@ app.get('/api/lot/:lotNo', async (req, res) => {
         fusing: getCol(matchedRow, 'Interlining', 'Fusing', 'Interlining / fusing'),
         shade: getCol(matchedRow, 'Shade', 'Shades'),
         size: getCol(matchedRow, 'Size', 'Sizes'),
-        quantity: parseInt(getCol(matchedRow, 'Challan Total Qty', 'Quantity', 'Cutting_Qty')) || 100,
+        quantity: finalDesignQty,
+        cuttingQuantity: cuttingQuantity || null,
         unit: getCol(matchedRow, 'Unit') || 'Pcs',
         partyName: getCol(matchedRow, 'Party Name', 'Party_Name'),
         emb: getCol(matchedRow, 'Emb'),
@@ -3352,6 +3420,43 @@ app.post('/api/old-pos/sync', async (req, res) => {
   }
 });
 
+// ── Old RGP (Google Sheet -> MySQL -> Frontend Fast Fetch) ──────────────────
+app.get('/api/old-rgp', async (req, res) => {
+  try {
+    const { search, status, vendor, limit, offset } = req.query;
+    const data = await getOldRgps({ search, status, vendor, limit, offset });
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('API GET /api/old-rgp error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve old RGP records.' });
+  }
+});
+
+app.get('/api/old-rgp/:rgpNo', async (req, res) => {
+  try {
+    const { rgpNo } = req.params;
+    const rgp = await getOldRgpByNumber(rgpNo);
+    if (!rgp) {
+      return res.status(404).json({ error: 'Old RGP record not found.' });
+    }
+    res.status(200).json(rgp);
+  } catch (err) {
+    console.error('API GET /api/old-rgp/:rgpNo error:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve old RGP details.' });
+  }
+});
+
+app.post('/api/old-rgp/sync', async (req, res) => {
+  try {
+    const { apiKey, spreadsheetId } = req.body || {};
+    const result = await syncOldRgpFromGoogleSheet({ apiKey, spreadsheetId });
+    res.status(200).json(result);
+  } catch (err) {
+    console.error('API POST /api/old-rgp/sync error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to sync old RGP records from Google Sheet.' });
+  }
+});
+
 // POST create new purchase order
 app.post('/api/pos', async (req, res) => {
   try {
@@ -4809,6 +4914,17 @@ const server = app.listen(PORT, HOST, () => {
   // Dedicated Incremental Sync Background Worker every 30 minutes (1800 seconds)
   setInterval(() => {
     syncGoogleSheetsToDb(false).catch(err => console.warn('[Incremental Sync Worker] Sync warning:', err.message));
+  }, 30 * 60 * 1000);
+
+  // Background Auto-Sync Old RGP from Google Sheets to MySQL every 30 minutes with 20s warmup delay
+  setTimeout(() => {
+    console.log('[Old RGP Sync Worker] Initiating startup Old RGP synchronization to MySQL database...');
+    syncOldRgpFromGoogleSheet().catch(err => console.warn('[Old RGP Sync Worker] Startup sync warning:', err.message));
+  }, 20000);
+
+  setInterval(() => {
+    console.log('[Old RGP Sync Worker] Periodic 30-minute sync: checking Google Sheets for new Old RGP entries...');
+    syncOldRgpFromGoogleSheet().catch(err => console.warn('[Old RGP Sync Worker] Periodic sync warning:', err.message));
   }, 30 * 60 * 1000);
 });
 

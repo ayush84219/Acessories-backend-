@@ -560,6 +560,38 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN entries LONGTEXT`); } catch (_) { }
   try { await pool.execute(`ALTER TABLE rgp ADD COLUMN status VARCHAR(50) DEFAULT 'Dispatched'`); } catch (_) { }
 
+  // Old RGP (Historical Returnable Gate Pass Archive synced from Google Sheets)
+  await pool.execute(`CREATE TABLE IF NOT EXISTS old_rgp (
+    rgp_no VARCHAR(100) PRIMARY KEY,
+    date VARCHAR(100) DEFAULT '',
+    rgp_type VARCHAR(100) DEFAULT '',
+    department VARCHAR(100) DEFAULT '',
+    vendor VARCHAR(255) DEFAULT '',
+    purpose VARCHAR(255) DEFAULT '',
+    item_description TEXT DEFAULT NULL,
+    quantity_sent VARCHAR(100) DEFAULT '',
+    uom VARCHAR(50) DEFAULT '',
+    expected_return_date VARCHAR(100) DEFAULT '',
+    vehicle_no VARCHAR(100) DEFAULT '',
+    authorized_by VARCHAR(255) DEFAULT '',
+    returned_quantity VARCHAR(100) DEFAULT '',
+    return_date VARCHAR(100) DEFAULT '',
+    remarks TEXT DEFAULT NULL,
+    status VARCHAR(100) DEFAULT '',
+    prepared_by VARCHAR(255) DEFAULT '',
+    gate_in_at VARCHAR(100) DEFAULT '',
+    gate_in_by VARCHAR(100) DEFAULT '',
+    gate_out_at VARCHAR(100) DEFAULT '',
+    gate_out_by VARCHAR(100) DEFAULT '',
+    raw_main_json LONGTEXT,
+    items_json LONGTEXT,
+    synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_old_rgp_vendor (vendor(191)),
+    INDEX idx_old_rgp_type (rgp_type),
+    INDEX idx_old_rgp_status (status),
+    INDEX idx_old_rgp_date (date)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // Weight Capture Table
   await pool.execute(`CREATE TABLE IF NOT EXISTS weight_capture (
     id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -3442,6 +3474,31 @@ export const checkInwardEligibility = async ({ poNumber = '', materialName = '',
   };
 };
 
+function parseIssueTimestamp(dateStr) {
+  if (!dateStr) return 0;
+  const str = String(dateStr).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    const t = Date.parse(str);
+    if (!isNaN(t)) return t;
+  }
+  const match = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (match) {
+    let [, p1, p2, year, hr = '0', min = '0', sec = '0'] = match;
+    let d = parseInt(p1, 10);
+    let m = parseInt(p2, 10);
+    let day = d;
+    let month = m;
+    if (m > 12 && d <= 12) {
+      day = m;
+      month = d;
+    }
+    const dt = new Date(parseInt(year, 10), month - 1, day, parseInt(hr, 10), parseInt(min, 10), parseInt(sec, 10));
+    return dt.getTime();
+  }
+  const fallback = Date.parse(str);
+  return isNaN(fallback) ? 0 : fallback;
+}
+
 export const getMaterialTraceability = async (query = '') => {
   const q = String(query || '').trim().toLowerCase();
 
@@ -3451,17 +3508,24 @@ export const getMaterialTraceability = async (query = '') => {
   // 2. Fetch weight_captures
   const [allCaptures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id DESC');
 
-  // 3. Fetch issue_logs / material_issues
+  // 3. Fetch issue_logs, extra_material_issues, and bone_issue
   let issueLogs = [];
   try {
-    const [iRows] = await pool.execute('SELECT * FROM material_issues ORDER BY id DESC');
+    const [iRows] = await pool.execute('SELECT * FROM issue_logs ORDER BY id DESC');
     issueLogs = iRows;
-  } catch (_) {
-    try {
-      const [iRows] = await pool.execute('SELECT * FROM issue_logs ORDER BY id DESC');
-      issueLogs = iRows;
-    } catch (_) { }
-  }
+  } catch (_) { }
+
+  let extraIssues = [];
+  try {
+    const [eRows] = await pool.execute('SELECT * FROM extra_material_issues ORDER BY id DESC');
+    extraIssues = eRows;
+  } catch (_) { }
+
+  let boneIssues = [];
+  try {
+    const [bRows] = await pool.execute('SELECT * FROM bone_issue ORDER BY id DESC');
+    boneIssues = bRows;
+  } catch (_) { }
 
   // 4. Fetch material_transfers
   let transfers = [];
@@ -3494,26 +3558,45 @@ export const getMaterialTraceability = async (query = '') => {
     const mCat = String(m.category || '').toLowerCase();
     const mCol = String(m.color || '').toLowerCase();
     const mLoc = String(m.location || '').toLowerCase();
-    return mId.includes(q) || mName.includes(q) || mCat.includes(q) || mCol.includes(q) || mLoc.includes(q);
+    const mCode = String(m.itemCode || m.item_code || m.code || '').toLowerCase();
+    return mId.includes(q) || mName.includes(q) || mCat.includes(q) || mCol.includes(q) || mLoc.includes(q) || mCode.includes(q);
   });
 
   // Build complete trace for each matched material
   const traceabilityRecords = matchedMaterials.map(m => {
-    const matId = String(m.id || '').trim();
+    const matId = String(m.id || '').trim().toLowerCase();
     const matName = String(m.name || '').trim().toLowerCase();
+    const matCode = String(m.itemCode || m.item_code || m.code || '').trim().toLowerCase();
+
+    const isMatch = (candId, candName, candCode) => {
+      const cId = String(candId || '').trim().toLowerCase();
+      const cName = String(candName || '').trim().toLowerCase();
+      const cCode = String(candCode || '').trim().toLowerCase();
+
+      if (matId && (cId === matId || cCode === matId)) return true;
+      if (matCode && (cId === matCode || cCode === matCode)) return true;
+      if (matName && cName) {
+        if (matName === cName) return true;
+        if (matName.length >= 3 && cName.includes(matName)) return true;
+        if (cName.length >= 3 && matName.includes(cName)) return true;
+      }
+      return false;
+    };
 
     // Related captures (Inward entries)
     const relatedCaptures = allCaptures.filter(c => {
       const cCode = String(c.materialCode || '').trim().toLowerCase();
       const cName = String(c.materialName || '').trim().toLowerCase();
       const cBarcode = String(c.barcodeId || '').trim().toLowerCase();
-      return (cCode && (cCode === matId.toLowerCase() || cCode.includes(matId.toLowerCase()))) ||
+      return (cCode && (cCode === matId || cCode.includes(matId))) ||
         (cName && (cName === matName || cName.includes(matName) || matName.includes(cName))) ||
-        (cBarcode && cBarcode.includes(matId.toLowerCase()));
+        (cBarcode && cBarcode.includes(matId));
     });
 
     // Related issue logs (Consumption / Issue against Cutting Lots)
     const relatedIssues = [];
+
+    // 1. From issue_logs (BOM and Without BOM floor issues)
     issueLogs.forEach(log => {
       let matItems = [];
       try {
@@ -3522,32 +3605,119 @@ export const getMaterialTraceability = async (query = '') => {
         matItems = [];
       }
 
-      const matchingItem = matItems.find(it => {
-        const iId = String(it.materialId || '').trim().toLowerCase();
-        const iName = String(it.name || it.materialName || '').trim().toLowerCase();
-        return (iId && iId === matId.toLowerCase()) ||
-          (iName && (iName === matName || iName.includes(matName) || matName.includes(iName)));
-      });
+      const matchingItems = matItems.filter(it =>
+        isMatch(it.materialId, it.name || it.materialName, it.itemCode || it.code || it.materialCode)
+      );
 
-      if (matchingItem) {
+      matchingItems.forEach(it => {
         const lotInfo = cuttingLots[String(log.lotId).trim()] || {};
+        const dateStr = log.date || 'N/A';
+        const timestamp = parseIssueTimestamp(dateStr);
         relatedIssues.push({
           issueId: log.id,
-          lotId: log.lotId,
+          lotId: log.lotId || 'Floor Issue',
           isReissue: Boolean(log.isReissue),
           isReturn: Boolean(log.isReturn),
-          qtyIssued: Number(matchingItem.qty || matchingItem.totalRequired || 0) || 0,
-          unit: matchingItem.unit || m.unit || 'pcs',
-          bomItemName: matchingItem.bomItemName || 'Accessory',
-          personName: log.personName || 'Store Incharge',
-          date: log.date || 'N/A',
+          qtyIssued: Number(it.qty || it.totalRequired || 0) || 0,
+          unit: it.unit || m.unit || 'pcs',
+          bomItemName: it.bomItemName || log.category || 'Accessory',
+          personName: log.personName || 'Store Staff',
+          receiverName: log.receiverName || '',
+          receiverDept: log.receiverDept || '',
+          date: dateStr,
+          timestamp,
           fabric: lotInfo.Fabric || 'Standard',
           garmentType: lotInfo.Garment_Type || log.category || 'Garment',
           style: lotInfo.Style || 'Standard',
-          supervisor: lotInfo.Supervisor || log.personName || 'Production Supervisor'
+          supervisor: lotInfo.Supervisor || log.receiverName || log.personName || 'Production Supervisor',
+          issueType: log.category || (log.id && String(log.id).startsWith('WO-') ? 'Without BOM Issue' : 'Material Issue'),
+          remarks: log.remarks || ''
+        });
+      });
+    });
+
+    // 2. From extra_material_issues (Extra Issue Requisitions)
+    extraIssues.forEach(emi => {
+      let matched = isMatch(emi.material_id, emi.material_name, emi.material_id);
+      let extraQty = Number(emi.extra_qty || 0);
+
+      if (!matched && emi.items_payload) {
+        try {
+          const payloadItems = typeof emi.items_payload === 'string' ? JSON.parse(emi.items_payload) : emi.items_payload;
+          if (Array.isArray(payloadItems)) {
+            const pi = payloadItems.find(p => isMatch(p.materialId, p.materialName, p.itemCode || p.materialCode));
+            if (pi) {
+              matched = true;
+              extraQty = Number(pi.totalRequired || pi.extraQty || extraQty);
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (matched && extraQty > 0) {
+        const lotInfo = cuttingLots[String(emi.lot_id).trim()] || {};
+        const dateStr = emi.issue_date || (emi.created_at ? new Date(emi.created_at).toLocaleString('en-IN') : 'N/A');
+        const timestamp = parseIssueTimestamp(dateStr) || (emi.created_at ? new Date(emi.created_at).getTime() : 0);
+        relatedIssues.push({
+          issueId: emi.voucher_id || `EMI-${emi.id}`,
+          lotId: emi.lot_id || 'Floor Issue',
+          isReissue: true,
+          isReturn: false,
+          qtyIssued: extraQty,
+          unit: emi.unit || m.unit || 'pcs',
+          bomItemName: emi.bom_item_name || 'Extra Material',
+          personName: emi.issuer_name || 'Store Staff',
+          receiverName: emi.receiver_name || '',
+          receiverDept: emi.receiver_dept || '',
+          date: dateStr,
+          timestamp,
+          fabric: lotInfo.Fabric || emi.style || 'Standard',
+          garmentType: lotInfo.Garment_Type || emi.category || 'Garment',
+          style: emi.style || lotInfo.Style || 'Standard',
+          supervisor: lotInfo.Supervisor || emi.receiver_name || 'Production Supervisor',
+          issueType: 'Extra Material Issue',
+          remarks: emi.reason ? `${emi.reason}${emi.remarks ? ` - ${emi.remarks}` : ''}` : (emi.remarks || '')
         });
       }
     });
+
+    // 3. From bone_issue (Bone / Piping issues)
+    boneIssues.forEach(bi => {
+      let biItems = [];
+      try {
+        const payload = typeof bi.payload === 'string' ? JSON.parse(bi.payload) : (bi.payload || {});
+        biItems = payload.deductedItems || [];
+      } catch (_) {}
+
+      const matchingBi = biItems.filter(it => isMatch(it.materialId, it.materialName, it.materialId));
+      matchingBi.forEach(it => {
+        const dateStr = bi.issue_date ? String(bi.issue_date) : (bi.created_at ? new Date(bi.created_at).toLocaleDateString() : 'N/A');
+        const timestamp = parseIssueTimestamp(dateStr) || (bi.created_at ? new Date(bi.created_at).getTime() : 0);
+        relatedIssues.push({
+          issueId: bi.slip_no || `BONE-${bi.id}`,
+          lotId: bi.lot_no || 'Floor Issue',
+          isReissue: false,
+          isReturn: false,
+          qtyIssued: Number(it.totalRequired || bi.quantity || bi.rolls || 1),
+          unit: it.unit || 'Roll',
+          bomItemName: 'Bone / Piping',
+          personName: bi.issuer_name || 'Store Staff',
+          receiverName: bi.receiver_name || '',
+          receiverDept: 'Stitching Floor',
+          date: dateStr,
+          timestamp,
+          fabric: bi.fabric || 'Standard',
+          garmentType: bi.garment_type || 'Lower / Tracksuit',
+          style: bi.style || 'Standard',
+          supervisor: bi.receiver_name || 'Supervisor',
+          issueType: 'Bone Issue',
+          remarks: bi.remarks || ''
+        });
+      });
+    });
+
+    // Sort strictly LATEST FIRST: newest date/timestamp on top
+    relatedIssues.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     // Related transfers
     const relatedTransfers = transfers.filter(t => {
