@@ -40,13 +40,13 @@ const getPoolConfig = () => {
         database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
         ssl: { rejectUnauthorized: false },
         waitForConnections: true,
-        connectionLimit: 10,
-        maxIdle: 10,
-        idleTimeout: 30000,
+        connectionLimit: 6,
+        maxIdle: 2,
+        idleTimeout: 15000,
         queueLimit: 0,
         enableKeepAlive: true,
         keepAliveInitialDelay: 5000,
-        connectTimeout: 30000,
+        connectTimeout: 20000,
       };
     } catch (e) {
       console.warn('[DB] Could not parse connection URL, falling back to individual variables:', e.message);
@@ -63,13 +63,13 @@ const getPoolConfig = () => {
     password: process.env.MYSQL_PASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
     database: (process.env.MYSQL_DATABASE || process.env.DB_NAME || 'accessories2').trim(),
     waitForConnections: true,
-    connectionLimit: 10,
-    maxIdle: 10,
-    idleTimeout: 30000,
+    connectionLimit: 6,
+    maxIdle: 2,
+    idleTimeout: 15000,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 5000,
-    connectTimeout: 30000,
+    connectTimeout: 20000,
   };
 
   if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
@@ -159,6 +159,19 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
       await pool.execute('SELECT 1');
       console.log('[DB] MySQL connected successfully.');
       connected = true;
+
+      // Auto-tune MySQL runtime parameters to minimize Railway RAM footprint
+      try {
+        await pool.execute('SET GLOBAL max_connections = 40').catch(() => {});
+        await pool.execute('SET GLOBAL table_open_cache = 400').catch(() => {});
+        await pool.execute('SET GLOBAL table_definition_cache = 400').catch(() => {});
+        await pool.execute('SET GLOBAL key_buffer_size = 16777216').catch(() => {});
+        await pool.execute('SET GLOBAL sort_buffer_size = 262144').catch(() => {});
+        await pool.execute('SET GLOBAL join_buffer_size = 262144').catch(() => {});
+        await pool.execute('SET GLOBAL read_buffer_size = 131072').catch(() => {});
+        await pool.execute('SET GLOBAL read_rnd_buffer_size = 262144').catch(() => {});
+        console.log('[DB] Applied low-memory runtime configuration (40 max connections, 400 table cache).');
+      } catch (_) {}
       break;
     } catch (err) {
       console.warn(`[DB] MySQL connection attempt ${attempt}/${maxRetries} failed: ${err.message}`);
