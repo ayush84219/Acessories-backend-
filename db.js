@@ -200,16 +200,16 @@ export async function initDb(maxRetries = 10, retryIntervalMs = 2000) {
 
       // Auto-tune MySQL runtime parameters to minimize Railway RAM footprint
       try {
-        await pool.execute('SET GLOBAL max_connections = 40').catch(() => {});
-        await pool.execute('SET GLOBAL table_open_cache = 400').catch(() => {});
-        await pool.execute('SET GLOBAL table_definition_cache = 400').catch(() => {});
-        await pool.execute('SET GLOBAL key_buffer_size = 16777216').catch(() => {});
-        await pool.execute('SET GLOBAL sort_buffer_size = 262144').catch(() => {});
-        await pool.execute('SET GLOBAL join_buffer_size = 262144').catch(() => {});
-        await pool.execute('SET GLOBAL read_buffer_size = 131072').catch(() => {});
-        await pool.execute('SET GLOBAL read_rnd_buffer_size = 262144').catch(() => {});
+        await pool.execute('SET GLOBAL max_connections = 40').catch(() => { });
+        await pool.execute('SET GLOBAL table_open_cache = 400').catch(() => { });
+        await pool.execute('SET GLOBAL table_definition_cache = 400').catch(() => { });
+        await pool.execute('SET GLOBAL key_buffer_size = 16777216').catch(() => { });
+        await pool.execute('SET GLOBAL sort_buffer_size = 262144').catch(() => { });
+        await pool.execute('SET GLOBAL join_buffer_size = 262144').catch(() => { });
+        await pool.execute('SET GLOBAL read_buffer_size = 131072').catch(() => { });
+        await pool.execute('SET GLOBAL read_rnd_buffer_size = 262144').catch(() => { });
         console.log('[DB] Applied low-memory runtime configuration (40 max connections, 400 table cache).');
-      } catch (_) {}
+      } catch (_) { }
       break;
     } catch (err) {
       console.warn(`[DB] MySQL connection attempt ${attempt}/${maxRetries} failed: ${err.message}`);
@@ -2510,7 +2510,7 @@ export const getCuttingMatrixByLot = async (lotNo) => {
     if (row.size_payload) {
       try {
         sizes = typeof row.size_payload === 'string' ? JSON.parse(row.size_payload) : row.size_payload;
-      } catch (_) {}
+      } catch (_) { }
     }
     if (!sizes || Object.keys(sizes).length === 0) {
       if (row.M !== null && row.M !== undefined) sizes['M'] = row.M;
@@ -3770,43 +3770,25 @@ export const getMaterialTraceability = async (query = '', itemCode = '', id = ''
 
     const normMatName = norm(matName);
 
-    const isMatch = (candId, candName, candCode, candBomName = '') => {
+    const isMatch = (candId, candName, candCode) => {
       const cId = String(candId || '').trim().toLowerCase();
       const cName = String(candName || '').trim().toLowerCase();
       const cCode = String(candCode || '').trim().toLowerCase();
-      const cBom = String(candBomName || '').trim().toLowerCase();
 
-      // 1. Direct Item Code Match (New system issues logged with Item Code)
+      // 1. Direct Item Code Match (Exact match)
       if (effectiveItemCode) {
-        if (cCode === effectiveItemCode || cCode.includes(effectiveItemCode)) return true;
-        if (cId === effectiveItemCode || cId.includes(effectiveItemCode)) return true;
+        const eCode = effectiveItemCode.toLowerCase();
+        if (cCode === eCode || cId === eCode) return true;
       }
 
-      // 2. Legacy MT / M Code Match (First time system issues logged with MT or M code)
+      // 2. Legacy MT / M Code Match (Exact match against aliases)
       if (cId && legacyAliases.has(cId)) return true;
       if (cCode && legacyAliases.has(cCode)) return true;
-      for (const alias of legacyAliases) {
-        if (cId && (cId.includes(alias) || alias.includes(cId))) return true;
-        if (cCode && (cCode.includes(alias) || alias.includes(cCode))) return true;
-      }
 
-      // 3. Numeric ID Match (e.g. 1325 in M1325 / MT1325)
-      const cIdNum = cId.replace(/\D/g, '');
-      const cCodeNum = cCode.replace(/\D/g, '');
-      if (cIdNum && legacyNums.has(cIdNum)) return true;
-      if (cCodeNum && legacyNums.has(cCodeNum)) return true;
-
-      // 4. Material Name / BOM Component Name Match
+      // 3. Exact Material Name Match (Normalized case-insensitive equality)
       const normCName = norm(cName);
-      const normCBom = norm(cBom);
-
-      if (normMatName && normMatName.length >= 3) {
-        if (normCName && (normMatName === normCName || normCName.includes(normMatName) || normMatName.includes(normCName))) return true;
-        if (normCBom && (normMatName === normCBom || normCBom.includes(normMatName) || normMatName.includes(normCBom))) return true;
-      }
-
-      if (matName && cName && (matName === cName || cName.includes(matName) || matName.includes(cName))) return true;
-      if (matName && cBom && (matName === cBom || cBom.includes(matName) || matName.includes(cBom))) return true;
+      if (normMatName && normCName && normMatName === normCName) return true;
+      if (matName && cName && matName.trim().toLowerCase() === cName.trim().toLowerCase()) return true;
 
       return false;
     };
@@ -3878,7 +3860,7 @@ export const getMaterialTraceability = async (query = '', itemCode = '', id = ''
               extraQty = Number(pi.totalRequired || pi.extraQty || extraQty);
             }
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       if (matched && extraQty > 0) {
@@ -3914,7 +3896,7 @@ export const getMaterialTraceability = async (query = '', itemCode = '', id = ''
       try {
         const payload = typeof bi.payload === 'string' ? JSON.parse(bi.payload) : (bi.payload || {});
         biItems = payload.deductedItems || [];
-      } catch (_) {}
+      } catch (_) { }
 
       const matchingBi = biItems.filter(it => isMatch(it.materialId || bi.material_code, it.materialName || it.name || bi.material_name, it.materialId || bi.material_code, it.bomItemName || 'Bone / Piping'));
       matchingBi.forEach(it => {
@@ -3961,7 +3943,7 @@ export const getMaterialTraceability = async (query = '', itemCode = '', id = ''
             if (found.name || found.materialName) itemName = found.name || found.materialName;
             if (found.unit) itemUnit = found.unit;
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       if (matched && eliQty > 0) {
@@ -4271,7 +4253,7 @@ export const deleteBoneIssue = async (idOrSlipNo) => {
     await pool.execute('DELETE FROM bone_issue WHERE slip_no = ?', [String(idOrSlipNo)]);
   }
   return true;
-}; 
+};
 
 // ── Elastic Issue DB Operations ─────────────────────────────────────────────
 export const createElasticIssue = async (data) => {
@@ -4423,7 +4405,7 @@ export const getAllElasticIssues = async (lotNo = null) => {
     let payloadObj = {};
     try {
       if (r.payload) payloadObj = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload;
-    } catch (_) {}
+    } catch (_) { }
 
     let parsedOtherItems = [];
     try {
@@ -4432,7 +4414,7 @@ export const getAllElasticIssues = async (lotNo = null) => {
       } else if (payloadObj.otherItems) {
         parsedOtherItems = payloadObj.otherItems;
       }
-    } catch (_) {}
+    } catch (_) { }
 
     const effMultiplier = r.multiplier || payloadObj.multiplier || (parsedOtherItems[0]?.multiplier) || '';
     const effMultiplierOp = r.multiplier_op || payloadObj.multiplierOp || (parsedOtherItems[0]?.multiplierOp) || 'multiply';
