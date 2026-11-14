@@ -26,19 +26,56 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-// ── MySQL Connection Pool (Optimized for <512MB RAM Instances) ──────────────────
+// ── MySQL Connection Pool (Auto-detects Local Dev vs Railway Cloud Private Network) ──
 const getPoolConfig = () => {
-  const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
+  // Check if we are genuinely running inside a Railway cloud container
+  const isInsideRailway = Boolean(
+    process.env.RAILWAY_ENVIRONMENT ||
+    process.env.RAILWAY_SERVICE_ID ||
+    process.env.RAILWAY_PROJECT_ID ||
+    process.env.RAILWAY_STATIC_URL
+  );
+
+  // Inside Railway cloud: prefer MYSQL_PRIVATE_URL ($0 egress, <1ms latency)
+  // Outside Railway (local desktop): use MYSQL_URL public proxy (monorail.proxy.rlwy.net)
+  let connectionUri = isInsideRailway
+    ? (process.env.MYSQL_PRIVATE_URL || process.env.MYSQL_URL || process.env.DATABASE_URL)
+    : (process.env.MYSQL_URL || process.env.DATABASE_URL);
+
   if (connectionUri) {
     try {
       const parsedUrl = new URL(connectionUri);
+
+      // Safety check: if running on local machine, mysql.railway.internal CANNOT be resolved by local DNS
+      if (!isInsideRailway && parsedUrl.hostname.includes('railway.internal')) {
+        if (process.env.MYSQL_URL && !process.env.MYSQL_URL.includes('railway.internal')) {
+          const publicUrl = new URL(process.env.MYSQL_URL);
+          return {
+            host: publicUrl.hostname,
+            port: Number(publicUrl.port) || 3306,
+            user: decodeURIComponent(publicUrl.username),
+            password: decodeURIComponent(publicUrl.password),
+            database: publicUrl.pathname.replace(/^\//, '') || 'railway',
+            ssl: { rejectUnauthorized: false },
+            waitForConnections: true,
+            connectionLimit: 6,
+            maxIdle: 2,
+            idleTimeout: 15000,
+            queueLimit: 0,
+            enableKeepAlive: true,
+            keepAliveInitialDelay: 5000,
+            connectTimeout: 20000,
+          };
+        }
+      }
+
       return {
         host: parsedUrl.hostname,
         port: Number(parsedUrl.port) || 3306,
         user: decodeURIComponent(parsedUrl.username),
         password: decodeURIComponent(parsedUrl.password),
         database: parsedUrl.pathname.replace(/^\//, '') || 'defaultdb',
-        ssl: { rejectUnauthorized: false },
+        ssl: parsedUrl.hostname.includes('railway.internal') ? false : { rejectUnauthorized: false },
         waitForConnections: true,
         connectionLimit: 6,
         maxIdle: 2,
@@ -54,14 +91,15 @@ const getPoolConfig = () => {
   }
 
   const host = (process.env.MYSQL_HOST || process.env.DB_HOST || 'localhost').trim();
-  const isAivenOrRemote = host.includes('aivencloud.com') || host.includes('railway.internal') || process.env.MYSQL_SSL === 'true';
+  const isRailwayInternal = host.includes('railway.internal');
+  const isAivenOrRemote = host.includes('aivencloud.com') || process.env.MYSQL_SSL === 'true';
 
   const config = {
     host: host,
-    port: Number(process.env.MYSQL_PORT || process.env.DB_PORT) || 3306,
-    user: (process.env.MYSQL_USER || process.env.DB_USER || 'root').trim(),
-    password: process.env.MYSQL_PASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
-    database: (process.env.MYSQL_DATABASE || process.env.DB_NAME || 'accessories2').trim(),
+    port: Number(process.env.MYSQL_PORT || process.env.MYSQLPORT || process.env.DB_PORT) || 3306,
+    user: (process.env.MYSQL_USER || process.env.MYSQLUSER || process.env.DB_USER || 'root').trim(),
+    password: process.env.MYSQL_PASSWORD ?? process.env.MYSQLPASSWORD ?? process.env.DB_PASSWORD ?? 'Ayush123',
+    database: (process.env.MYSQL_DATABASE || process.env.MYSQLDATABASE || process.env.DB_NAME || 'accessories2').trim(),
     waitForConnections: true,
     connectionLimit: 6,
     maxIdle: 2,
@@ -72,7 +110,7 @@ const getPoolConfig = () => {
     connectTimeout: 20000,
   };
 
-  if (isAivenOrRemote && process.env.MYSQL_SSL !== 'false') {
+  if ((isAivenOrRemote || (host !== 'localhost' && !isRailwayInternal)) && process.env.MYSQL_SSL !== 'false') {
     config.ssl = { rejectUnauthorized: false };
   }
 
@@ -3490,38 +3528,76 @@ export const checkInwardEligibility = async ({ poNumber = '', materialName = '',
 function parseIssueTimestamp(dateStr) {
   if (!dateStr) return 0;
   const str = String(dateStr).trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
-    const t = Date.parse(str);
-    if (!isNaN(t)) return t;
+
+  // Try direct parse first if ISO or standard date format
+  const direct = Date.parse(str);
+  if (!isNaN(direct) && (/T|Z/.test(str) || /[A-Za-z]{3}\s+\d/.test(str))) {
+    return direct;
   }
-  const match = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+
+  // Handle DD/MM/YYYY or DD-MM-YYYY or YYYY-MM-DD with optional time and AM/PM
+  const match = str.match(/^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})(?:[,\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?(?:\s*(am|pm))?)?/i);
   if (match) {
-    let [, p1, p2, year, hr = '0', min = '0', sec = '0'] = match;
-    let d = parseInt(p1, 10);
-    let m = parseInt(p2, 10);
-    let day = d;
-    let month = m;
-    if (m > 12 && d <= 12) {
-      day = m;
-      month = d;
+    let [, p1, p2, p3, hrStr, minStr, secStr, ampm] = match;
+    let year, month, day;
+    if (p1.length === 4) {
+      // YYYY-MM-DD
+      year = parseInt(p1, 10);
+      month = parseInt(p2, 10);
+      day = parseInt(p3, 10);
+    } else {
+      // DD/MM/YYYY or MM/DD/YYYY
+      year = parseInt(p3, 10);
+      let d = parseInt(p1, 10);
+      let m = parseInt(p2, 10);
+      day = d;
+      month = m;
+      if (m > 12 && d <= 12) {
+        day = m;
+        month = d;
+      }
     }
-    const dt = new Date(parseInt(year, 10), month - 1, day, parseInt(hr, 10), parseInt(min, 10), parseInt(sec, 10));
-    return dt.getTime();
+
+    let hr = hrStr ? parseInt(hrStr, 10) : 0;
+    const min = minStr ? parseInt(minStr, 10) : 0;
+    const sec = secStr ? parseInt(secStr, 10) : 0;
+
+    if (ampm) {
+      const isPm = ampm.toLowerCase() === 'pm';
+      if (isPm && hr < 12) hr += 12;
+      if (!isPm && hr === 12) hr = 0;
+    }
+
+    const dt = new Date(year, month - 1, day, hr, min, sec);
+    if (!isNaN(dt.getTime())) return dt.getTime();
   }
+
   const fallback = Date.parse(str);
   return isNaN(fallback) ? 0 : fallback;
 }
 
-export const getMaterialTraceability = async (query = '') => {
+export const getMaterialTraceability = async (query = '', itemCode = '', id = '') => {
   const q = String(query || '').trim().toLowerCase();
+  const reqCode = String(itemCode || '').trim().toLowerCase();
+  const reqId = String(id || '').trim().toLowerCase();
 
-  // 1. Fetch materials
-  const [allMaterials] = await pool.execute('SELECT * FROM materials ORDER BY name ASC');
+  // 1. Fetch materials safely
+  let allMaterials = [];
+  try {
+    const [mRows] = await pool.execute('SELECT * FROM materials ORDER BY name ASC');
+    allMaterials = mRows;
+  } catch (err) {
+    console.error('Error fetching materials in getMaterialTraceability:', err.message);
+  }
 
-  // 2. Fetch weight_captures
-  const [allCaptures] = await pool.execute('SELECT * FROM weight_capture ORDER BY id DESC');
+  // 2. Fetch weight_captures safely
+  let allCaptures = [];
+  try {
+    const [cRows] = await pool.execute('SELECT * FROM weight_capture ORDER BY id DESC');
+    allCaptures = cRows;
+  } catch (_) { }
 
-  // 3. Fetch issue_logs, extra_material_issues, and bone_issue
+  // 3. Fetch issue_logs, extra_material_issues, bone_issue, and elastic_issue
   let issueLogs = [];
   try {
     const [iRows] = await pool.execute('SELECT * FROM issue_logs ORDER BY id DESC');
@@ -3538,6 +3614,12 @@ export const getMaterialTraceability = async (query = '') => {
   try {
     const [bRows] = await pool.execute('SELECT * FROM bone_issue ORDER BY id DESC');
     boneIssues = bRows;
+  } catch (_) { }
+
+  let elasticIssues = [];
+  try {
+    const [elRows] = await pool.execute('SELECT * FROM elastic_issue ORDER BY id DESC');
+    elasticIssues = elRows;
   } catch (_) { }
 
   // 4. Fetch material_transfers
@@ -3563,36 +3645,169 @@ export const getMaterialTraceability = async (query = '') => {
     });
   } catch (_) { }
 
-  // Filter materials matching query
-  const matchedMaterials = allMaterials.filter(m => {
-    if (!q) return true;
-    const mId = String(m.id || '').toLowerCase();
-    const mName = String(m.name || '').toLowerCase();
-    const mCat = String(m.category || '').toLowerCase();
-    const mCol = String(m.color || '').toLowerCase();
-    const mLoc = String(m.location || '').toLowerCase();
-    const mCode = String(m.itemCode || m.item_code || m.code || '').toLowerCase();
-    return mId.includes(q) || mName.includes(q) || mCat.includes(q) || mCol.includes(q) || mLoc.includes(q) || mCode.includes(q);
+  // 7. Fetch item_codes to bridge modern ST Item Codes with legacy MT / M codes
+  let itemCodeRows = [];
+  try {
+    const [ic] = await pool.execute('SELECT item_code, mt_code, item_name, brand FROM item_codes');
+    itemCodeRows = ic;
+  } catch (_) { }
+
+  // Filter materials matching query / itemCode / id
+  const targetClean = (reqCode || reqId || q).trim().toLowerCase();
+  const targetNum = targetClean.replace(/\D/g, '');
+
+  let matchedMaterials = allMaterials.filter(m => {
+    const mId = String(m.id || '').trim().toLowerCase();
+    const mName = String(m.name || '').trim().toLowerCase();
+    const mCat = String(m.category || '').trim().toLowerCase();
+    const mCol = String(m.color || '').trim().toLowerCase();
+    const mLoc = String(m.location || '').trim().toLowerCase();
+    const mCode = String(m.itemCode || m.item_code || m.code || '').trim().toLowerCase();
+    const mNum = mId.replace(/\D/g, '');
+
+    // Match by explicit Item Code
+    if (reqCode && (mCode === reqCode || mId === reqCode)) return true;
+    if (reqId && (mId === reqId || mCode === reqId)) return true;
+
+    // Match by query as Item Code or ID
+    if (q) {
+      if (mCode === q || mId === q) return true;
+      if (mCode.includes(q) || mId.includes(q)) return true;
+      if (targetNum && targetNum.length >= 3 && (mNum === targetNum || mCode.includes(targetNum))) return true;
+      return mName.includes(q) || mCat.includes(q) || mCol.includes(q) || mLoc.includes(q);
+    }
+
+    return true;
   });
+
+  // If strict filter yielded nothing, try flexible name match
+  if (matchedMaterials.length === 0 && q) {
+    const cleanQ = q.replace(/polybeg/g, 'polybag').replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+    matchedMaterials = allMaterials.filter(m => {
+      const mNameClean = String(m.name || '').toLowerCase().replace(/polybeg/g, 'polybag').replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+      return mNameClean.includes(cleanQ) || cleanQ.includes(mNameClean);
+    });
+  }
+
+  // Synthesize fallback if still empty so modal never crashes
+  if (matchedMaterials.length === 0 && (q || reqId || reqCode)) {
+    matchedMaterials = [{
+      id: reqId || reqCode || q.toUpperCase(),
+      name: q || reqId || reqCode,
+      category: 'Accessory',
+      stock: 0,
+      unit: 'Pcs',
+      location: 'Main Store',
+      itemCode: reqCode || (q.toUpperCase().startsWith('ST') ? q.toUpperCase() : '') || reqId || q.toUpperCase()
+    }];
+  }
 
   // Build complete trace for each matched material
   const traceabilityRecords = matchedMaterials.map(m => {
+    const matCode = String(m.itemCode || m.item_code || m.code || '').trim().toLowerCase();
     const matId = String(m.id || '').trim().toLowerCase();
     const matName = String(m.name || '').trim().toLowerCase();
-    const matCode = String(m.itemCode || m.item_code || m.code || '').trim().toLowerCase();
 
-    const isMatch = (candId, candName, candCode) => {
+    // The official Item Code (prefer ST code)
+    const effectiveItemCode = (matCode && matCode !== 'n/a' && matCode !== '') ? matCode : (matId.startsWith('st') ? matId : '');
+
+    // Collect all legacy MT and M IDs associated with this Item Code
+    const legacyAliases = new Set();
+    if (matId && matId !== 'n/a') {
+      legacyAliases.add(matId);
+      if (matId.startsWith('mt')) legacyAliases.add(matId.replace(/^mt/, 'm'));
+      if (matId.startsWith('m') && !matId.startsWith('mt')) legacyAliases.add(matId.replace(/^m/, 'mt'));
+    }
+
+    // Look for mappings in item_codes table
+    itemCodeRows.forEach(ic => {
+      const icCode = String(ic.item_code || '').trim().toLowerCase();
+      const icMt = String(ic.mt_code || '').trim().toLowerCase();
+      if (effectiveItemCode && icCode === effectiveItemCode) {
+        if (icMt) {
+          legacyAliases.add(icMt);
+          if (icMt.startsWith('mt')) legacyAliases.add(icMt.replace(/^mt/, 'm'));
+          if (icMt.startsWith('m') && !icMt.startsWith('mt')) legacyAliases.add(icMt.replace(/^m/, 'mt'));
+        }
+      }
+      if (matId && (icMt === matId || icCode === matId)) {
+        if (icMt) {
+          legacyAliases.add(icMt);
+          if (icMt.startsWith('mt')) legacyAliases.add(icMt.replace(/^mt/, 'm'));
+        }
+        if (icCode) legacyAliases.add(icCode);
+      }
+    });
+
+    // Also collect all material IDs in allMaterials that share the same itemCode
+    if (effectiveItemCode) {
+      allMaterials.forEach(otherM => {
+        const otherCode = String(otherM.itemCode || otherM.item_code || otherM.code || '').trim().toLowerCase();
+        if (otherCode === effectiveItemCode) {
+          if (otherM.id) {
+            const oId = String(otherM.id).trim().toLowerCase();
+            legacyAliases.add(oId);
+            if (oId.startsWith('mt')) legacyAliases.add(oId.replace(/^mt/, 'm'));
+            if (oId.startsWith('m') && !oId.startsWith('mt')) legacyAliases.add(oId.replace(/^m/, 'mt'));
+          }
+        }
+      });
+    }
+
+    // Number extraction for numeric code matching (e.g. '1325' for MT1325 / M1325)
+    const legacyNums = new Set();
+    legacyAliases.forEach(a => {
+      const n = a.replace(/\D/g, '');
+      if (n.length >= 3) legacyNums.add(n);
+    });
+
+    // Normalizer helper for names (e.g. polybeg -> polybag, remove punctuation)
+    const norm = (s) => String(s || '').toLowerCase()
+      .replace(/polybeg/g, 'polybag')
+      .replace(/[\/\*x\-_]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const normMatName = norm(matName);
+
+    const isMatch = (candId, candName, candCode, candBomName = '') => {
       const cId = String(candId || '').trim().toLowerCase();
       const cName = String(candName || '').trim().toLowerCase();
       const cCode = String(candCode || '').trim().toLowerCase();
+      const cBom = String(candBomName || '').trim().toLowerCase();
 
-      if (matId && (cId === matId || cCode === matId)) return true;
-      if (matCode && (cId === matCode || cCode === matCode)) return true;
-      if (matName && cName) {
-        if (matName === cName) return true;
-        if (matName.length >= 3 && cName.includes(matName)) return true;
-        if (cName.length >= 3 && matName.includes(cName)) return true;
+      // 1. Direct Item Code Match (New system issues logged with Item Code)
+      if (effectiveItemCode) {
+        if (cCode === effectiveItemCode || cCode.includes(effectiveItemCode)) return true;
+        if (cId === effectiveItemCode || cId.includes(effectiveItemCode)) return true;
       }
+
+      // 2. Legacy MT / M Code Match (First time system issues logged with MT or M code)
+      if (cId && legacyAliases.has(cId)) return true;
+      if (cCode && legacyAliases.has(cCode)) return true;
+      for (const alias of legacyAliases) {
+        if (cId && (cId.includes(alias) || alias.includes(cId))) return true;
+        if (cCode && (cCode.includes(alias) || alias.includes(cCode))) return true;
+      }
+
+      // 3. Numeric ID Match (e.g. 1325 in M1325 / MT1325)
+      const cIdNum = cId.replace(/\D/g, '');
+      const cCodeNum = cCode.replace(/\D/g, '');
+      if (cIdNum && legacyNums.has(cIdNum)) return true;
+      if (cCodeNum && legacyNums.has(cCodeNum)) return true;
+
+      // 4. Material Name / BOM Component Name Match
+      const normCName = norm(cName);
+      const normCBom = norm(cBom);
+
+      if (normMatName && normMatName.length >= 3) {
+        if (normCName && (normMatName === normCName || normCName.includes(normMatName) || normMatName.includes(normCName))) return true;
+        if (normCBom && (normMatName === normCBom || normCBom.includes(normMatName) || normMatName.includes(normCBom))) return true;
+      }
+
+      if (matName && cName && (matName === cName || cName.includes(matName) || matName.includes(cName))) return true;
+      if (matName && cBom && (matName === cBom || cBom.includes(matName) || matName.includes(cBom))) return true;
+
       return false;
     };
 
@@ -3601,12 +3816,11 @@ export const getMaterialTraceability = async (query = '') => {
       const cCode = String(c.materialCode || '').trim().toLowerCase();
       const cName = String(c.materialName || '').trim().toLowerCase();
       const cBarcode = String(c.barcodeId || '').trim().toLowerCase();
-      return (cCode && (cCode === matId || cCode.includes(matId))) ||
-        (cName && (cName === matName || cName.includes(matName) || matName.includes(cName))) ||
-        (cBarcode && cBarcode.includes(matId));
+      const cItemCode = String(c.itemCode || '').trim().toLowerCase();
+      return isMatch(cCode, cName, cItemCode) ||
+        (cBarcode && (cBarcode.includes(matId) || (effectiveItemCode && cBarcode.includes(effectiveItemCode))));
     });
 
-    // Related issue logs (Consumption / Issue against Cutting Lots)
     const relatedIssues = [];
 
     // 1. From issue_logs (BOM and Without BOM floor issues)
@@ -3619,7 +3833,7 @@ export const getMaterialTraceability = async (query = '') => {
       }
 
       const matchingItems = matItems.filter(it =>
-        isMatch(it.materialId, it.name || it.materialName, it.itemCode || it.code || it.materialCode)
+        isMatch(it.materialId, it.name || it.materialName, it.itemCode || it.code || it.materialCode, it.bomItemName || it.bom_item_name)
       );
 
       matchingItems.forEach(it => {
@@ -3651,14 +3865,14 @@ export const getMaterialTraceability = async (query = '') => {
 
     // 2. From extra_material_issues (Extra Issue Requisitions)
     extraIssues.forEach(emi => {
-      let matched = isMatch(emi.material_id, emi.material_name, emi.material_id);
+      let matched = isMatch(emi.material_id, emi.material_name, emi.material_id, emi.bom_item_name);
       let extraQty = Number(emi.extra_qty || 0);
 
       if (!matched && emi.items_payload) {
         try {
           const payloadItems = typeof emi.items_payload === 'string' ? JSON.parse(emi.items_payload) : emi.items_payload;
           if (Array.isArray(payloadItems)) {
-            const pi = payloadItems.find(p => isMatch(p.materialId, p.materialName, p.itemCode || p.materialCode));
+            const pi = payloadItems.find(p => isMatch(p.materialId, p.materialName, p.itemCode || p.materialCode, p.bomItemName || p.bom_item_name));
             if (pi) {
               matched = true;
               extraQty = Number(pi.totalRequired || pi.extraQty || extraQty);
@@ -3702,7 +3916,7 @@ export const getMaterialTraceability = async (query = '') => {
         biItems = payload.deductedItems || [];
       } catch (_) {}
 
-      const matchingBi = biItems.filter(it => isMatch(it.materialId, it.materialName, it.materialId));
+      const matchingBi = biItems.filter(it => isMatch(it.materialId || bi.material_code, it.materialName || it.name || bi.material_name, it.materialId || bi.material_code, it.bomItemName || 'Bone / Piping'));
       matchingBi.forEach(it => {
         const dateStr = bi.issue_date ? String(bi.issue_date) : (bi.created_at ? new Date(bi.created_at).toLocaleDateString() : 'N/A');
         const timestamp = parseIssueTimestamp(dateStr) || (bi.created_at ? new Date(bi.created_at).getTime() : 0);
@@ -3729,14 +3943,64 @@ export const getMaterialTraceability = async (query = '') => {
       });
     });
 
+    // 4. From elastic_issue (Elastic & Tape issues)
+    elasticIssues.forEach(eli => {
+      let matched = isMatch(eli.selectedOtherMaterialId, eli.otherMaterialName, eli.otherItemCode);
+      let eliQty = Number(eli.total_elastic_mtr || eli.total_tape_mtr || eli.quantity || eli.rolls || 0);
+      let itemName = eli.otherMaterialName || (eli.total_tape_mtr > 0 ? 'Tape Issue' : 'Elastic Issue');
+      let itemUnit = eli.otherUnit || (eli.total_tape_mtr > 0 || eli.total_elastic_mtr > 0 ? 'Meters' : (eli.rolls ? 'Rolls' : (m.unit || 'pcs')));
+
+      if (!matched && eli.payload) {
+        try {
+          const p = typeof eli.payload === 'string' ? JSON.parse(eli.payload) : eli.payload;
+          const items = Array.isArray(p.otherItems) ? p.otherItems : (Array.isArray(p.items) ? p.items : (Array.isArray(p.deductedItems) ? p.deductedItems : []));
+          const found = items.find(it => isMatch(it.materialId || it.id, it.materialName || it.name, it.itemCode || it.otherItemCode || it.code));
+          if (found) {
+            matched = true;
+            eliQty = Number(found.totalRequired || found.qty || found.totalMtr || eliQty);
+            if (found.name || found.materialName) itemName = found.name || found.materialName;
+            if (found.unit) itemUnit = found.unit;
+          }
+        } catch (_) {}
+      }
+
+      if (matched && eliQty > 0) {
+        const lotInfo = cuttingLots[String(eli.lot_no).trim()] || {};
+        const dateStr = eli.issue_date ? String(eli.issue_date) : (eli.created_at ? new Date(eli.created_at).toLocaleString('en-GB') : 'N/A');
+        const timestamp = parseIssueTimestamp(dateStr) || (eli.created_at ? new Date(eli.created_at).getTime() : 0);
+        relatedIssues.push({
+          issueId: eli.slip_no || `EL-${eli.id}`,
+          lotId: eli.lot_no || 'Floor Issue',
+          isReissue: false,
+          isReturn: false,
+          qtyIssued: eliQty,
+          unit: itemUnit,
+          bomItemName: itemName,
+          personName: eli.issuer_name || 'Store Staff',
+          receiverName: eli.receiver_name || '',
+          receiverDept: 'Stitching Floor',
+          date: dateStr,
+          timestamp,
+          fabric: eli.fabric || lotInfo.Fabric || 'Standard',
+          garmentType: eli.garment_type || lotInfo.Garment_Type || 'Garment',
+          style: eli.style || lotInfo.Style || 'Standard',
+          supervisor: eli.supervisor_name || lotInfo.Supervisor || eli.receiver_name || 'Supervisor',
+          issueType: eli.total_tape_mtr > 0 ? 'Tape Issue' : 'Elastic Issue',
+          remarks: eli.remarks || ''
+        });
+      }
+    });
+
     // Sort strictly LATEST FIRST: newest date/timestamp on top
     relatedIssues.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     // Related transfers
     const relatedTransfers = transfers.filter(t => {
       const tCode = String(t.materialCode || t.materialId || '').trim().toLowerCase();
+      const tItemCode = String(t.itemCode || '').trim().toLowerCase();
       const tName = String(t.materialName || '').trim().toLowerCase();
-      return tCode === matId.toLowerCase() || tName.includes(matName) || matName.includes(tName);
+      return isMatch(tCode, tName, tItemCode) || isMatch(tItemCode, tName, tCode) ||
+        tCode === matId.toLowerCase() || tName.includes(matName) || matName.includes(tName);
     });
 
     // Related scanner logs

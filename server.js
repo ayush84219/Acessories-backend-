@@ -3348,8 +3348,8 @@ app.get('/api/pos/materials', async (req, res) => {
 // GET Material Traceability & Full Lifecycle History
 app.get('/api/materials/traceability', async (req, res) => {
   try {
-    const { query } = req.query;
-    const records = await getMaterialTraceability(query || '');
+    const { query, itemCode, id } = req.query;
+    const records = await getMaterialTraceability(query || '', itemCode || '', id || '');
     res.status(200).json({ success: true, count: records.length, data: records });
   } catch (err) {
     console.error('API GET /api/materials/traceability error:', err.message);
